@@ -377,6 +377,9 @@ impl Engine {
                 host: token_host.unwrap_or_else(|| "github.com".to_string()),
                 user: user.clone(),
                 created_at: chrono::Utc::now(),
+                refresh_token: None,
+                expires_at: None,
+                refresh_token_expires_at: None,
             },
         )
         .await?;
@@ -583,6 +586,9 @@ impl Engine {
                         .unwrap_or_else(|| "github.com".to_string()),
                     user: user.clone(),
                     created_at: chrono::Utc::now(),
+                    refresh_token: None,
+                    expires_at: None,
+                    refresh_token_expires_at: None,
                 };
                 // The save touches the OS keychain, which is a blocking call
                 // with a bound but no cancellation: off the runtime's worker
@@ -710,6 +716,9 @@ impl Engine {
                 host: token_host.unwrap_or_else(|| "github.com".to_string()),
                 user,
                 created_at: chrono::Utc::now(),
+                refresh_token: None,
+                expires_at: None,
+                refresh_token_expires_at: None,
             },
         )
         .await?;

@@ -1546,6 +1546,9 @@ fn seed_token_file(dir: &std::path::Path, user: &str) {
         host: "github.com".to_string(),
         user: user.to_string(),
         created_at: chrono::Utc::now(),
+        refresh_token: None,
+        expires_at: None,
+        refresh_token_expires_at: None,
     })
     .unwrap();
 }
@@ -2452,6 +2455,9 @@ fn seed_personal_token_file(dir: &std::path::Path, identity: &str, user: &str) {
         host: "github.com".to_string(),
         user: user.to_string(),
         created_at: chrono::Utc::now(),
+        refresh_token: None,
+        expires_at: None,
+        refresh_token_expires_at: None,
     })
     .unwrap();
 }

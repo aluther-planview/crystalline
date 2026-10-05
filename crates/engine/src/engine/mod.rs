@@ -8488,6 +8488,9 @@ mod share_actor_tests {
                 host: "github.com".to_string(),
                 user: user.to_string(),
                 created_at: Utc::now(),
+                refresh_token: None,
+                expires_at: None,
+                refresh_token_expires_at: None,
             })
             .unwrap();
     }
