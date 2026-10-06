@@ -131,7 +131,13 @@ pub const SETUP_PATH: &str = "/auth/setup";
 /// every other `POST`. This list is a path list, so it exempts both; the guard
 /// that matters for the second one lives in the handler rather than here, and
 /// that is the first thing to check when reading this exemption.
-const PUBLIC_PATHS: [&str; 10] = [
+/// Two more are public by path and guarded inside the handler, like the POST
+/// above: the GitHub web link's connect route, which a browser may reach
+/// before it has signed in anywhere and which sends it to sign in rather than
+/// 401ing it, and the callback GitHub sends it back to, which is
+/// authenticated by the single-use state this process minted rather than by a
+/// session. See [`super::github_web`].
+const PUBLIC_PATHS: [&str; 12] = [
     LOGIN_PATH,
     "/auth/logout",
     "/auth/me",
@@ -155,6 +161,8 @@ const PUBLIC_PATHS: [&str; 10] = [
     // What proves it may have one is the PKCE verifier behind the challenge the
     // authorization was started with. See `super::oauth::token`.
     super::oauth::TOKEN_PATH,
+    super::github_web::CONNECT_PATH,
+    super::github_web::CALLBACK_PATH,
 ];
 
 /// The three auth settings, resolved once when the HTTP surface is built.
