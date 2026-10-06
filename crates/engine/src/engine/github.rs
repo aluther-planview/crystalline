@@ -104,7 +104,7 @@ impl Engine {
     /// another route (a pasted token) and a disconnect both do: the flow in
     /// flight is about to be answered by a stale background task, and only for
     /// this one credential.
-    fn clear_pending_for(&self, identity: &TokenIdentity) {
+    pub(super) fn clear_pending_for(&self, identity: &TokenIdentity) {
         let mut guard = self.pending_connect.lock().unwrap();
         if guard.as_ref().is_some_and(|p| p.identity == *identity) {
             *guard = None;
@@ -759,6 +759,13 @@ impl Engine {
     /// Only this identity's cache entry is evicted, not the whole cache: every
     /// other credential this process resolved is still valid, and re-reading
     /// them would cost a keychain prompt each for nothing.
+    ///
+    /// On an instance that registered a GitHub App, the grant behind the
+    /// credential is revoked on GitHub first, so disconnecting here stops the
+    /// token working there too rather than only forgetting where it was kept.
+    /// Best effort, and deliberately so: a revoke that fails is logged and the
+    /// local credential is forgotten anyway (see
+    /// [`Engine::revoke_github_grant`]).
     pub async fn disconnect_github_identity(&self, account: &str) -> Result<GithubIdentity> {
         let identity = personal_identity(account)?;
         if self.read_only {
@@ -766,6 +773,9 @@ impl Engine {
         }
         let host = self.github_token_host();
         let (store, token) = self.github_credential_for(&identity, host.as_deref())?;
+        if let Some(token) = &token {
+            self.revoke_github_grant(token).await;
+        }
         if token.is_some() {
             store.delete().map_err(EngineError::Remote)?;
         }
