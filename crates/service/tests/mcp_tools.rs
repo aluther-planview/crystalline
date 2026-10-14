@@ -4368,6 +4368,244 @@ async fn plant(h: &Harness, domain: &str, slug: &str, fields: &str) -> std::path
     path
 }
 
+/// The lines a line diff of `before` and `after` reports as removed and
+/// added, with the `generated` line left out of both sides first: a real
+/// edit restamps it, and that line moving is expected. Common leading and
+/// trailing lines are dropped, which is exact for one block of change.
+fn changed_lines(before: &str, after: &str) -> (Vec<String>, Vec<String>) {
+    let keep = |text: &str| -> Vec<String> {
+        text.lines()
+            .filter(|l| !l.starts_with("generated:"))
+            .map(str::to_string)
+            .collect()
+    };
+    let (a, b) = (keep(before), keep(after));
+    let mut start = 0;
+    while start < a.len() && start < b.len() && a[start] == b[start] {
+        start += 1;
+    }
+    let (mut ea, mut eb) = (a.len(), b.len());
+    while ea > start && eb > start && a[ea - 1] == b[eb - 1] {
+        ea -= 1;
+        eb -= 1;
+    }
+    (a[start..ea].to_vec(), b[start..eb].to_vec())
+}
+
+/// The checksum a read hands out for an engram.
+async fn checksum_of(peer: &Peer<RoleClient>, domain: &str, identifier: &str) -> String {
+    let read = call(
+        peer,
+        "read_engram",
+        json!({ "domain": domain, "identifier": identifier }),
+    )
+    .await
+    .unwrap();
+    read["checksum"].as_str().unwrap().to_string()
+}
+
+/// A list set_frontmatter writes is the list write_engram writes: one more
+/// item right after a write adds exactly one line. Only the generated line
+/// moves beside it, because a real edit is stamped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_frontmatter_after_a_write_changes_only_the_line_it_adds() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+    let sources = [
+        "https://example.com/page#frag",
+        "notedown://jordi/n1/p0#b1",
+        "a: b",
+        "#hash",
+        "\"quoted\"",
+        "Grüße",
+    ];
+    call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng", "title": "Listed", "content": "A rule.",
+            "tags": ["alpha", "beta"],
+            "metadata": { "sources": sources },
+        }),
+    )
+    .await
+    .unwrap();
+    let path = h.root.join("eng/listed.md");
+
+    let before = std::fs::read_to_string(&path).unwrap();
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng", "identifier": "listed", "operation": "set_frontmatter",
+            "key": "tags", "values": ["alpha", "beta", "gamma"],
+        }),
+    )
+    .await
+    .unwrap();
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        changed_lines(&before, &after),
+        (vec![], vec!["- gamma".to_string()]),
+        "{before}\n=====\n{after}"
+    );
+
+    let before = after;
+    let mut more: Vec<&str> = sources.to_vec();
+    more.push("https://example.com/new#x");
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng", "identifier": "listed", "operation": "set_frontmatter",
+            "key": "sources", "values": more,
+        }),
+    )
+    .await
+    .unwrap();
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        changed_lines(&before, &after),
+        (vec![], vec!["- https://example.com/new#x".to_string()]),
+        "{before}\n=====\n{after}"
+    );
+    let out = call(
+        peer,
+        "read_engram",
+        json!({ "domain": "eng", "identifier": "listed" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["frontmatter"]["extra"]["sources"], json!(more), "{out}");
+}
+
+/// A set_frontmatter that leaves the engram saying what it said writes
+/// nothing: the file keeps its bytes, the checksum and the generated block
+/// stay, and the receipt says unchanged: true. Compared as values, so tags
+/// that fold to the stored ones and a 0.25.1-style indented list are equal,
+/// while a new order is a change. A stale checksum is still refused first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_frontmatter_that_changes_nothing_writes_nothing() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+    call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng", "title": "Same", "content": "A rule.",
+            "tags": ["alpha", "beta"],
+            "metadata": { "sources": ["https://example.com/a", "https://example.com/b#c"] },
+        }),
+    )
+    .await
+    .unwrap();
+    let path = h.root.join("eng/same.md");
+    let stored = std::fs::read_to_string(&path).unwrap();
+    let checksum = checksum_of(peer, "eng", "same").await;
+
+    for (key, values) in [
+        ("tags", json!(["alpha", "beta"])),
+        // Folded, deduplicated and blank-dropped the way the write folds.
+        ("tags", json!(["Alpha", " beta ", "alpha", ""])),
+        (
+            "sources",
+            json!(["https://example.com/a", "https://example.com/b#c"]),
+        ),
+        (
+            "sources",
+            json!([
+                " https://example.com/a",
+                "https://example.com/b#c",
+                "https://example.com/a",
+                " "
+            ]),
+        ),
+    ] {
+        let receipt = call(
+            peer,
+            "edit_engram",
+            json!({
+                "domain": "eng", "identifier": "same", "operation": "set_frontmatter",
+                "key": key, "values": values, "expected_checksum": checksum,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            receipt["unchanged"],
+            json!(true),
+            "{key} {values}: {receipt}"
+        );
+        assert_eq!(receipt["permalink"], json!("same"), "{receipt}");
+        assert_eq!(
+            stored,
+            std::fs::read_to_string(&path).unwrap(),
+            "{key} {values}"
+        );
+        assert_eq!(checksum, checksum_of(peer, "eng", "same").await);
+    }
+    let receipt = call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng", "identifier": "same", "operation": "set_frontmatter",
+            "key": "status", "value": "stable",
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(receipt["unchanged"], json!(true), "{receipt}");
+    assert_eq!(stored, std::fs::read_to_string(&path).unwrap());
+
+    // A stale checksum is refused even when the edit would change nothing.
+    let err = call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng", "identifier": "same", "operation": "set_frontmatter",
+            "key": "tags", "values": ["alpha", "beta"],
+            "expected_checksum": "0".repeat(64),
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("stale edit"), "{err}");
+
+    // A new order is a change: written, stamped and without the key.
+    let receipt = call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng", "identifier": "same", "operation": "set_frontmatter",
+            "key": "tags", "values": ["beta", "alpha"],
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(receipt.get("unchanged").is_none(), "{receipt}");
+    assert_ne!(stored, std::fs::read_to_string(&path).unwrap());
+    assert_ne!(checksum, checksum_of(peer, "eng", "same").await);
+
+    // An older file in the indented 0.25.1 style with an equal list is left
+    // alone too.
+    let legacy = plant(&h, "eng", "legacy", "status: stable\n").await;
+    let planted = std::fs::read_to_string(&legacy).unwrap();
+    let receipt = call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng", "identifier": "legacy", "operation": "set_frontmatter",
+            "key": "tags", "values": ["eng"],
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(receipt["unchanged"], json!(true), "{receipt}");
+    assert_eq!(planted, std::fs::read_to_string(&legacy).unwrap());
+}
+
 /// set_frontmatter flips a status by field assignment rather than text
 /// substitution, so it lands whichever spelling the file carries: the current
 /// `stable` a write produces and the legacy `current` an older file holds.
@@ -4587,7 +4825,7 @@ async fn set_frontmatter_values_adds_a_tag_that_search_and_vocabulary_see() {
     .unwrap();
     let text = std::fs::read_to_string(&path).unwrap();
     assert!(
-        text.contains("tags:\n  - retries\n  - network-policy\n"),
+        text.contains("tags:\n- retries\n- network-policy\n"),
         "{text}"
     );
 
@@ -4625,6 +4863,344 @@ async fn set_frontmatter_values_adds_a_tag_that_search_and_vocabulary_see() {
     assert_eq!(text, std::fs::read_to_string(&path).unwrap());
 }
 
+/// sources is set as a whole list over MCP, guarded by expected_checksum: a
+/// location is added and another dropped, and $contains finds the engram by
+/// the new location and no longer by the dropped one. An entry the index
+/// cannot hold, a value instead of values and a bare string for values are
+/// refused, and none of them writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_frontmatter_sources_adds_and_drops_a_location_that_contains_sees() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+    call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng", "title": "Page One", "content": "Page one text.",
+            "metadata": { "sources": [
+                "https://github.com/acme/api/blob/main/src/a.rs",
+                "https://github.com/acme/api/blob/main/src/old.rs",
+            ] },
+        }),
+    )
+    .await
+    .unwrap();
+    let path = h.root.join("eng/page-one.md");
+    let total = |filter: Value| {
+        let peer = peer.clone();
+        async move {
+            let out = call(
+                &peer,
+                "search_engrams",
+                json!({ "domains": ["eng"], "metadata_filters": { "sources": filter } }),
+            )
+            .await
+            .unwrap();
+            out["total"].clone()
+        }
+    };
+    assert_eq!(
+        total(json!({ "$contains": "https://github.com/acme/api/blob/main/src/old.rs" })).await,
+        json!(1)
+    );
+
+    // A stale checksum is refused and the file stays as it was.
+    let before = std::fs::read_to_string(&path).unwrap();
+    let err = call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng", "identifier": "page-one", "operation": "set_frontmatter",
+            "key": "sources",
+            "values": ["https://github.com/acme/api/blob/main/src/a.rs"],
+            "expected_checksum": "0".repeat(64),
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(!err.is_empty());
+    assert_eq!(before, std::fs::read_to_string(&path).unwrap());
+
+    let read = call(
+        peer,
+        "read_engram",
+        json!({ "domain": "eng", "identifier": "page-one" }),
+    )
+    .await
+    .unwrap();
+    let checksum = read["checksum"].as_str().unwrap().to_string();
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng", "identifier": "page-one", "operation": "set_frontmatter",
+            "key": "sources",
+            "values": [
+                "https://github.com/acme/api/blob/main/src/a.rs",
+                "  https://github.com/acme/api/blob/main/src/new.rs  ",
+                "https://github.com/acme/api/blob/main/src/a.rs",
+                "https://example.com/straße?a=1,2#x",
+            ],
+            "expected_checksum": checksum,
+        }),
+    )
+    .await
+    .unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        text.contains(
+            "sources:\n- https://github.com/acme/api/blob/main/src/a.rs\n- https://github.com/acme/api/blob/main/src/new.rs\n- https://example.com/straße?a=1,2#x\n"
+        ),
+        "{text}"
+    );
+    assert_eq!(
+        total(json!({ "$contains": "https://example.com/straße?a=1,2#x" })).await,
+        json!(1),
+        "a location with a comma, a query, a fragment and non-ASCII text is found as spelled"
+    );
+    assert_eq!(
+        total(json!({ "$contains": "https://github.com/acme/api/blob/main/src/new.rs" })).await,
+        json!(1),
+        "the new location is found"
+    );
+    assert_eq!(
+        total(json!({ "$contains": "https://github.com/acme/api/blob/main/src/old.rs" })).await,
+        json!(0),
+        "the dropped location is not"
+    );
+    assert_eq!(
+        total(json!({ "$contains_any": [
+            "https://github.com/acme/api/blob/main/src/old.rs",
+            "https://github.com/acme/api/blob/main/src/new.rs",
+        ] }))
+        .await,
+        json!(1)
+    );
+
+    // An entry the index cannot hold is refused by its position; nothing
+    // is written.
+    let long = format!("https://example.com/{}", "a".repeat(1100));
+    let err = call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng", "identifier": "page-one", "operation": "set_frontmatter",
+            "key": "sources", "values": ["https://example.com/ok", long],
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.contains(
+            "sources element 2 is too long for the metadata index, so a $contains filter could not find it"
+        ),
+        "{err}"
+    );
+    assert_eq!(text, std::fs::read_to_string(&path).unwrap());
+
+    // value on sources points at values and writes nothing.
+    let err = call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng", "identifier": "page-one", "operation": "set_frontmatter",
+            "key": "sources", "value": "https://example.com/ok",
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.contains("sources is a list: pass the whole new list as values"),
+        "{err}"
+    );
+    assert_eq!(text, std::fs::read_to_string(&path).unwrap());
+
+    // values as one bare string is a parameter error, never a write. It
+    // comes back as a tool-level refusal, not a protocol error.
+    let refused = call_result(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng", "identifier": "page-one", "operation": "set_frontmatter",
+            "key": "sources", "values": "https://example.com/ok",
+        }),
+    )
+    .await;
+    assert_eq!(refused.is_error, Some(true));
+    let err = result_text(&refused);
+    assert!(err.contains("expected a sequence"), "{err}");
+    assert_eq!(text, std::fs::read_to_string(&path).unwrap());
+
+    // An empty list removes the key, and the engram is found by nothing.
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng", "identifier": "page-one", "operation": "set_frontmatter",
+            "key": "sources", "values": [],
+        }),
+    )
+    .await
+    .unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("sources"), "{text}");
+    assert_eq!(
+        total(json!({ "$contains": "https://github.com/acme/api/blob/main/src/a.rs" })).await,
+        json!(0)
+    );
+}
+
+/// write_engram keeps taking sources in metadata, a long element included,
+/// and validate keeps naming it as E011 by its position (spec C-1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_engram_keeps_a_long_sources_element_and_validate_names_it() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+    call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng", "title": "Long Source", "content": "Text.",
+            "metadata": { "sources": [
+                "https://example.com/ok",
+                format!("https://example.com/{}", "a".repeat(1100)),
+            ] },
+        }),
+    )
+    .await
+    .unwrap();
+    let report = call(
+        peer,
+        "validate_engrams",
+        json!({ "domain": "eng", "identifier": "long-source" }),
+    )
+    .await
+    .unwrap();
+    let e011: Vec<&Value> = report["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["kind"] == "E011")
+        .collect();
+    assert_eq!(e011.len(), 1, "{report}");
+    assert!(
+        e011[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("frontmatter key `sources` element 2 is over 1024 bytes"),
+        "{report}"
+    );
+}
+
+/// In a domain that reviews changes, set_frontmatter on sources becomes the
+/// caller's draft: the folder keeps what the team reviewed, the caller's own
+/// read shows the new list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_review_mode_set_frontmatter_sources_is_a_draft() {
+    const PAGE: &str = "---\ntype: engram\ntitle: Page\npermalink: page\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-01-01\nsources:\n  - https://example.com/a\n---\n\n# Page\n\nBody.\n";
+    let h = Harness::build_tweaked(&["eng"], false, true, |cfg, root| {
+        cfg.domains.get_mut("eng").unwrap().review = Some(ReviewMode::Overlay);
+        std::fs::write(root.join("eng/page.md"), PAGE).unwrap();
+    })
+    .await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+    // A stale checksum is refused even when the edit would change nothing.
+    let err = call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng", "identifier": "page", "operation": "set_frontmatter",
+            "key": "sources", "values": ["https://example.com/a"],
+            "expected_checksum": "0".repeat(64),
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("stale edit"), "{err}");
+    // The list the page already holds, spelled the 0.25.1 way on disk: no
+    // draft is written, so the caller's read is still the reviewed page.
+    let out = call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng", "identifier": "page", "operation": "set_frontmatter",
+            "key": "sources", "values": ["https://example.com/a"],
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["unchanged"], true, "{out}");
+    let read = call(
+        peer,
+        "read_engram",
+        json!({ "domain": "eng", "identifier": "page" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(read["content"], PAGE, "no draft: {read}");
+    let out = call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng", "identifier": "page", "operation": "set_frontmatter",
+            "key": "sources", "values": ["https://example.com/a", "https://example.com/b"],
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["draft"], true, "{out}");
+    assert!(out.get("unchanged").is_none(), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(h.root.join("eng/page.md")).unwrap(),
+        PAGE,
+        "the folder does not move"
+    );
+    let read = call(
+        peer,
+        "read_engram",
+        json!({ "domain": "eng", "identifier": "page" }),
+    )
+    .await
+    .unwrap();
+    assert!(
+        read["content"]
+            .as_str()
+            .unwrap()
+            .contains("sources:\n- https://example.com/a\n- https://example.com/b\n"),
+        "{read}"
+    );
+}
+
+/// edit_engram's copy and its values parameter name sources as a list key
+/// beside tags, so an ingesting agent finds the verb (spec C-1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_descriptions_teach_sources_as_a_list() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let tools = client.peer().list_all_tools().await.unwrap();
+    let edit = tools
+        .iter()
+        .find(|t| t.name == "edit_engram")
+        .expect("edit_engram listed");
+    let description = edit.description.as_deref().unwrap_or("");
+    for needle in [
+        "sources takes values too",
+        "(resource, source_version, sources)",
+    ] {
+        assert!(description.contains(needle), "{needle}: {description}");
+    }
+    let schema = serde_json::to_value(&edit.input_schema).unwrap();
+    for field in ["key", "values"] {
+        let doc = schema["properties"][field]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(doc.contains("sources"), "{field}: {doc}");
+    }
+}
+
 /// The edit_engram schema advertises values as a list of strings, so a client
 /// can send a tag list without guessing its shape.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4642,6 +5218,7 @@ async fn edit_engram_schema_exposes_values_as_a_string_list() {
     assert_eq!(values["items"]["type"], json!("string"), "{values}");
     let doc = values["description"].as_str().unwrap_or_default();
     assert!(doc.contains("tags"), "{doc}");
+    assert!(doc.contains("sources"), "{doc}");
 }
 
 /// The keyset is a safe list: identity and provenance keys are refused by
@@ -7736,4 +8313,251 @@ async fn tool_descriptions_teach_a_domain_rows_read_only() {
             "{name} names the mark: {description}"
         );
     }
+}
+
+/// The tool names `packaging/mcpb/generate-manifest.sh` writes into the
+/// Claude Desktop manifest's `"tools"` block. Only the names are read: the
+/// descriptions there are short hand-written summaries.
+fn desktop_manifest_tool_names() -> Vec<String> {
+    let script =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/mcpb/generate-manifest.sh");
+    let text = std::fs::read_to_string(&script).unwrap();
+    // The block opens on its key and closes on the first `]` at the
+    // two-space indentation of a top-level manifest key.
+    const BLOCK_START: &str = "\"tools\": [";
+    const BLOCK_END: &str = "\n  ]";
+    let start = text
+        .find(BLOCK_START)
+        .expect("the manifest has a tools block");
+    let block = &text[start..];
+    let block = &block[..block.find(BLOCK_END).expect("the tools block ends")];
+    block
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("\"name\": \""))
+        .map(|rest| rest.trim_end_matches(['"', ',']).to_string())
+        .collect()
+}
+
+/// The Claude Desktop manifest names exactly the tools the binary lists.
+/// The default configuration is what is compared: `github.enabled` is off,
+/// so the six collaboration tools it gates are withheld here and are left out
+/// of the Desktop manifest too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_desktop_manifest_names_the_tools_a_default_install_lists() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let tools = client.peer().list_tools(Default::default()).await.unwrap();
+    let mut listed: Vec<String> = tools.tools.iter().map(|t| t.name.to_string()).collect();
+    listed.sort();
+    let mut manifest = desktop_manifest_tool_names();
+    manifest.sort();
+    assert_eq!(
+        manifest, listed,
+        "packaging/mcpb/generate-manifest.sh's tools block differs from the binary's tool list"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The close-folder hint on a write receipt
+// ---------------------------------------------------------------------------
+
+/// A `write_engram` call into `folder` of `eng`, returning the receipt.
+async fn write_in(peer: &Peer<RoleClient>, folder: &str, title: &str) -> Value {
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "folder": folder, "title": title, "content": "A fact about the topic." }),
+    )
+    .await
+    .unwrap()
+}
+
+fn assert_no_folder_hint(receipt: &Value) {
+    assert!(receipt.get("close_folders").is_none(), "{receipt}");
+    assert!(receipt.get("folder_guidance").is_none(), "{receipt}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_that_starts_a_folder_next_to_a_close_one_says_so() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    let first = write_in(peer, "projects/planview", "Roadmap").await;
+    // The very first folder under `projects` has no sibling at all.
+    assert_no_folder_hint(&first);
+    write_in(peer, "projects/planview", "Budget").await;
+    let unrelated = write_in(peer, "projects/billing", "Invoices").await;
+    assert_no_folder_hint(&unrelated);
+
+    let started = write_in(peer, "projects/planview-work", "Standup").await;
+    assert_eq!(
+        started["close_folders"],
+        json!([{ "folder": "projects/planview", "engrams": 2 }]),
+        "{started}"
+    );
+    assert_eq!(
+        started["folder_guidance"],
+        "This write started a new folder next to existing folders with a close name. If it is the same topic, move the engram there with move_engram and keep one folder; if the topics differ, leave it."
+    );
+
+    // The second engram in the new folder does not start it.
+    let second = write_in(peer, "projects/planview-work", "Retro").await;
+    assert_no_folder_hint(&second);
+    // Nor does a write into a folder that already held engrams.
+    let existing = write_in(peer, "projects/planview", "Risks").await;
+    assert_no_folder_hint(&existing);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_top_level_folder_is_compared_with_the_top_level_folders() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    write_in(peer, "meetings", "Kickoff").await;
+    let started = write_in(peer, "meeting", "Weekly").await;
+    assert_eq!(
+        started["close_folders"],
+        json!([{ "folder": "meetings", "engrams": 1 }]),
+        "{started}"
+    );
+    // A deeper new level is compared at the first level the write created:
+    // `meeting` exists now, so `meeting/notes/2026` creates `meeting/notes`,
+    // which has no sibling.
+    let deeper = write_in(peer, "meeting/notes/2026", "Planning").await;
+    assert_no_folder_hint(&deeper);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_overwrite_never_carries_the_folder_hint() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    write_in(peer, "planview", "Roadmap").await;
+    write_in(peer, "planview-work", "Standup").await;
+    let replaced = call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "folder": "planview-work",
+            "title": "Standup",
+            "content": "A new body.",
+            "overwrite": true
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(replaced["action"], "written", "{replaced}");
+    assert_no_folder_hint(&replaced);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_review_mode_the_folder_hint_sees_the_callers_own_drafts() {
+    let h = Harness::build_tweaked(&["eng"], false, true, |cfg, _| {
+        cfg.domains.get_mut("eng").unwrap().review = Some(ReviewMode::Overlay);
+    })
+    .await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    let first = write_in(peer, "planview", "Roadmap").await;
+    assert_eq!(first["draft"], true, "{first}");
+    write_in(peer, "planview", "Budget").await;
+    assert!(
+        !h.root.join("eng/planview").exists(),
+        "the drafts did not move the tree"
+    );
+    let started = write_in(peer, "planview-work", "Standup").await;
+    assert_eq!(
+        started["close_folders"],
+        json!([{ "folder": "planview", "engrams": 2 }]),
+        "{started}"
+    );
+    let second = write_in(peer, "planview-work", "Retro").await;
+    assert_no_folder_hint(&second);
+}
+
+/// write_engram's copy names the close_folders receipt key and the verb that
+/// acts on it; evolve_engrams' copy names V112.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_descriptions_teach_close_folders_and_v112() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let tools = client.peer().list_tools(Default::default()).await.unwrap();
+    let description = |name: &str| {
+        tools
+            .tools
+            .iter()
+            .find(|t| t.name == name)
+            .and_then(|t| t.description.as_deref())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let write = description("write_engram");
+    assert!(
+        write.contains("close_folders") && write.contains("move_engram"),
+        "write_engram names the hint: {write}"
+    );
+    let evolve = description("evolve_engrams");
+    assert!(
+        evolve.contains("V112") && evolve.contains("close names"),
+        "evolve_engrams names V112: {evolve}"
+    );
+}
+
+/// Over MCP, `evolve_ack V112` on an engram that is not the row's anchor
+/// records the pair its folder is in, and `remove V112` on the anchor (the
+/// engram the queue row names) takes it back from there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_v112_ack_off_the_anchor_is_recorded_for_its_pair_and_removed_from_the_anchor() {
+    let h = Harness::new(&["eng"]).await;
+    for path in ["meeting/kickoff", "meetings/a", "meetings/b", "meetings/c"] {
+        let abs = h.root.join(format!("eng/{path}.md"));
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(
+            abs,
+            format!(
+                "---\ntype: engram\ntitle: {path}\npermalink: {path}\ntags:\n  - work\nstatus: stable\nrecorded_at: 2026-07-25\n---\n\nWhat {path} holds.\n\n- [fact] one line\n- [fact] two lines\n"
+            ),
+        )
+        .unwrap();
+    }
+    h.engine.sync(None).await.unwrap();
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+    let ack = |identifier: &str, value: &str| {
+        json!({
+            "domain": "eng",
+            "identifier": identifier,
+            "operation": "set_frontmatter",
+            "key": "evolve_ack",
+            "value": value,
+        })
+    };
+
+    let recorded = call(
+        peer,
+        "edit_engram",
+        ack("meetings/a", "V112 not the same topic"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        recorded["evolve_ack"]["scope"], "meeting, meetings",
+        "{recorded}"
+    );
+    let removed = call(peer, "edit_engram", ack("meeting/kickoff", "remove V112"))
+        .await
+        .unwrap();
+    assert_eq!(removed["evolve_ack_removed"], "V112", "{removed}");
+    assert_eq!(
+        removed["evolve_ack_removed_from"],
+        json!(["meetings/a"]),
+        "{removed}"
+    );
+    let a = std::fs::read_to_string(h.root.join("eng/meetings/a.md")).unwrap();
+    assert!(!a.contains("evolve_ack"), "{a}");
 }

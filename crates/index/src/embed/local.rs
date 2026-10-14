@@ -353,6 +353,17 @@ async fn load_pinned(
     }
 }
 
+/// The checks a build makes that need no device: `config.json` parses and
+/// names this model. A cache that holds the wrong files, or files that are
+/// not a model at all, fails here, by name, before a GPU is opened for it
+/// and rather than deep inside candle on a missing tensor. Answers the
+/// config text, so every build of this load reads the file once.
+fn check_files(files: &HubFiles, model: &LocalModel) -> Result<String> {
+    let config_text = read(files.config()?)?;
+    check_model_type(&config_text, model)?;
+    Ok(config_text)
+}
+
 /// [`build_encoder`] on a blocking thread: it mmaps and parses the weights.
 /// The device is the best one that builds the model and embeds a warm-up
 /// text; a GPU failure only falls back to the CPU, so the error this returns,
@@ -366,9 +377,10 @@ async fn build_on_blocking(
     model: &'static LocalModel,
 ) -> Result<ModelSlot<Encoder>> {
     tokio::task::spawn_blocking(move || {
+        let config_text = check_files(&files, model)?;
         let (encoder, report) = load_on_best_device(
             EMBEDDING_MODEL,
-            |device| build_encoder(&files, model, device),
+            |device| build_encoder(&files, &config_text, model, device),
             |encoder| embed_texts(encoder, &["warm-up".to_string()]).map(|_| ()),
         )?;
         Ok(ModelSlot::new(
@@ -376,26 +388,28 @@ async fn build_on_blocking(
             encoder,
             report,
             IndexError::Embedding,
-            move || build_encoder(&files, model, &Device::Cpu),
+            move || build_encoder(&files, &config_text, model, &Device::Cpu),
         ))
     })
     .await
     .map_err(|e| IndexError::Embedding(format!("model load task failed: {e}")))?
 }
 
-fn build_encoder(files: &HubFiles, model: &LocalModel, device: &Device) -> Result<Encoder> {
-    let config_text = read(files.config()?)?;
-    // A cache holding another model's files fails here, by name, rather than
-    // deep inside candle on a missing tensor.
-    check_model_type(&config_text, model)?;
-
+/// Build the encoder on `device` from `config_text`, the `config.json`
+/// [`check_files`] already read and checked.
+fn build_encoder(
+    files: &HubFiles,
+    config_text: &str,
+    model: &LocalModel,
+    device: &Device,
+) -> Result<Encoder> {
     let mut tokenizer = Tokenizer::from_file(files.tokenizer()?)
         .map_err(|e| IndexError::Embedding(format!("loading tokenizer.json: {e}")))?;
     let tokenizer_config_text = match files.tokenizer_config() {
         Some(path) => read(path)?,
         None => "{}".to_string(),
     };
-    let pad = pad_id(&tokenizer, &tokenizer_config_text, &config_text)?;
+    let pad = pad_id(&tokenizer, &tokenizer_config_text, config_text)?;
     tokenizer.with_padding(Some(PaddingParams {
         strategy: PaddingStrategy::BatchLongest,
         pad_id: pad,
@@ -423,11 +437,11 @@ fn build_encoder(files: &HubFiles, model: &LocalModel, device: &Device) -> Resul
     };
     let loaded = match model.architecture {
         Architecture::Bert => {
-            let config: BertConfig = parse_config(&config_text)?;
+            let config: BertConfig = parse_config(config_text)?;
             Loaded::Bert(Box::new(BertModel::load(vb, &config).map_err(build_error)?))
         }
         Architecture::ModernBert => {
-            let config: ModernBertConfig = parse_config(&config_text)?;
+            let config: ModernBertConfig = parse_config(config_text)?;
             Loaded::ModernBert(ModernBert::load(vb, &config).map_err(build_error)?)
         }
     };
@@ -540,8 +554,9 @@ mod tests {
     use hf_hub::HFClient;
 
     use super::{
-        MAX_INPUT_CHARS, cached_path, cap_chars, check_model_type, cls_pool, ensure_files_with,
-        load_encoder_with, load_files_with,
+        HubFiles, MAX_INPUT_CHARS, build_on_blocking, cached_path, cap_chars, check_files,
+        check_model_type, cls_pool, ensure_files_with, hub_repo, load_encoder_with,
+        load_files_with,
     };
     use crate::embed::models::{
         LocalModel, SnapshotChoice, choose_snapshot, lookup_local_model, older_snapshot_warning,
@@ -1004,6 +1019,36 @@ mod tests {
                 pinned_differs: false
             }
         );
+    }
+
+    /// The whole blocking build of files that are not a model fails with the
+    /// config's own reason.
+    #[tokio::test]
+    async fn a_build_of_files_that_are_not_a_model_fails_on_the_config() {
+        let granite = lookup_local_model("granite-embedding-97m-multilingual-r2").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let older = "1111111111111111111111111111111111111111";
+        cache_from_main(tmp.path(), granite, older);
+        let files = HubFiles::from_snapshot(tmp.path(), &hub_repo(granite), older);
+        let err = build_on_blocking(files, granite)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("parsing config.json"), "{err}");
+    }
+
+    /// Files that are not a model fail before any device is opened, with the
+    /// config's own reason: the build never reaches the GPU.
+    #[tokio::test]
+    async fn files_that_are_not_a_model_fail_before_a_device_is_opened() {
+        let granite = lookup_local_model("granite-embedding-97m-multilingual-r2").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let older = "1111111111111111111111111111111111111111";
+        cache_from_main(tmp.path(), granite, older);
+        let files = HubFiles::from_snapshot(tmp.path(), &hub_repo(granite), older);
+        let err = check_files(&files, granite).unwrap_err().to_string();
+        assert!(err.contains("parsing config.json"), "{err}");
     }
 
     /// An older snapshot that fails to build (here: files that are not a

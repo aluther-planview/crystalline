@@ -555,6 +555,43 @@ async fn a_viewer_role_grantee_opens_read_only_with_a_reason() {
     );
 }
 
+/// The reason a write list gives for a read-only draft names the list and who
+/// changes it, in the words the CLI command carries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_list_grantee_opens_read_only_with_the_list_named() {
+    let _serialized = crate::support::maintenance_guard().await;
+    let f = serve().await;
+    let path = f.draft("alice", "Fresh", "A page only alice has.").await;
+    f.auth
+        .set_write_list("bob", &["other".to_string()])
+        .await
+        .unwrap();
+    let alice = login(f.addr, "alice").await;
+    let bob = login(f.addr, "bob").await;
+    let token = f.mint(&alice, &path).await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let accepted: serde_json::Value = bob
+        .request(f.addr, reqwest::Method::POST, "/api/v1/draft-links/accept")
+        .json(&serde_json::json!({"token": token}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(accepted["editable"], serde_json::json!(false), "{accepted}");
+    let reason = accepted["reason"].as_str().unwrap();
+    assert!(
+        reason.contains(
+            "you are reading this draft: 'team' is not on the write list of 'bob'; an instance \
+             admin changes it with crystalline users writes"
+        ),
+        "the reason names the list and who changes it: {reason}"
+    );
+}
+
 /// The grant widens one path and nothing else.
 ///
 /// The property the whole mode rests on, asserted from the one direction that
@@ -1152,6 +1189,55 @@ async fn a_granted_read_answers_the_draft_and_names_whose() {
         stranger.status(),
         404,
         "while somebody holding no link sees exactly what they saw before"
+    );
+}
+
+/// A granted draft read carries the same read-only mark every other read does:
+/// the viewer who was handed the link cannot write in the domain, the editor
+/// who accepts the same link can, so only the viewer's answer says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_granted_draft_read_carries_the_read_only_mark() {
+    let _serialized = crate::support::maintenance_guard().await;
+    let f = serve().await;
+    let path = f.draft("alice", "Fresh", "A page only alice has.").await;
+    let alice = login(f.addr, "alice").await;
+    let vera = login(f.addr, "vera").await;
+    let bob = login(f.addr, "bob").await;
+    for who in [&vera, &bob] {
+        // A link binds the first account that accepts it, so each grantee
+        // holds a link of their own.
+        let token = f.mint(&alice, &path).await["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let accepted = who
+            .request(f.addr, reqwest::Method::POST, "/api/v1/draft-links/accept")
+            .json(&serde_json::json!({"token": token}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), 200, "the link is accepted");
+    }
+    let read_as = |who: &Session| {
+        who.request(
+            f.addr,
+            reqwest::Method::GET,
+            "/api/v1/domains/team/engrams/fresh",
+        )
+        .send()
+    };
+    let hers: serde_json::Value = read_as(&vera).await.unwrap().json().await.unwrap();
+    assert_eq!(hers["draft"], serde_json::json!(true), "{hers}");
+    assert_eq!(
+        hers["read_only"],
+        serde_json::json!(true),
+        "a viewer reading a granted draft is told she cannot write: {hers}"
+    );
+    let his: serde_json::Value = read_as(&bob).await.unwrap().json().await.unwrap();
+    assert_eq!(his["draft"], serde_json::json!(true), "{his}");
+    assert!(
+        his.get("read_only").is_none(),
+        "an editor's granted read has no read_only key: {his}"
     );
 }
 
@@ -3313,6 +3399,38 @@ fn append_edit(line: &str) -> crystalline_service::params::EditParams {
     }
 }
 
+/// An agent presenting a link while its account's write list leaves the
+/// domain out reads the draft and is told which list says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_agent_off_the_write_list_is_handed_the_link_read_only() {
+    let _serialized = crate::support::maintenance_guard().await;
+    let f = serve().await;
+    let path = f.draft("alice", "Fresh", "A page only alice has.").await;
+    f.auth
+        .set_write_list("bob", &["other".to_string()])
+        .await
+        .unwrap();
+    let alice = login(f.addr, "alice").await;
+    let token = f.mint(&alice, &path).await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    match f
+        .engine
+        .open_share_link(&token, &as_account("bob"), &agent_holder("bob"))
+        .await
+        .expect("the link still opens")
+    {
+        crystalline_service::engine::OpenedLink::ReadOnly(reason) => assert!(
+            reason.contains("is not on the write list of 'bob'"),
+            "{reason}"
+        ),
+        crystalline_service::engine::OpenedLink::Joined { .. } => {
+            panic!("a write-list exclusion must not open a join")
+        }
+    }
+}
+
 /// An agent presents the link it was handed and composes into the author's
 /// draft: the two browser steps in one, and the write lands where the author
 /// will review it.
@@ -3509,5 +3627,198 @@ async fn an_agents_join_ending_leaves_the_browsers_key_alone() {
             .joins()
             .holds("bob", &browser_holder(&bob), "team", "alice", &path),
         "which the co-editing upgrade still agrees with"
+    );
+}
+
+/// The review-mode fixture the `V112` take-back tests share: the pair
+/// `meeting`, `meetings` acknowledged on `meeting/intro` and on
+/// `meeting/kickoff`, and alice's draft of kickoff shared with bob to read,
+/// which bob has not joined.
+async fn shared_v112_fixture() -> (Fixture, Session, Session, std::path::PathBuf) {
+    let f = serve().await;
+    let dir = f.root.join("team");
+    let page = |permalink: &str, ack: bool| {
+        let ack = if ack {
+            "evolve_ack:\n- { rule: V112, scope: \"meeting, meetings\", note: not the same topic }\n"
+        } else {
+            ""
+        };
+        format!(
+            "---\ntype: engram\ntitle: {permalink}\npermalink: {permalink}\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-07-25\n{ack}---\n\nWhat {permalink} holds.\n\n- [fact] one line\n- [fact] two lines\n"
+        )
+    };
+    for (path, ack) in [
+        ("meeting/agenda", false),
+        ("meeting/intro", true),
+        ("meeting/kickoff", true),
+        ("meetings/a", false),
+        ("meetings/b", false),
+        ("meetings/c", false),
+        ("meetings/d", false),
+    ] {
+        let abs = dir.join(format!("{path}.md"));
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(abs, page(path, ack)).unwrap();
+    }
+    f.engine.sync(None).await.unwrap();
+
+    // alice drafts over kickoff and shares it with bob to read.
+    let mut over = append_edit("alice's line");
+    over.identifier = "meeting/kickoff".to_string();
+    f.engine
+        .edit_engram_as(&over, Some("alice"), &as_account("alice"))
+        .await
+        .unwrap();
+    let alice = login(f.addr, "alice").await;
+    let bob = login(f.addr, "bob").await;
+    bob_holds(&f, &alice, &bob, "meeting/kickoff.md").await;
+    (f, alice, bob, dir)
+}
+
+/// `remove V112` takes the pair back on every engram of the two folders, and
+/// in a domain in review mode each of those rewrites is a draft of the
+/// caller's own. A page another account drafted over and shared with the
+/// caller to read, not joined, is left as it is and named on the receipt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remove_v112_skips_and_names_a_page_shared_to_read() {
+    let _serialized = crate::support::maintenance_guard().await;
+    let (f, _alice, bob, dir) = shared_v112_fixture().await;
+
+    let receipt = f
+        .engine
+        .edit_engram_as(
+            &crystalline_service::params::EditParams {
+                identifier: "meeting/agenda".to_string(),
+                domain: "team".to_string(),
+                operation: "set_frontmatter".to_string(),
+                key: Some("evolve_ack".to_string()),
+                value: Some("remove V112".to_string()),
+                ..crystalline_service::params::EditParams::default()
+            },
+            Some("bob"),
+            &as_account("bob"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt["evolve_ack_removed"], "V112", "{receipt}");
+    assert_eq!(
+        receipt["evolve_ack_removed_from"],
+        serde_json::json!(["meeting/intro"]),
+        "{receipt}"
+    );
+    let skipped = &receipt["evolve_ack_not_removed_from"];
+    assert_eq!(skipped[0]["permalink"], "meeting/kickoff", "{receipt}");
+    assert!(
+        skipped[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("shared with you to read"),
+        "{receipt}"
+    );
+    assert_eq!(skipped.as_array().unwrap().len(), 1, "{receipt}");
+
+    // Review mode: the take-back on intro is bob's draft, the team's file is
+    // untouched, and alice's draft of kickoff still holds its entry.
+    let on_disk = std::fs::read_to_string(dir.join("meeting/intro.md")).unwrap();
+    assert!(on_disk.contains("meeting, meetings"), "{on_disk}");
+    let bobs = f
+        .engine
+        .read_engram(&read_as("meeting/intro"), &as_account("bob"))
+        .await
+        .unwrap();
+    assert!(
+        !bobs["content"].as_str().unwrap().contains("evolve_ack"),
+        "{bobs}"
+    );
+    let alices = f
+        .engine
+        .read_engram(&read_as("meeting/kickoff"), &as_account("alice"))
+        .await
+        .unwrap();
+    let entries = &alices["frontmatter"]["extra"]["evolve_ack"];
+    assert_eq!(entries.as_array().map(Vec::len), Some(1), "{alices}");
+    assert_eq!(entries[0]["rule"], "V112", "{alices}");
+    assert_eq!(entries[0]["scope"], "meeting, meetings", "{alices}");
+
+    // Fluid's withdraw, now that the pair's entry stands only on the page bob
+    // may not rewrite: not a 404 "nothing to withdraw" but a 409 naming it.
+    let withdrawn = bob
+        .request(
+            f.addr,
+            reqwest::Method::DELETE,
+            "/api/v1/domains/team/evolve/ack",
+        )
+        .json(&serde_json::json!({"permalink": "meeting/agenda", "rule": "V112"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(withdrawn.status(), 409);
+    let problem: serde_json::Value = withdrawn.json().await.unwrap();
+    let detail = problem["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("meeting/kickoff") && detail.contains("shared with you to read"),
+        "{problem}"
+    );
+
+    // The agent's `remove V112` meets the same state with the same variant
+    // the REST answer comes from: a conflict, not an invalid request.
+    let refused = f
+        .engine
+        .edit_engram_as(
+            &crystalline_service::params::EditParams {
+                identifier: "meeting/agenda".to_string(),
+                domain: "team".to_string(),
+                operation: "set_frontmatter".to_string(),
+                key: Some("evolve_ack".to_string()),
+                value: Some("remove V112".to_string()),
+                ..crystalline_service::params::EditParams::default()
+            },
+            Some("bob"),
+            &as_account("bob"),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&refused, crystalline_service::EngineError::Conflict(m)
+            if m.contains("meeting/kickoff") && m.contains("shared with you to read")),
+        "{refused:?}"
+    );
+}
+
+/// Fluid's withdrawal that takes the pair back on some pages and has to leave
+/// it on one answers 409, not 204: the row stays silenced, and the detail
+/// names the page left with its reason and the pages whose entries went.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_withdrawal_that_leaves_an_entry_behind_answers_409() {
+    let _serialized = crate::support::maintenance_guard().await;
+    let (f, _alice, bob, _dir) = shared_v112_fixture().await;
+
+    let withdrawn = bob
+        .request(
+            f.addr,
+            reqwest::Method::DELETE,
+            "/api/v1/domains/team/evolve/ack",
+        )
+        .json(&serde_json::json!({"permalink": "meeting/agenda", "rule": "V112"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(withdrawn.status(), 409);
+    let problem: serde_json::Value = withdrawn.json().await.unwrap();
+    let detail = problem["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("taken back on 'meeting/intro'")
+            && detail.contains("stays on 'meeting/kickoff'")
+            && detail.contains("shared with you to read"),
+        "{problem}"
+    );
+    let bobs = f
+        .engine
+        .read_engram(&read_as("meeting/intro"), &as_account("bob"))
+        .await
+        .unwrap();
+    assert!(
+        !bobs["content"].as_str().unwrap().contains("evolve_ack"),
+        "the entry that could go went: {bobs}"
     );
 }

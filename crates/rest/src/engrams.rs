@@ -30,7 +30,7 @@
 
 use axum::Json;
 use axum::extract::State;
-use axum::http::header::{CACHE_CONTROL, ETAG};
+use axum::http::header::{CACHE_CONTROL, ETAG, VARY};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
@@ -308,7 +308,12 @@ fn listing_order(sort: Option<&str>, dir: Option<&str>) -> Result<SearchOrder, A
                    both the 200 and the 304 keeps a stored copy revalidating \
                    instead of going heuristically fresh, so a save elsewhere - \
                    or an upgrade that changed this JSON's own shape - is \
-                   picked up on its next use.",
+                   picked up on its next use.\n\nWhen the answer says \
+                   `read_only: true` for this caller, the tag ends in `-ro` \
+                   (`\"{checksum}-{version}-ro\"`), so a tag held by a \
+                   reader who may not write never answers 304 to one who \
+                   may. `If-Match` accepts the tag with or without it. The \
+                   response carries `Vary: Cookie, Authorization`.",
     params(
         ("domain" = String, Path, description = "The registered domain."),
         (
@@ -349,6 +354,8 @@ fn listing_order(sort: Option<&str>, dir: Option<&str>) -> Result<SearchOrder, A
                  against."),
                 ("cache-control" = String, description = "Always `no-cache`: \
                  store it, but revalidate before every use."),
+                ("vary" = String, description = "Always `Cookie, \
+                 Authorization`: the body depends on who reads it."),
             ),
             example = json!({
                 "domain": "eng",
@@ -422,9 +429,14 @@ pub async fn detail(
     // validator for the same engram, which `no-cache` and the per-session
     // auth make harmless.
     let mut value = value;
+    if super::domains::reads_only(&identity) {
+        value["read_only"] = serde_json::json!(true);
+    }
     crate::web_url::attach_engram_url(&mut value, &state.engine.request_web_base(&headers));
-    let checksum = checksum_of(&value)?.to_string();
-    if if_none_match_matches(&headers, &versioned_etag(&checksum)) {
+    // This caller's own tag: a read-only answer carries the `-ro` suffix, so
+    // a tag cached by a reader who may not write never answers 304 to one
+    // who may, and the other way round.
+    if if_none_match_matches(&headers, &engram_tag(&value)?) {
         // The validator and `Cache-Control`, no body: the shape is stated
         // once, on `if_none_match_matches`.
         return Ok((
@@ -432,6 +444,7 @@ pub async fn detail(
             [
                 (ETAG, etag(&value)?),
                 (CACHE_CONTROL, HeaderValue::from_static(REVALIDATE)),
+                (VARY, HeaderValue::from_static(VARY_BY_CALLER)),
             ],
         )
             .into_response());
@@ -441,8 +454,19 @@ pub async fn detail(
     resp.headers_mut().insert(ETAG, etag);
     resp.headers_mut()
         .insert(CACHE_CONTROL, HeaderValue::from_static(REVALIDATE));
+    resp.headers_mut()
+        .insert(VARY, HeaderValue::from_static(VARY_BY_CALLER));
     Ok(resp)
 }
+
+/// The engram read's body depends on who asks (its `read_only` mark), so a
+/// shared cache must key it by the request's credentials too.
+const VARY_BY_CALLER: &str = "Cookie, Authorization";
+
+/// The suffix a read-only answer's tag carries after the version. A write's
+/// `If-Match` keeps only the checksum before the first `-` (see
+/// [`super::if_match`]), so a tag with or without it is the same precondition.
+const READ_ONLY_TAG_SUFFIX: &str = "-ro";
 
 /// The query string `GET /domains/{domain}/inbound/{*permalink}` takes: which
 /// references to keep, and which page of them to answer with.
@@ -723,7 +747,10 @@ pub struct MoveBody {
 /// its `guidance` string are copied off the receipt onto the answer, so a
 /// create is also the search the author did not run. A title that slugifies
 /// into something its author would not expect back carries `notices` beside
-/// them. Every one of those keys is absent when there is nothing to say.
+/// them, and a create that started a new folder next to a sibling folder with
+/// a close name carries `close_folders` and `folder_guidance`, as the MCP
+/// write receipt does. Every one of those keys is absent when there is nothing
+/// to say.
 ///
 /// A permalink already taken is the engine's `Conflict`, answered 409: this
 /// route never overwrites, so a client that means to replace something saves it
@@ -755,7 +782,11 @@ pub struct MoveBody {
                            which lands the engram nested, or a `:`, which a \
                            link reads as a domain prefix - also carries a \
                            `notices` list of sentences naming what happened \
-                           and what to write instead.",
+                           and what to write instead. A create that started a \
+                           new folder next to sibling folders with a close name \
+                           (planview beside planview-work, note beside notes) \
+                           carries `close_folders`, up to three \
+                           {folder, engrams}, and a `folder_guidance` string.",
             body = Object,
             headers(("etag" = String, description = "The quoted \
                      `\"{checksum}-{version}\"` of the engram as written, \
@@ -880,11 +911,20 @@ pub async fn create(
     // verb: the probe takes that lock again and it is not reentrant. It never
     // fails and never delays the answer past its own two-second ceiling; a
     // probe that finds nothing leaves the receipt untouched.
+    //
+    // The close-folder hint rides beside it, run at the same time so the
+    // answer waits for the slower of the two rather than both: a create that
+    // started a folder next to a sibling with a close name says so, exactly as
+    // the MCP write receipt does.
     let scope = identity.scope();
-    state
-        .engine
-        .attach_similar(&mut written, SimilarProbe::for_write(&params), &scope)
-        .await;
+    let folders = crate::engine::Engine::close_folder_probe(&written);
+    let ((), close) = tokio::join!(
+        state
+            .engine
+            .attach_similar(&mut written, SimilarProbe::for_write(&params), &scope),
+        state.engine.close_folders_for(folders.as_ref(), &scope),
+    );
+    crate::engine::Engine::attach_close_folders(&mut written, &close);
     let permalink = written["permalink"]
         .as_str()
         .ok_or_else(|| ApiError::internal("the write did not report a permalink to read back"))?
@@ -1948,10 +1988,11 @@ async fn detail_response(
 /// route answers with. The detail is what the editor renders; these ride beside
 /// it under the same keys the MCP receipt uses, so one reader learns one shape.
 ///
-/// Two independent things travel here. The neighbours advisory is a pair -
+/// Three independent things travel here. The neighbours advisory is a pair -
 /// `similar` and `guidance` - and travels as a pair or not at all. The title
 /// notices are their own: a write can produce a surprising permalink with no
-/// neighbour in sight.
+/// neighbour in sight. The close-folder hint is a pair too, `close_folders`
+/// and `folder_guidance`.
 ///
 /// Safe to do before [`etag`] runs: the tag is taken from the payload's own
 /// `checksum`, which is the version of the engram on disk, rather than hashed
@@ -1966,6 +2007,12 @@ fn carry_advisory(detail: &mut Value, receipt: &Value) {
     }
     if let Some(notices) = receipt.get("notices") {
         detail.insert("notices".to_string(), notices.clone());
+    }
+    if let (Some(folders), Some(guidance)) =
+        (receipt.get("close_folders"), receipt.get("folder_guidance"))
+    {
+        detail.insert("close_folders".to_string(), folders.clone());
+        detail.insert("folder_guidance".to_string(), guidance.clone());
     }
 }
 
@@ -1987,9 +2034,20 @@ fn carry_advisory(detail: &mut Value, receipt: &Value) {
 /// `checksum` from a read; it guards against a future contract break, loudly,
 /// rather than letting an engram be served without a version.
 fn etag(value: &Value) -> Result<HeaderValue, ApiError> {
-    let checksum = checksum_of(value)?;
-    HeaderValue::from_str(&format!("\"{}\"", versioned_etag(checksum)))
+    HeaderValue::from_str(&format!("\"{}\"", engram_tag(value)?))
         .map_err(|_| ApiError::internal("the engram's checksum is not a usable ETag"))
+}
+
+/// The unquoted tag [`etag`] sends: the [`versioned_etag`] of the checksum,
+/// plus [`READ_ONLY_TAG_SUFFIX`] when this answer says `read_only: true`. A
+/// caller who may write keeps the plain versioned tag.
+fn engram_tag(value: &Value) -> Result<String, ApiError> {
+    let tag = versioned_etag(checksum_of(value)?);
+    Ok(if value["read_only"] == Value::Bool(true) {
+        format!("{tag}{READ_ONLY_TAG_SUFFIX}")
+    } else {
+        tag
+    })
 }
 
 /// The raw checksum an engram read carries, unquoted: what [`etag`] wraps into
@@ -2016,6 +2074,17 @@ mod tests {
         assert_eq!(
             etag(&value).unwrap(),
             format!("\"abc123-{}\"", crystalline_core::VERSION)
+        );
+    }
+
+    /// A read-only answer's tag carries the suffix, so it never matches the
+    /// tag of an answer for a caller who may write.
+    #[test]
+    fn a_read_only_answer_tags_itself_apart() {
+        let value = serde_json::json!({ "checksum": "abc123", "read_only": true });
+        assert_eq!(
+            etag(&value).unwrap(),
+            format!("\"abc123-{}-ro\"", crystalline_core::VERSION)
         );
     }
 

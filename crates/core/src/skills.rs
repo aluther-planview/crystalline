@@ -310,6 +310,14 @@ mod tests {
     }
 
     #[test]
+    fn the_capture_skill_teaches_the_close_folder_hint() {
+        let capture = skill("crystalline-capture").unwrap().content;
+        for needle in ["`close_folders`", "`move_engram`", "V112"] {
+            assert!(capture.contains(needle), "capture skill lacks {needle}");
+        }
+    }
+
+    #[test]
     fn the_skills_teach_per_engram_provenance_and_citing_it() {
         let capture = skill("crystalline-capture").unwrap().content;
         for needle in [
@@ -397,10 +405,66 @@ mod tests {
     /// `read_only` means and where to write instead (spec A-5, B-6).
     #[test]
     fn the_skills_teach_that_a_read_only_domain_takes_no_writes() {
-        let sentence = "A domain whose routing line says (read-only), or whose row carries `read_only: true` (a domain row's `read_only`), is not a place for you to write: it is locked, your role only reads it, or it is not on your account's write list. Search and read it, and write where the routing block allows.";
+        let sentence = "A domain whose routing line says (read-only), or whose row carries `read_only: true` (a domain row's `read_only`), is not a place for you to write. It is locked, your role only reads it, or it is not on your account's write list. Search and read it, and write where the routing block allows.";
         for name in ["crystalline-intelligence", "crystalline-capture"] {
             let body = skill(name).unwrap().content;
             assert!(body.contains(sentence), "{name}");
+        }
+    }
+
+    /// An agent that finds a wrong engram it cannot fix asks the person to
+    /// fix it, with the page link and the evidence, instead of staying quiet.
+    #[test]
+    fn the_skills_teach_asking_a_person_to_fix_a_wrong_engram() {
+        for name in ["crystalline-intelligence", "crystalline-capture"] {
+            let body = skill(name).unwrap().content;
+            for needle in [
+                "A wrong engram you cannot fix yourself still gets fixed",
+                "give its `web_url`",
+                "what is true instead and the source that shows it",
+                "Never leave a wrong engram unmentioned",
+                "Still capture the correct fact where you may write",
+                "tell the person about both",
+            ] {
+                assert!(body.contains(needle), "{name} lacks {needle:?}");
+            }
+        }
+    }
+
+    /// The two skills an ingesting agent reads teach the sources pattern:
+    /// every location in a `sources` list, kept current with set_frontmatter,
+    /// found again with $contains_any, never a reason to retire on its own,
+    /// and the fallback for an older server (0.25.1 spec C-2).
+    #[test]
+    fn the_skills_teach_keeping_sources_current() {
+        let capture = skill("crystalline-capture").unwrap().content;
+        for needle in [
+            "`key: \"sources\"`, `values: [...]`",
+            "Every location an engram was distilled from goes into its `sources` list",
+            "`https://github.com/{org}/{repo}/blob/main/{path}`",
+            "`set_frontmatter` takes all three, and it takes `sources`",
+            "`{\"sources\": {\"$contains_any\": [...]}}`",
+            "That alone is not a reason to retire it.",
+            "make no call",
+            "`unknown operator '$contains'`",
+            "The record also lists the source's stable addresses in `sources`",
+            "the whole `sources` list with the old address replaced by the new one",
+            "point `resource` at the new path",
+            "A value whose JSON text is longer than 1024 bytes (quotes and escapes count)",
+        ] {
+            assert!(capture.contains(needle), "capture skill lacks {needle}");
+        }
+        let desktop = skill("crystalline-intelligence").unwrap().content;
+        for needle in [
+            "filter `search_engrams` on its `sources` list",
+            "`$contains_any`",
+            "`unknown operator '$contains'`",
+            "every location it was distilled from in a `sources` list",
+        ] {
+            assert!(
+                desktop.contains(needle),
+                "intelligence skill lacks {needle}"
+            );
         }
     }
 }

@@ -125,7 +125,7 @@ pub const TREE_LEVEL_CAP: usize = 500;
 /// Clamped rather than refused, like every other bound on this surface: a hand
 /// written URL asking for too much gets the largest page there is, not a 4xx.
 ///
-/// The same number as [`MAX_INBOUND_LIMIT`] and for the same reason, kept as
+/// The same number as `MAX_INBOUND_LIMIT` and for the same reason, kept as
 /// its own constant because the two bound different queries and either could
 /// move without the other: this one bounds a sorter holding bodies, that one
 /// bounds how much of the reference index a popover materializes.
@@ -176,11 +176,14 @@ pub const EVOLVE_GUIDANCE: &str = "This queue changes nothing by itself. Present
 /// the lifecycle surface an agent tends while keeping knowledge honest, plus
 /// one engram's `tags`. `resource` and `source_version` are the source a piece
 /// of knowledge was taken from and the version of it that was read; a
-/// re-ingest moves both. Every other key is refused there, because identity
-/// (`permalink`, `title`, `type`), the record of when knowledge was captured
-/// (`recorded_at`) and the write provenance (`generated`) are owned by the
-/// tools that maintain them and a blind assignment would corrupt an address or
-/// a history. Bulk tag hygiene across a domain stays with `crystalline tags`.
+/// re-ingest moves both. `sources` lists every location the engram was
+/// distilled from, which a `$contains` filter finds it by, so an ingesting
+/// agent keeps it current as locations change. Every other key is refused
+/// there, because identity (`permalink`, `title`, `type`), the record of when
+/// knowledge was captured (`recorded_at`) and the write provenance
+/// (`generated`) are owned by the tools that maintain them and a blind
+/// assignment would corrupt an address or a history. Bulk tag hygiene across a
+/// domain stays with `crystalline tags`.
 pub const SETTABLE_FRONTMATTER_KEYS: &[&str] = &[
     "tags",
     "status",
@@ -190,6 +193,7 @@ pub const SETTABLE_FRONTMATTER_KEYS: &[&str] = &[
     "source_date",
     "resource",
     "source_version",
+    "sources",
     "salience",
     "verified",
     "evolve_ack",
@@ -197,8 +201,9 @@ pub const SETTABLE_FRONTMATTER_KEYS: &[&str] = &[
 
 /// The settable keys whose value is a list: `set_frontmatter` takes the whole
 /// new list as `values` and writes it as a block list, where every other key
-/// takes one `value`.
-pub const LIST_FRONTMATTER_KEYS: &[&str] = &["tags"];
+/// takes one `value`. `tags` folds each entry to the tag spelling; `sources`
+/// keeps each entry exactly as given.
+pub const LIST_FRONTMATTER_KEYS: &[&str] = &["tags", "sources"];
 
 /// [`SETTABLE_FRONTMATTER_KEYS`] rendered for an error message.
 fn settable_keys() -> String {
@@ -648,7 +653,7 @@ pub type OriginProgress = std::sync::Arc<dyn Fn(u64, u64, &str) + Send + Sync>;
 
 /// The GitHub identity calls the `configure` tool's connect actions need:
 /// validating a token and running a device flow to completion. Production
-/// always uses [`RealConnectAuth`], a thin pass-through to
+/// always uses `RealConnectAuth`, a thin pass-through to
 /// `crystalline_remote::github::auth`; tests inject a fake so the
 /// pending-connect state machine (one flow at a time, a landed outcome
 /// reported once, the slot cleared after) can be driven deterministically,
@@ -713,7 +718,7 @@ impl ConnectAuth for RealConnectAuth {
 
 /// A message from the engine to the daemon's file watcher: a domain root to
 /// start or stop watching, raised when a domain registered after the daemon
-/// started is first resolved (see [`Engine::domain_entry`]) or removed (see
+/// started is first resolved (see `Engine::domain_entry`) or removed (see
 /// [`Engine::forget_domain`]). Only the daemon's watcher task consumes these;
 /// embedded stdio and standalone CLI commands never install a receiver.
 #[derive(Debug, Clone)]
@@ -3038,7 +3043,7 @@ impl Engine {
     /// per-operation `GitHubProvider` build from config and the token store.
     /// Test-only: production code always leaves this unset so the provider is
     /// built from the cached GitHub token (read from the keychain at most once
-    /// per process, see [`Engine::github_credential`]) and a new `connect` is
+    /// per process, see `Engine::github_credential`) and a new `connect` is
     /// still picked up without a restart.
     pub fn with_origin_provider(mut self, provider: Arc<dyn Provider>) -> Engine {
         self.origin_provider_override = Some(provider);
@@ -3049,7 +3054,7 @@ impl Engine {
     /// share to record an author (see
     /// [`crystalline_remote::state::Proposal::author_login`]). Test-only, and
     /// only meaningful beside [`Engine::with_origin_provider`]: a mock has no
-    /// credential for [`Engine::resolve_share_provider`] to read a login off,
+    /// credential for `Engine::resolve_share_provider` to read a login off,
     /// so the login it would have carried is supplied here. Leaving it unset
     /// keeps the injected provider's original behaviour - a write that names
     /// nobody.
@@ -4835,7 +4840,7 @@ impl Engine {
     /// Every domain name this instance has a registration for, resolved the way
     /// a *named* lookup resolves one: the startup snapshot, the discovered
     /// overlay, then a re-read of the configuration file on disk - the three
-    /// tiers of [`Engine::domain_entry`], so what one verb calls registered
+    /// tiers of `Engine::domain_entry`, so what one verb calls registered
     /// another cannot call an orphan.
     ///
     /// A union of the three and not a replacement by the newest: the file is
@@ -4845,7 +4850,7 @@ impl Engine {
     /// across the tiers, so this is too.
     ///
     /// One file read per call, never one per name, and never a write: unlike
-    /// [`Engine::refresh_domain`] nothing found here is cached into the
+    /// `Engine::refresh_domain` nothing found here is cached into the
     /// discovered overlay and no watch is armed for it, because merely asking
     /// whether a domain is registered must not start indexing it. The file read
     /// failing is read as no further registrations, so the answer narrows and
@@ -4854,7 +4859,7 @@ impl Engine {
     /// **This is the set collection may key on.** A caller deciding that rows
     /// are collectable, or stamping `last_registered` for one that is not, must
     /// resolve "registered" through here rather than through
-    /// [`Engine::known_domain_names`], whose two tiers miss a registration this
+    /// `Engine::known_domain_names`, whose two tiers miss a registration this
     /// process has never been asked about by name.
     pub fn registered_domain_names(&self) -> HashSet<String> {
         self.registered_domain_entries().into_keys().collect()
@@ -5408,6 +5413,8 @@ mod domain_lookup_tests {
 // lists them in the order they stood in the single engine.rs.
 mod adopt_names;
 mod attachments;
+mod close_folders;
+pub use close_folders::FolderProbe;
 mod configure;
 mod context;
 mod contradictions;
@@ -6290,6 +6297,10 @@ struct SourceEdited {
     /// How many domain spellings the final text had rewritten to their
     /// canonical name, `0` when none were.
     normalized: usize,
+    /// Whether the edit was found to change nothing and so wrote nothing:
+    /// no file, no row, no draft, no live compose and no generated stamp.
+    /// Only an edit that asked for the check (`skip_unchanged`) reports it.
+    unchanged: bool,
 }
 
 /// A source edit that failed, and whether the source may already carry the new
@@ -6387,17 +6398,23 @@ fn decide_alias_record(source: &str, old_f: &str, new_f: &str) -> AliasRecord {
     }
 }
 
-fn routing_bullets(root: &Path) -> Vec<String> {
-    let manifest = root.join("MANIFEST.md");
-    let Ok(source) = std::fs::read_to_string(&manifest) else {
-        return Vec::new();
+/// A file domain's lock and routing bullets from one read and one parse of
+/// its MANIFEST: the lock [`Engine::domain_is_read_only`] reads
+/// (`crystalline_core::read_only_at`) and the bullets a listing with routing
+/// shows. Unlocked with no bullets when the MANIFEST is missing, unreadable
+/// or does not parse, the answer each of the two reads gives on its own.
+fn manifest_lock_and_bullets(root: &Path) -> (bool, Vec<String>) {
+    let Ok(source) = std::fs::read_to_string(root.join("MANIFEST.md")) else {
+        return (false, Vec::new());
     };
     let Ok(engram) = parse_engram(&source) else {
-        return Vec::new();
+        return (false, Vec::new());
     };
-    Manifest::from_engram(&engram, &source)
-        .routing_bullets()
-        .to_vec()
+    let manifest = Manifest::from_engram(&engram, &source);
+    (
+        manifest.read_only().is_on(),
+        manifest.routing_bullets().to_vec(),
+    )
 }
 
 fn read_engram_file(root: &Path, rel: &str) -> Option<Engram> {
@@ -6936,6 +6953,28 @@ pub enum AckIntent {
     },
 }
 
+/// What [`Engine::unacknowledge_finding_as`] took back, and what it had to
+/// leave. Nothing in either list is a withdrawal of an entry that was not
+/// there, which the REST surface answers as a 404.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Withdrawal {
+    /// The permalinks whose entries went: the named engram first when it held
+    /// one, then for `V112` every other engram of the pair's two folders.
+    pub removed_from: Vec<String>,
+    /// The permalinks still holding an entry for the named pair, each with
+    /// the reason it could not be taken back (a draft shared to read and not
+    /// joined, or a rewrite that failed). Only `V112` reaches past the engram,
+    /// so only a `V112` withdrawal ever fills it.
+    pub not_removed_from: Vec<(String, String)>,
+}
+
+impl Withdrawal {
+    /// Whether any entry went.
+    pub fn removed(&self) -> bool {
+        !self.removed_from.is_empty()
+    }
+}
+
 /// An [`AckIntent`] the server has completed, on its way to the text edit: the
 /// record carries the scope only a sweep could supply, the removal carries the
 /// rule alone because the entry it names is already in the file.
@@ -7142,9 +7181,9 @@ fn without_ack(source: &str, rule: &str, scope: Option<&str>) -> String {
 /// reads. The replacement keeps the original position, which keeps a
 /// hand-ordered list hand-ordered.
 ///
-/// The exception is [`crystalline_index::is_pair_scoped`] - `V301` and `V302` -
-/// and it exists because a twin finding, like a possible contradiction, is
-/// about a pair rather than about the engram:
+/// The exception is [`crystalline_index::is_pair_scoped`] - `V112`, `V301` and
+/// `V302` - and it exists because a twin finding, like a possible contradiction
+/// or a pair of close folders, is about a pair rather than about the engram:
 /// an engram that twins two others carries two twin findings and neither is the
 /// engram's answer about the rule. Keying those by rule alone made the second
 /// acknowledgment overwrite the first, which silenced one pair and left the
@@ -7555,9 +7594,18 @@ pub fn read_only_sentence(domain: &str) -> String {
     format!("'{domain}' is read-only; its owner switches read_only off in the domain policies")
 }
 
-/// Whether a domain-relative path is the domain's MANIFEST.
+/// Whether `rel` is the MANIFEST's path exactly, the file routing reads on a
+/// case-sensitive file system.
 pub(crate) fn is_manifest_path(rel: &str) -> bool {
     rel == "MANIFEST.md"
+}
+
+/// Whether `rel` names the MANIFEST in any letter case. The write and move
+/// checks use this: a case-insensitive file system (the macOS and Windows
+/// defaults) opens `manifest.md` as the very `MANIFEST.md` routing reads.
+/// Public so the archive import and the MCP path checks ask the same rule.
+pub fn names_the_manifest(rel: &str) -> bool {
+    rel.eq_ignore_ascii_case("MANIFEST.md")
 }
 
 /// Put the MANIFEST rules' findings about `text` on a receipt, when there are

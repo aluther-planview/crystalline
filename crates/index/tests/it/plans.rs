@@ -294,6 +294,27 @@ pub fn registry() -> Vec<HotStatement> {
             postgres_must_seek: &[],
         },
         HotStatement {
+            // The close-folder hint asks this on every write that may have
+            // started a folder: is anything else already under it. A byte
+            // range over `path`, which turso seeks on `idx_engram_path_actor`;
+            // on postgres the default-collation index cannot serve the
+            // `COLLATE "C"` range, so v19 adds `idx_engram_base_path_c`.
+            issued_by: "Store::folder_holds_other",
+            turso: || crystalline_index::turso::FOLDER_HOLDS_OTHER_SQL.to_string(),
+            postgres: || crystalline_index::postgres::FOLDER_HOLDS_OTHER_SQL.to_string(),
+            literals: &["1", "'notes/'", "'notes0'", "'notes/x.md'"],
+            literals_pg: None,
+            scan_expected: &[],
+            scan_expected_pg: None,
+            turso_must_seek: &["idx_engram_path_actor"],
+            // Not named here: on this fixture's 200 rows a domain postgres
+            // walks `idx_engram_domain` and stops at the first row, which is
+            // still no scan. The claim that the C-collated index serves the
+            // range at scale is pinned where the index is made, in the v19
+            // migration test, over 4,400 rows.
+            postgres_must_seek: &[],
+        },
+        HotStatement {
             // Every upsert asks this before it writes, so a walk here is paid
             // once per engram: quadratic in a first index, twice that in a
             // full reindex (10 to 12 minutes at 50,000 engrams before it
@@ -2139,6 +2160,9 @@ mod postgres_plans {
             "idx_engram_path_actor",
             "idx_engram_permalink_actor",
             "idx_engram_title_lower",
+            // Partial on the base rows and led by `domain_id`, so it serves
+            // the base filter on its own just as the title index does.
+            "idx_engram_base_path_c",
         ] {
             store.drop_index(index).await.unwrap();
         }
@@ -2183,6 +2207,18 @@ fn the_postgres_upsert_probe_is_planned_per_call() {
     );
 }
 
+/// The body of the function whose signature starts with `signature`, up to
+/// the closing brace at the signature's own indentation, so a function
+/// inside an `impl` block is cut where it ends, not at the end of the impl.
+fn function_body<'a>(source: &'a str, signature: &str) -> &'a str {
+    let start = source.find(signature).expect("the function is in the file");
+    let line_start = source[..start].rfind('\n').map_or(0, |i| i + 1);
+    let indent = &source[line_start..start];
+    let close = format!("\n{indent}}}\n");
+    let end = start + source[start..].find(&close).expect("the function ends");
+    &source[start..end]
+}
+
 /// The child rows of a postgres upsert are deleted in one round trip. Each
 /// statement is a round trip to the server, and a full reindex runs the child
 /// delete once per engram, so six statements here made the full reindex six
@@ -2190,11 +2226,7 @@ fn the_postgres_upsert_probe_is_planned_per_call() {
 #[test]
 fn the_postgres_child_delete_is_one_statement() {
     let src = include_str!("../../src/postgres/mod.rs");
-    let start = src
-        .find("async fn delete_children(")
-        .expect("delete_children exists");
-    let end = start + src[start..].find("\n}\n").expect("delete_children ends");
-    let body = &src[start..end];
+    let body = function_body(src, "async fn delete_children(");
     assert_eq!(
         body.matches("sqlx::query(").count(),
         1,

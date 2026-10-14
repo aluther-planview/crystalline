@@ -228,6 +228,143 @@ async fn virtual_crud(store: Arc<Mutex<dyn Store>>) {
 }
 both_backends!(virtual_domain_crud_round_trips, virtual_crud);
 
+// --- set_frontmatter on sources ----------------------------------------------
+
+/// A virtual domain takes the sources list through the same writer as a
+/// folder: the row is rewritten and the index finds the new location and
+/// not the dropped one, on both backends.
+async fn sources_list_edit(store: Arc<Mutex<dyn Store>>) {
+    let engine = virtual_engine(store);
+    let mut write = write_params("Cited", "a cited note");
+    write.metadata = Some(serde_json::json!({ "sources": [
+        "notedown://jordi/n1/p0#b1",
+        "notedown://jordi/n1/p0#b2",
+    ] }));
+    engine.write_engram(&write).await.unwrap();
+
+    engine
+        .edit_engram(&EditParams {
+            identifier: "cited".to_string(),
+            domain: "notes".to_string(),
+            operation: "set_frontmatter".to_string(),
+            key: Some("sources".to_string()),
+            values: Some(vec![
+                "notedown://jordi/n1/p0#b1".to_string(),
+                "notedown://jordi/n1/p0#b3".to_string(),
+            ]),
+            ..EditParams::default()
+        })
+        .await
+        .unwrap();
+
+    let total = |anchor: &str| {
+        let params = SearchParams {
+            domains: vec!["notes".to_string()],
+            metadata_filters: Some(serde_json::json!({ "sources": { "$contains": anchor } })),
+            ..SearchParams::default()
+        };
+        let engine = &engine;
+        async move {
+            engine
+                .search_engrams(&params, &Scope::Unrestricted)
+                .await
+                .unwrap()["total"]
+                .clone()
+        }
+    };
+    assert_eq!(
+        total("notedown://jordi/n1/p0#b3").await,
+        1,
+        "the new anchor"
+    );
+    assert_eq!(
+        total("notedown://jordi/n1/p0#b2").await,
+        0,
+        "the dropped anchor"
+    );
+    assert_eq!(
+        total("notedown://jordi/n1/p0#b1").await,
+        1,
+        "the kept anchor"
+    );
+}
+both_backends!(
+    set_frontmatter_sources_in_a_virtual_domain,
+    sources_list_edit
+);
+
+/// A set_frontmatter that leaves a virtual engram saying what it said writes
+/// no row: the content and its checksum stay, generated block and all, and
+/// the receipt says unchanged: true. A new order is a change and is written.
+async fn unchanged_sources_edit(store: Arc<Mutex<dyn Store>>) {
+    let engine = virtual_engine(store);
+    let mut write = write_params("Cited", "a cited note");
+    write.tags = vec!["alpha".to_string()];
+    write.metadata = Some(serde_json::json!({ "sources": [
+        "notedown://jordi/n1/p0#b1",
+        "notedown://jordi/n1/p0#b2",
+    ] }));
+    engine.write_engram(&write).await.unwrap();
+    let read = || async {
+        engine
+            .read_engram(
+                &ReadParams {
+                    identifier: "cited".to_string(),
+                    domain: Some("notes".to_string()),
+                    share_link: None,
+                },
+                &Scope::Unrestricted,
+            )
+            .await
+            .unwrap()
+    };
+    let before = read().await;
+    let edit = |key: &str, values: &[&str]| EditParams {
+        identifier: "cited".to_string(),
+        domain: "notes".to_string(),
+        operation: "set_frontmatter".to_string(),
+        key: Some(key.to_string()),
+        values: Some(values.iter().map(|v| v.to_string()).collect()),
+        expected_checksum: before["checksum"].as_str().map(str::to_string),
+        ..EditParams::default()
+    };
+    for params in [
+        edit(
+            "sources",
+            &["notedown://jordi/n1/p0#b1", " notedown://jordi/n1/p0#b2 "],
+        ),
+        edit("tags", &["Alpha", "alpha"]),
+    ] {
+        let receipt = engine.edit_engram(&params).await.unwrap();
+        assert_eq!(receipt["unchanged"], serde_json::json!(true), "{receipt}");
+        let after = read().await;
+        assert_eq!(after["checksum"], before["checksum"]);
+        assert_eq!(after["content"], before["content"]);
+    }
+    // A stale checksum is refused even when the edit would change nothing.
+    let mut stale = edit(
+        "sources",
+        &["notedown://jordi/n1/p0#b1", "notedown://jordi/n1/p0#b2"],
+    );
+    stale.expected_checksum = Some("0".repeat(64));
+    let err = engine.edit_engram(&stale).await.unwrap_err();
+    assert!(err.to_string().contains("stale edit"), "{err}");
+    assert_eq!(read().await["checksum"], before["checksum"]);
+    let receipt = engine
+        .edit_engram(&edit(
+            "sources",
+            &["notedown://jordi/n1/p0#b2", "notedown://jordi/n1/p0#b1"],
+        ))
+        .await
+        .unwrap();
+    assert!(receipt.get("unchanged").is_none(), "{receipt}");
+    assert_ne!(read().await["checksum"], before["checksum"]);
+}
+both_backends!(
+    an_unchanged_set_frontmatter_writes_no_virtual_row,
+    unchanged_sources_edit
+);
+
 // --- stale-edit CAS conflict -------------------------------------------------
 
 async fn stale_edit_conflict(store: Arc<Mutex<dyn Store>>) {

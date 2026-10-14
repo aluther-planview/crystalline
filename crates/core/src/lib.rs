@@ -21,6 +21,7 @@ pub mod base;
 pub mod config;
 pub mod emit;
 pub mod engram;
+pub mod folders;
 pub mod frontmatter;
 pub mod harness;
 pub mod import;
@@ -42,6 +43,7 @@ pub mod skills;
 pub mod tags;
 pub mod temporal;
 pub mod text;
+pub mod tree;
 pub mod verify;
 pub mod yaml;
 
@@ -99,7 +101,9 @@ pub use provision::{
 pub use schema::{
     FieldDecl, FieldType, ScalarType, Schema, SchemaDrift, SchemaIssue, ValidationMode,
 };
-pub use similarity::{dice_coefficient, normalize};
+pub use similarity::{
+    WORD_BIGRAM_FLOOR, dice_coefficient, near_duplicate, normalize, word_bigram_dice,
+};
 pub use skills::{SKILL_ASSETS, SkillAsset, skill};
 pub use tags::{fold_tag, is_lower_hyphen, retag};
 pub use temporal::{

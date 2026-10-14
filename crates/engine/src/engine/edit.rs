@@ -1,3 +1,4 @@
+use super::evolve::FOLDER_PAIR_RULE;
 use super::*;
 
 /// How many times an edit without an `expected_checksum` is applied to a
@@ -130,6 +131,74 @@ impl Engine {
         // cannot happen inside the pure text edit below. Computed before the
         // write lock is taken, so a sweep never runs while a file is held.
         let ack = self.ack_draft(p, &desc, &actor, scope).await?;
+        // `remove V112` takes the pair back wherever its acknowledgment sits:
+        // on any engram of the two folders, since the anchor moves as they
+        // change. Which pairs, and whether this engram holds an entry itself,
+        // is settled here, before the write, like the record's scope above.
+        // Not for an edit joined into somebody's draft by its share-link: that
+        // edit lands at the one page the link was minted on and nowhere else,
+        // so it takes back this engram's entries alone, as it always did.
+        let mut folder_pairs = match &ack {
+            Some(AckDraft::Remove(rule))
+                if join.is_none() && rule.eq_ignore_ascii_case(FOLDER_PAIR_RULE) =>
+            {
+                let current = view.text_at(&source, &desc).await?.unwrap_or_default();
+                let here = has_ack(&current, rule, None);
+                // An engram that holds nothing is not written below, so the
+                // compare-and-swap the edit would make is made here: a stale
+                // token is refused before any other engram changes.
+                if !here && let Some(expected) = p.expected_checksum.as_deref() {
+                    let found = sha256_hex(current.as_bytes());
+                    if found != expected {
+                        return Err(EngineError::Conflict(stale_edit_message(expected, &found)));
+                    }
+                }
+                let pairs = self
+                    .folder_pairs_to_withdraw(&desc, &current, None, scope)
+                    .await?;
+                let holders = self
+                    .folder_pair_holders(&view, &desc, &pairs, scope)
+                    .await?;
+                Some((here, holders))
+            }
+            _ => None,
+        };
+        if let Some((false, holders)) = folder_pairs.take_if(|(here, h)| !*here && !h.is_empty()) {
+            // Nothing here to take back, so nothing here is written; the
+            // pair's entries on the other engrams are the whole removal. When
+            // there are none either, the edit below refuses as it always has.
+            let done = self
+                .take_back_folder_pairs(&view, holders, &actor, scope)
+                .await;
+            if done.removed.is_empty() {
+                let named: Vec<String> = done
+                    .not_removed
+                    .iter()
+                    .map(|(permalink, reason)| format!("'{permalink}' ({reason})"))
+                    .collect();
+                // The same variant the REST withdrawal answers this with:
+                // nothing is wrong with the request, the entries just sit
+                // where this caller may not write.
+                return Err(EngineError::Conflict(format!(
+                    "no {FOLDER_PAIR_RULE} acknowledgment on '{}' could be taken back; the pair's acknowledgment stays on {}",
+                    desc.permalink,
+                    named.join(", ")
+                )));
+            }
+            let mut response = json!({
+                "domain": desc.domain,
+                "permalink": desc.permalink,
+                "path": desc.path,
+                "operation": p.operation,
+                "unchanged": true,
+                "evolve_ack_removed": FOLDER_PAIR_RULE,
+            });
+            done.note(&mut response);
+            if overlay.is_some() {
+                response["draft"] = json!(true);
+            }
+            return Ok(response);
+        }
 
         // The staged form rather than the shorthand, for the one thing it
         // reports that this verb says out loud: whether the edit composed into
@@ -155,6 +224,9 @@ impl Engine {
                 model.as_deref(),
                 scope,
                 peer,
+                // A set_frontmatter that leaves the engram saying what it
+                // said writes nothing; every other operation writes as sent.
+                p.operation == "set_frontmatter",
                 |current| {
                     // The REPORTED model here, not the one resolved against
                     // this actor: the block this call stamps is held against
@@ -204,12 +276,25 @@ impl Engine {
             response["landed"] = json!("live");
             response["present"] = json!(live.participants);
         }
+        // An edit that changed nothing wrote nothing, and says so; the key is
+        // absent on every edit that wrote.
+        if edited.unchanged {
+            response["unchanged"] = json!(true);
+        }
         note_unmirrored(&mut response, edited.warning);
         note_domain_names_normalized(&mut response, edited.normalized);
         match &ack {
             Some(AckDraft::Record(entry)) => response["evolve_ack"] = ack_json(entry),
             Some(AckDraft::Remove(rule)) => response["evolve_ack_removed"] = json!(rule),
             None => {}
+        }
+        if let Some((true, holders)) = folder_pairs {
+            // Best effort from here on: this engram's own edit has landed, so
+            // a holder that cannot be rewritten is named on the receipt
+            // rather than turning a removal that happened into an error.
+            self.take_back_folder_pairs(&view, holders, &actor, scope)
+                .await
+                .note(&mut response);
         }
         note_heading_stripped(&mut response, heading_stripped);
         if let Some(text) = manifest_text {
@@ -264,6 +349,7 @@ impl Engine {
             model,
             scope,
             None,
+            false,
             apply,
         )
         .await
@@ -291,6 +377,7 @@ impl Engine {
         model: Option<&str>,
         scope: &crate::scope::Scope,
         peer: Option<&AgentPeer>,
+        skip_unchanged: bool,
         mut apply: F,
     ) -> std::result::Result<SourceEdited, SourceEditFailure>
     where
@@ -303,6 +390,23 @@ impl Engine {
         // `expected_checksum` against the bytes it read BEFORE this
         // conversion, which is what a read handed out.
         let mut apply = move |current: &str| apply(&crystalline_core::to_lf(current));
+        // Whether an edit's result says what the text it was applied to said,
+        // compared as parsed values against the LF form `apply` saw. Asked
+        // after `apply` and before the generated stamp, so an edit that
+        // changes nothing never reaches the stamp or a write.
+        let unchanged = |current: &str, edited: &str| {
+            skip_unchanged
+                && crystalline_core::frontmatter::same_content(
+                    &crystalline_core::to_lf(current),
+                    edited,
+                )
+        };
+        let nothing_written = || SourceEdited {
+            warning: None,
+            live: None,
+            normalized: 0,
+            unchanged: true,
+        };
         // A MANIFEST edit may switch read_only on, which is the owner's
         // (decision D10, on every tier). The verdict is asked here, before any
         // lock, because `domain_is_read_only` may take the store lock and
@@ -370,6 +474,10 @@ impl Engine {
                     }
                 }
                 let edited = apply(&live.text).map_err(SourceEditFailure::before)?;
+                // Nothing to compose: the document already says it.
+                if unchanged(&live.text, &edited) {
+                    return Ok(nothing_written());
+                }
                 // The same two passes every other arm makes, in the same
                 // order. An edit that skipped them would put a document in
                 // front of a person that the saver then refuses, minutes
@@ -390,6 +498,7 @@ impl Engine {
                     warning: None,
                     live: Some(applied),
                     normalized,
+                    unchanged: false,
                 });
             }
         }
@@ -435,6 +544,10 @@ impl Engine {
             // `Engine::hold_next_draft_edit`.
             self.take_draft_hold().await;
             let edited = apply(&current).map_err(SourceEditFailure::before)?;
+            // No draft is written, so none is created either.
+            if unchanged(&current, &edited) {
+                return Ok(nothing_written());
+            }
             let edited = touch_generated(&edited, actor, model, now_offset());
             let edited = Self::enforce_temporal(edited).map_err(SourceEditFailure::before)?;
             let (edited, normalized) = self
@@ -458,6 +571,7 @@ impl Engine {
                 warning,
                 live: None,
                 normalized,
+                unchanged: false,
             });
         }
 
@@ -482,6 +596,11 @@ impl Engine {
                     }
                 }
                 let edited = apply(&current).map_err(SourceEditFailure::before)?;
+                // Returned rather than handed to the tail below: the tail is
+                // the announcement and the index work a write owes.
+                if unchanged(&current, &edited) {
+                    return Ok(nothing_written());
+                }
                 let edited = touch_generated(&edited, actor, model, now_offset());
                 let edited = Self::enforce_temporal(edited).map_err(SourceEditFailure::before)?;
                 let (edited, count) = self
@@ -538,6 +657,21 @@ impl Engine {
                         .map(str::to_string)
                         .unwrap_or_else(|| sha256_hex(current.as_bytes()));
                     let edited = apply(&current).map_err(SourceEditFailure::before)?;
+                    if unchanged(&current, &edited) {
+                        // The store's compare and swap is never reached on
+                        // this return, so a checksum the caller presented is
+                        // compared here, exactly as the other arms compare it:
+                        // a stale one is refused even when nothing would change.
+                        if let Some(presented) = expected_checksum {
+                            let found = sha256_hex(current.as_bytes());
+                            if found != presented {
+                                return Err(SourceEditFailure::before(EngineError::Conflict(
+                                    stale_edit_message(presented, &found),
+                                )));
+                            }
+                        }
+                        return Ok(nothing_written());
+                    }
                     let edited = touch_generated(&edited, actor, model, now_offset());
                     let edited =
                         Self::enforce_temporal(edited).map_err(SourceEditFailure::before)?;
@@ -643,6 +777,7 @@ impl Engine {
             warning: None,
             live: None,
             normalized,
+            unchanged: false,
         })
     }
 
@@ -819,6 +954,9 @@ impl Engine {
         // through to the refusal that names that set.
         if LIST_FRONTMATTER_KEYS.contains(&key) {
             return match (&p.values, value) {
+                // Each list key has its own writer: tags fold to the tag
+                // spelling, a location is kept exactly as given.
+                (Some(values), None) if key == "sources" => Self::set_sources_list(source, values),
                 (Some(values), None) => Self::set_tags(source, values),
                 _ => Err(EngineError::Invalid(format!(
                     "{key} is a list: pass the whole new list as values"
@@ -1010,6 +1148,39 @@ impl Engine {
         ))
     }
 
+    /// Replace an engram's whole `sources` list, the locations it was
+    /// distilled from, the list form of `set_frontmatter`. Each entry is
+    /// trimmed, blanks are dropped and repeats are kept once in first order.
+    /// The spelling is kept exactly: a `$contains` filter matches a location
+    /// byte for byte, so folding one would hide it. An entry the metadata
+    /// index cannot hold (its compact JSON over
+    /// [`crystalline_core::META_VALUE_MAX_BYTES`], measured with
+    /// [`crystalline_core::meta_value_text`] as the index measures it)
+    /// refuses the whole edit by its 1-based position in `values`, blanks
+    /// counted, the way verify's E011 counts elements. An empty list removes
+    /// the key.
+    fn set_sources_list(source: &str, values: &[String]) -> Result<String> {
+        let mut sources: Vec<String> = Vec::with_capacity(values.len());
+        for (i, raw) in values.iter().enumerate() {
+            let entry = raw.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            if crystalline_core::meta_value_text(&Value::String(entry.to_string())).is_none() {
+                return Err(EngineError::Invalid(format!(
+                    "sources element {} is too long for the metadata index, so a $contains filter could not find it",
+                    i + 1
+                )));
+            }
+            if !sources.iter().any(|s| s == entry) {
+                sources.push(entry.to_string());
+            }
+        }
+        Ok(crystalline_core::emit::set_frontmatter_list(
+            source, "sources", &sources,
+        ))
+    }
+
     fn require_content<'a>(&self, p: &'a EditParams) -> Result<&'a str> {
         p.content.as_deref().ok_or_else(|| {
             EngineError::Invalid(format!("operation '{}' requires content", p.operation))
@@ -1094,6 +1265,8 @@ mod settable_keys_tests {
         assert!(SETTABLE_FRONTMATTER_KEYS.contains(&"resource"));
         assert!(SETTABLE_FRONTMATTER_KEYS.contains(&"source_version"));
         assert!(SETTABLE_FRONTMATTER_KEYS.contains(&"tags"));
+        assert!(SETTABLE_FRONTMATTER_KEYS.contains(&"sources"));
+        assert!(LIST_FRONTMATTER_KEYS.contains(&"sources"));
         for key in LIST_FRONTMATTER_KEYS {
             assert!(
                 SETTABLE_FRONTMATTER_KEYS.contains(key),
@@ -1253,6 +1426,15 @@ mod list_keys_tests {
             .tags
     }
 
+    fn sources_of(source: &str) -> Vec<String> {
+        let parsed = crystalline_core::parse_engram(source).unwrap();
+        match parsed.frontmatter.extra.get("sources") {
+            None => Vec::new(),
+            Some(value) => serde_json::from_value(serde_json::to_value(value).unwrap())
+                .unwrap_or_else(|e| panic!("sources is not a list of strings ({e}): {source}")),
+        }
+    }
+
     #[test]
     fn a_tag_is_added_whatever_shape_the_old_tags_had() {
         for old in [
@@ -1263,7 +1445,7 @@ mod list_keys_tests {
         ] {
             let out = set_values(&engram(old), "tags", &["old", "new"]).unwrap();
             assert_eq!(tags_of(&out), ["old", "new"], "{old:?}: {out}");
-            assert!(out.contains("tags:\n  - old\n  - new\n"), "{old:?}: {out}");
+            assert!(out.contains("tags:\n- old\n- new\n"), "{old:?}: {out}");
             assert_eq!(out.matches("old").count(), 1, "{old:?}: {out}");
         }
     }
@@ -1348,5 +1530,130 @@ mod list_keys_tests {
             .expect_err("title")
             .to_string();
         assert!(e.contains("cannot set 'title'"), "{e}");
+    }
+
+    /// sources is a list key: the whole new list replaces the old one, in
+    /// every shape a hand or write_engram may have left it in (serde_yaml_ng
+    /// writes a metadata list without indent).
+    #[test]
+    fn a_location_is_added_and_dropped_whatever_shape_sources_had() {
+        for old in [
+            "sources:\n  - https://a.example\n",
+            "sources:\n- https://a.example\n",
+            "sources: [https://a.example]\n",
+            "sources: https://a.example\n",
+        ] {
+            let out = set_values(
+                &engram(old),
+                "sources",
+                &["https://a.example", "https://b.example"],
+            )
+            .unwrap();
+            assert_eq!(
+                sources_of(&out),
+                ["https://a.example", "https://b.example"],
+                "{old:?}: {out}"
+            );
+            assert!(
+                out.contains("sources:\n- https://a.example\n- https://b.example\n"),
+                "{old:?}: {out}"
+            );
+            let out = set_values(&out, "sources", &["https://b.example"]).unwrap();
+            assert_eq!(sources_of(&out), ["https://b.example"], "{old:?}: {out}");
+        }
+    }
+
+    #[test]
+    fn an_empty_sources_list_removes_the_key() {
+        let source = engram("sources:\n  - https://a.example\n");
+        for empty in [&[][..], &["", "   "][..]] {
+            let out = set_values(&source, "sources", empty).unwrap();
+            assert!(!out.contains("sources"), "{empty:?}: {out}");
+            crystalline_core::parse_engram(&out).unwrap();
+        }
+    }
+
+    /// Entries are trimmed, blanks dropped and repeats kept once in first
+    /// order, but never folded: a location is matched byte for byte.
+    #[test]
+    fn sources_are_trimmed_and_deduped_but_never_folded() {
+        let out = set_values(
+            &engram(""),
+            "sources",
+            &[
+                "  https://Example.com/A  ",
+                "",
+                "https://example.com/a",
+                "https://Example.com/A",
+                "notedown://jordi/n1/p0#b3",
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            sources_of(&out),
+            [
+                "https://Example.com/A",
+                "https://example.com/a",
+                "notedown://jordi/n1/p0#b3",
+            ],
+            "{out}"
+        );
+        // tags still fold: the dispatch is by key, not by "is a list".
+        let out = set_values(&engram(""), "tags", &["Retry Policy"]).unwrap();
+        assert_eq!(tags_of(&out), ["retry-policy"], "{out}");
+    }
+
+    /// A comma, a fragment, a query, a quote, a backslash and non-ASCII text
+    /// all survive the write as the exact same string.
+    #[test]
+    fn sources_keep_their_spelling_through_a_round_trip() {
+        let entries = [
+            "https://example.com/straße?a=1,2#x",
+            "github:acme/api:src/lib.rs",
+            "say \"hi\" \\ there",
+            "-leading-hyphen",
+            "trailing:",
+        ];
+        let out = set_values(&engram(""), "sources", &entries).unwrap();
+        assert_eq!(sources_of(&out), entries, "{out}");
+    }
+
+    /// The limit is the index's: the compact JSON text of the entry, quotes
+    /// and escapes included. The refusal names the position in the list the
+    /// caller sent, blanks counted, and stays on one line.
+    #[test]
+    fn a_sources_entry_is_measured_as_the_index_measures_it() {
+        let fits = "x".repeat(crystalline_core::META_VALUE_MAX_BYTES - 2);
+        let out = set_values(&engram(""), "sources", &[fits.as_str()]).unwrap();
+        assert_eq!(sources_of(&out), std::slice::from_ref(&fits));
+
+        let over = "x".repeat(crystalline_core::META_VALUE_MAX_BYTES - 1);
+        let quotes = "\"".repeat(600);
+        for (list, n) in [
+            (vec!["https://a.example", over.as_str()], 2),
+            (vec!["", "  ", quotes.as_str()], 3),
+        ] {
+            let e = set_values(&engram(""), "sources", &list)
+                .expect_err("over the index limit")
+                .to_string();
+            assert_eq!(
+                e,
+                format!(
+                    "sources element {n} is too long for the metadata index, so a $contains filter could not find it"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn value_on_sources_points_at_values() {
+        let p = params("sources", Some("https://a.example"), None);
+        let e = Engine::apply_set_frontmatter(&engram(""), &p, "t", "tester", None, None)
+            .expect_err("value on sources")
+            .to_string();
+        assert!(
+            e.contains("sources is a list: pass the whole new list as values"),
+            "{e}"
+        );
     }
 }

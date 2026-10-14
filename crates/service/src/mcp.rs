@@ -62,7 +62,7 @@
 //! does filter. Stdio keeps the
 //! whole block, because a local session is the machine owner. Every channel
 //! that *does* carry a request context is scoped per caller instead:
-//! `server/discover` through [`McpServer::arrival_info_scoped`], the
+//! `server/discover` through `McpServer::arrival_info_scoped`, the
 //! `onboarding` prompt, and `list_domains` itself.
 //!
 //! In read-only mode (the engine's `read_only` flag) the write-gated tools are
@@ -194,8 +194,8 @@
 //! can carry one: `remove_domain` and `discard_changes`. Each returns an
 //! `input_required` result holding a single form elicitation, the client puts
 //! it to its user, and the same call arrives again with the answer beside the
-//! original arguments. [`confirmation_supported`] decides whether to ask,
-//! [`confirm_question`] builds the question and [`confirmed`] reads the
+//! original arguments. `confirmation_supported` decides whether to ask,
+//! `confirm_question` builds the question and `confirmed` reads the
 //! answer; all three are deliberately tool-agnostic. The question's one
 //! checkbox is checked by default, so Accept alone goes ahead, and an accept
 //! that leaves the box out of its content is a yes.
@@ -219,7 +219,7 @@
 //! re-sends the original arguments beside the answer and nothing on this side
 //! remembers what was asked, so a buggy client that changes an argument on the
 //! retry is honoured rather than caught - the price of the stateless design
-//! (see [`confirm_question`] on why nothing is sealed into `requestState`),
+//! (see `confirm_question` on why nothing is sealed into `requestState`),
 //! and the reason each round's refusal is read before the act it guards rather
 //! than after it.
 //!
@@ -306,7 +306,7 @@ fn is_write_tool(name: &str) -> bool {
 /// `instructions` to `server/discover`, restricts `tools/list_changed` to
 /// subscribers and requires caching hints on six operations; all four are
 /// implemented here - see [`McpServer::list_tools`], [`McpServer::discover`],
-/// [`McpServer::listen`] and [`CacheHinted`]. The stdio path has no probe
+/// [`McpServer::listen`] and `CacheHinted`. The stdio path has no probe
 /// handling of its own - every client line is forwarded verbatim
 /// (`crate::client`) and rmcp classifies and answers it. A fifth obligation,
 /// `ping`'s removal, is rmcp's: it answers `method_not_found` to any peer that
@@ -1884,10 +1884,10 @@ impl McpServer {
         // The role and the write list are asked whatever the lock says, so a
         // locked domain never opens this gate: the collaboration verbs reach
         // origin paths that do not read the lock. The lock's own sentence is
-        // left to the engine's write view and to the MCP unlock refusal
-        // (`configure`, `edit_engram` on the MANIFEST), which run first, so
-        // this gate never answers it; `Reviewing` is the open tier's, which
-        // returned above.
+        // left to the engine's write view and to the MCP unlock refusal,
+        // which run before this gate in `edit_core` and `configure_domain`;
+        // on the collaboration verbs the engine's origin paths answer the
+        // lock. `Reviewing` is the open tier's, which returned above.
         match self
             .engine
             .write_access_block(scope, domain)
@@ -2177,9 +2177,18 @@ impl McpServer {
             Ok(receipt) => receipt,
             Err(e) => return overlay_refusal(e).map(Verdict::Refused),
         };
-        let receipt = self
-            .with_similar(receipt, SimilarProbe::for_write(&p), scope)
-            .await;
+        // The close-folder hint, on this verb alone: a capture is where a new
+        // folder is started without a look at the layout, while a move names
+        // its destination on purpose. After the write returned, for the same
+        // lock reason as the neighbours advisory, and at the same time as that
+        // advisory rather than after it, so the write waits for the slower of
+        // the two and the hint's own short budget adds nothing beyond it.
+        let folders = Engine::close_folder_probe(&receipt);
+        let (mut receipt, close) = tokio::join!(
+            self.with_similar(receipt, SimilarProbe::for_write(&p), scope),
+            self.engine.close_folders_for(folders.as_ref(), scope),
+        );
+        Engine::attach_close_folders(&mut receipt, &close);
         Ok(done_written(receipt, &caller.base))
     }
 
@@ -2646,7 +2655,7 @@ impl McpServer {
     #[tool(
         name = "write_engram",
         title = "Capture engram",
-        description = "Capture a new engram - a unit of knowledge - into a domain. Writes the markdown file and indexes it. Body bullets: '- [decision] we chose X #tag' become observations, '- rel_type [[Target]]' become relations. domain is required so an engram never lands in the wrong place. Pass folder to file the engram under a topic prefix: reuse the domain's existing layout (browse_domain shows it), start a subfolder when a topic cluster is forming and keep singletons at the root; the folder path becomes the permalink prefix build_context globs as crystalline://domain/folder/*. permalink, status, recorded_at and generated (who wrote it, with which model, and when) are filled in; pass model with your own model id, the one you were told you are (for example claude-opus-5), on every capture, so a later reader can weigh the page by which model wrote it - leave it out only when you do not know it; valid_from/valid_to are never auto-set - absence means always valid; to bound validity pass them inside metadata as plain ISO dates (YYYY-MM-DD). Any other date format is rejected; a sentinel far-future valid_to and an explicit null are dropped, since absence already means valid forever. Recommended type values: engram, guide, decision, architecture, runbook, reference. Recommended status values (guidance, not enforced): stable, implemented, draft, proposed, idea, poc, deprecated, superseded, archived, legacy. stable is the default and the word for knowledge that holds now; current is the legacy alias for the same state, and a status filter on either word matches engrams carrying either. Of those, deprecated, superseded, archived and legacy are the recognized retirement set: a status inside it softly fades in search ranking, any other value ranks at full strength. Errors if the permalink exists in the same folder unless overwrite is true, and an overwrite replaces the engram that owns the permalink in its own file, whatever that file is called; a permalink owned by an engram in another folder is refused whether or not overwrite is set, and no overwrite is offered for it (move_engram it first, or change it in place with edit_engram); it refuses a title that would file the engram as the reserved index.md or log.md (Crystalline generates the folder index itself). The vocabulary tool lists tags already in use; reuse one before coining a new tag. Set an optional numeric salience metadata key (0-10) to mark exceptionally valuable knowledge; salient engrams are lifted in hybrid search ranking. Raise it later to elevate an engram that proved load-bearing. The receipt may carry a similar list: up to three existing engrams closest in meaning to what was just written, with guidance - read the one that fits and merge into it, supersede it or link it, and say so; never ignore the list silently. Replacing an engram somebody has open in the web editor is never silent: an overwrite of a live document is refused and names who is in there, so use edit_engram for the change, which composes into their document. In a domain in review mode (review: overlay) your write lands in your own private draft; share_changes proposes exactly your drafts for review, and a receipt marked draft means the tree did not move. To capture into somebody's shared draft rather than a copy of your own, pass the draft share-link they handed you (dl_...) as share_link on that call: it opens their draft for this session and the write lands in their copy, at the page the link was minted on and nowhere else.",
+        description = "Capture a new engram - a unit of knowledge - into a domain. Writes the markdown file and indexes it. Body bullets: '- [decision] we chose X #tag' become observations, '- rel_type [[Target]]' become relations. domain is required so an engram never lands in the wrong place. Pass folder to file the engram under a topic prefix: reuse the domain's existing layout (browse_domain shows it), start a subfolder when a topic cluster is forming and keep singletons at the root; the folder path becomes the permalink prefix build_context globs as crystalline://domain/folder/*. permalink, status, recorded_at and generated (who wrote it, with which model, and when) are filled in; pass model with your own model id, the one you were told you are (for example claude-opus-5), on every capture, so a later reader can weigh the page by which model wrote it - leave it out only when you do not know it; valid_from/valid_to are never auto-set - absence means always valid; to bound validity pass them inside metadata as plain ISO dates (YYYY-MM-DD). Any other date format is rejected; a sentinel far-future valid_to and an explicit null are dropped, since absence already means valid forever. Recommended type values: engram, guide, decision, architecture, runbook, reference. Recommended status values (guidance, not enforced): stable, implemented, draft, proposed, idea, poc, deprecated, superseded, archived, legacy. stable is the default and the word for knowledge that holds now; current is the legacy alias for the same state, and a status filter on either word matches engrams carrying either. Of those, deprecated, superseded, archived and legacy are the recognized retirement set: a status inside it softly fades in search ranking, any other value ranks at full strength. Errors if the permalink exists in the same folder unless overwrite is true, and an overwrite replaces the engram that owns the permalink in its own file, whatever that file is called; a permalink owned by an engram in another folder is refused whether or not overwrite is set, and no overwrite is offered for it (move_engram it first, or change it in place with edit_engram); it refuses a title that would file the engram as the reserved index.md or log.md (Crystalline generates the folder index itself). The vocabulary tool lists tags already in use; reuse one before coining a new tag. Set an optional numeric salience metadata key (0-10) to mark exceptionally valuable knowledge; salient engrams are lifted in hybrid search ranking. Raise it later to elevate an engram that proved load-bearing. The receipt may carry a similar list: up to three existing engrams closest in meaning to what was just written, with guidance - read the one that fits and merge into it, supersede it or link it, and say so; never ignore the list silently. The receipt may also carry close_folders when the write started a new folder next to existing sibling folders with a close name (planview beside planview-work, note beside notes, a typo or a case variant), each with its engram count, plus folder_guidance: if it is the same topic, move the engram into that folder with move_engram and keep one folder; if the topics differ, leave it. Replacing an engram somebody has open in the web editor is never silent: an overwrite of a live document is refused and names who is in there, so use edit_engram for the change, which composes into their document. In a domain in review mode (review: overlay) your write lands in your own private draft; share_changes proposes exactly your drafts for review, and a receipt marked draft means the tree did not move. To capture into somebody's shared draft rather than a copy of your own, pass the draft share-link they handed you (dl_...) as share_link on that call: it opens their draft for this session and the write lands in their copy, at the page the link was minted on and nowhere else.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2700,7 +2709,7 @@ impl McpServer {
     #[tool(
         name = "edit_engram",
         title = "Edit engram",
-        description = "Refine an existing engram in place as understanding evolves. Sections are addressed by heading path such as '## API > ### Auth'. replace_section keeps the section's heading line and replaces the section body under it, keeping deeper subsections unless include_subsections is set; insert_after_section puts content right under that same heading line. For both, content is the section body only - send only the body, never the heading. Content that repeats the section's own heading has the repeat dropped (a duplicated heading would leave an empty section) and the receipt reports heading_stripped. An edit of a domain's MANIFEST that leaves it broken - an empty When to Use or Scope section, a duplicate heading, a wrong type - still lands, and the receipt lists manifest_findings (the validate M rules: code, severity, message, line) so you can fix the routing right away. operation is one of append, prepend, find_replace, replace_section, insert_before_section, insert_after_section, set_frontmatter. find_replace takes find_text and an optional expected_replacements guard that fails on a count mismatch. set_frontmatter assigns one frontmatter field by key instead of text-substituting a frontmatter line. tags takes values, the whole new list: to add a tag, remove a tag or set tags, read the engram, check vocabulary and pass every tag it should carry (each folded to lowercase-with-hyphens, a tag that cannot be folded refused by name; an empty list removes them). The other settable keys take one value: status, valid_from, valid_to, stale_after, source_date, resource, source_version, salience, verified and evolve_ack; identity, recorded_at and the generated block are refused. Use it to retag or retire an engram, record where knowledge came from (resource, source_version), close or reopen a validity window, push a review date forward, mark knowledge salient or record that you re-checked something. Omit value to remove the field (that is how a valid_to that should never have been set is cleared); status cannot be removed. The four date keys take a plain ISO date (YYYY-MM-DD), resource and source_version take plain text and salience a number from 0 to 10. verified never removes: it stamps { by, at } with the current instant, taking value as the verifying actor or else your own identity. evolve_ack is never cleared by an omitted value either: it acknowledges an evolve finding the user ruled intentional, taking value as the rule id optionally followed by a note ('V101' or 'V101 lineage citation, keep'), and the server records what evidence the finding fired on so the acknowledgment holds while that evidence holds and comes back marked stale when it changes; acknowledging the same finding again replaces its entry, and V301 and V302 are the two rules that keep more than one, an entry per pair (a twin pair for V301, a pair of observation lines for V302), so acknowledging a second pair on the same engram records it beside the first and each pair is silenced on its own. Every other rule keeps exactly one entry however often it fires on that engram, so a second acknowledgment of it replaces what the first said and the finding it was not given for comes back marked stale. To unacknowledge a finding - to unack it, to take back an acknowledgment so the finding resurfaces on the next sweep - pass the value 'remove <rule-id>' ('remove V101') on the same key; it takes back every entry for that rule, which for V301 and V302 means every pair you acknowledged on that engram, it errors when the engram carries no entry for that rule, and the receipt reports evolve_ack_removed. Take an acknowledgment back only when the user asks. Pass expected_checksum (from read_engram) to guard an edit against a change since your read: a conflict is refused if it changed, so re-read and retry; omit it for last-write-wins. An edit of an engram somebody has open in the web editor composes into their live document instead of the file - it arrives under their cursor, keeps what they have typed, and the receipt says landed: live with present naming who is in there; their session saves it. You are usually named in their participant strip while you work there, for a minute after each call, so they can tell which agent a change came from. To edit somebody's shared draft rather than your own copy of the page, pass the draft share-link they handed you (dl_...) as share_link: it opens that draft for this connection and the edit lands in its author's copy, with the receipt saying whose. A draft reached that way is read from its author's last saved text rather than from their open document, so send an edit inside one without expected_checksum: the text composes correctly either way, and a checksum taken from a granted read is refused as stale for as long as its author keeps typing. That stays open until your session ends, or - on a sessionless HTTP connection - for 30 minutes after your last call about the draft, so present the link again whenever an edit is refused as unjoined. Without it, an edit at a path somebody shared with you is refused and told the two ways forward. The generated provenance block is refreshed with who edited it, with which model, and when: pass model with your own model id (for example claude-opus-5) on every edit, and a verification you record carries it too. A content edit's receipt may carry a similar list, the existing engrams closest in meaning to the text just added, with guidance to merge, supersede, link or leave them; set_frontmatter never probes. Status values to reflect a changed lifecycle (recommended values: see write_engram). Temporal frontmatter fields (recorded_at, valid_from, valid_to, source_date, stale_after, plus the legacy last_verified and review_after spellings) must stay plain ISO dates (YYYY-MM-DD): an edit that leaves one malformed is rejected and a sentinel far-future valid_to or an explicit null is dropped, except recorded_at which is required and cannot be nulled. In a domain in review mode (review: overlay) your write lands in your own private draft; share_changes proposes exactly your drafts for review, and a receipt marked draft means the tree did not move.",
+        description = "Refine an existing engram in place as understanding evolves. Sections are addressed by heading path such as '## API > ### Auth'. replace_section keeps the section's heading line and replaces the section body under it, keeping deeper subsections unless include_subsections is set; insert_after_section puts content right under that same heading line. For both, content is the section body only - send only the body, never the heading. Content that repeats the section's own heading has the repeat dropped (a duplicated heading would leave an empty section) and the receipt reports heading_stripped. An edit of a domain's MANIFEST that leaves it broken - an empty When to Use or Scope section, a duplicate heading, a wrong type - still lands, and the receipt lists manifest_findings (the validate M rules: code, severity, message, line) so you can fix the routing right away. operation is one of append, prepend, find_replace, replace_section, insert_before_section, insert_after_section, set_frontmatter. find_replace takes find_text and an optional expected_replacements guard that fails on a count mismatch. set_frontmatter assigns one frontmatter field by key instead of text-substituting a frontmatter line. A set_frontmatter that changes nothing - the same tags, sources, status or plain value the engram already holds - writes nothing (no file write, no new generated stamp, the checksum stays) and the receipt answers unchanged: true. tags takes values, the whole new list: to add a tag, remove a tag or set tags, read the engram, check vocabulary and pass every tag it should carry (each folded to lowercase-with-hyphens, a tag that cannot be folded refused by name; an empty list removes them). sources takes values too, the whole new list of locations the engram was distilled from: to add or drop one location, read the engram and pass every location it should keep (each trimmed and kept exactly as spelled, repeats kept once, an entry whose JSON is over 1024 bytes refused by its position because a $contains filter could not find it; an empty list removes the key). The other settable keys take one value: status, valid_from, valid_to, stale_after, source_date, resource, source_version, salience, verified and evolve_ack; identity, recorded_at and the generated block are refused. Use it to retag or retire an engram, record where knowledge came from (resource, source_version, sources), close or reopen a validity window, push a review date forward, mark knowledge salient or record that you re-checked something. Omit value to remove the field (that is how a valid_to that should never have been set is cleared); status cannot be removed. The four date keys take a plain ISO date (YYYY-MM-DD), resource and source_version take plain text and salience a number from 0 to 10. verified never removes: it stamps { by, at } with the current instant, taking value as the verifying actor or else your own identity. evolve_ack is never cleared by an omitted value either: it acknowledges an evolve finding the user ruled intentional, taking value as the rule id optionally followed by a note ('V101' or 'V101 lineage citation, keep'), and the server records what evidence the finding fired on so the acknowledgment holds while that evidence holds and comes back marked stale when it changes; acknowledging the same finding again replaces its entry, and V112, V301 and V302 are the three rules that keep more than one, an entry per pair (a pair of sibling folders for V112, a twin pair for V301, a pair of observation lines for V302), so acknowledging a second pair on the same engram records it beside the first and each pair is silenced on its own; a V112 acknowledgment holds on any engram in either folder of its pair, while both folder names hold, and given on an engram other than the one its queue row names it records the pair that engram's folder is in, refused when the engram sits in more than one pair (acknowledge on the row's engram then) or in none. Every other rule keeps exactly one entry however often it fires on that engram, so a second acknowledgment of it replaces what the first said and the finding it was not given for comes back marked stale. To unacknowledge a finding - to unack it, to take back an acknowledgment so the finding resurfaces on the next sweep - pass the value 'remove <rule-id>' ('remove V101') on the same key; it takes back every entry for that rule, which for V301 and V302 means every pair you acknowledged on that engram. 'remove V112' takes back every pair this engram holds or anchors, on this engram and on every other engram of the two folders, since a pair's acknowledgment can sit on any of them: the receipt names the engrams it cleared in evolve_ack_removed_from and the ones it could not (a draft shared with you to read and not joined, or a rewrite that reported an error, which says so when the file was written first and the entry may already be gone) with the reason in evolve_ack_not_removed_from, and in a domain in review mode each engram it clears gets a draft of your own. It errors when no entry for that rule is there to take back, and the receipt reports evolve_ack_removed. Take an acknowledgment back only when the user asks. Pass expected_checksum (from read_engram) to guard an edit against a change since your read: a conflict is refused if it changed, so re-read and retry; omit it for last-write-wins. An edit of an engram somebody has open in the web editor composes into their live document instead of the file - it arrives under their cursor, keeps what they have typed, and the receipt says landed: live with present naming who is in there; their session saves it. You are usually named in their participant strip while you work there, for a minute after each call, so they can tell which agent a change came from. To edit somebody's shared draft rather than your own copy of the page, pass the draft share-link they handed you (dl_...) as share_link: it opens that draft for this connection and the edit lands in its author's copy, with the receipt saying whose. A draft reached that way is read from its author's last saved text rather than from their open document, so send an edit inside one without expected_checksum: the text composes correctly either way, and a checksum taken from a granted read is refused as stale for as long as its author keeps typing. That stays open until your session ends, or - on a sessionless HTTP connection - for 30 minutes after your last call about the draft, so present the link again whenever an edit is refused as unjoined. Without it, an edit at a path somebody shared with you is refused and told the two ways forward. The generated provenance block is refreshed with who edited it, with which model, and when: pass model with your own model id (for example claude-opus-5) on every edit, and a verification you record carries it too. A content edit's receipt may carry a similar list, the existing engrams closest in meaning to the text just added, with guidance to merge, supersede, link or leave them; set_frontmatter never probes. Status values to reflect a changed lifecycle (recommended values: see write_engram). Temporal frontmatter fields (recorded_at, valid_from, valid_to, source_date, stale_after, plus the legacy last_verified and review_after spellings) must stay plain ISO dates (YYYY-MM-DD): an edit that leaves one malformed is rejected and a sentinel far-future valid_to or an explicit null is dropped, except recorded_at which is required and cannot be nulled. In a domain in review mode (review: overlay) your write lands in your own private draft; share_changes proposes exactly your drafts for review, and a receipt marked draft means the tree did not move.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -2954,7 +2963,7 @@ impl McpServer {
     #[tool(
         name = "evolve_engrams",
         title = "Evolve engrams",
-        description = "Sweep one domain or every domain for the maintenance the knowledge needs and return a ranked work queue: a to-do list that walks you through tidying, cleaning up, auditing, reviewing or health-checking what has been taught. Detects temporal and lifecycle debt (an elapsed valid_to still marked stable, stale_after past due, long-unverified knowledge, a superseded engram with no successor relation and the half-finished converse, a retired engram still cited as current by live ones, and a team domain holding substantive work nobody has shared for over a week), structural gaps (unresolved [[links]], one-sided supersedes or summarizes pairs, orphans, an engram over the split budget, near-empty stubs, V109 a permalink off its folder - one whose folder part differs from the folder its file sits in, which a build_context folder glob silently misses; repair it with move_engram, destination the engram's own path and permalink \"path\" - V110 a link that spells a domain by this machine's local name instead of its canonical name; rewrite it with edit_engram - and V111 an engram an ingestion record fed that names no resource, so an answer from it cannot cite where it came from; set it with edit_engram set_frontmatter key resource), redundancy (near-duplicate clusters, drifted tags) and meaning (V301 semantic twins, two current engrams that say the same thing in different words, and V302 possible contradiction, two observation lines a local NLI model read as contradicting each other, raised only when evolve.contradictions is on). It detects by dates, links, graph shape, embedding similarity and stored model scores, and it never confirms a contradiction: similarity is agreement about a topic, and a V302 row is the model's question, never proof - read both engrams and decide. It also surfaces engrams people captured directly (through the Fluid web UI) that nobody reviewed yet, so what a person taught gets verified, tagged against the vocabulary and woven into the graph - those findings are judgment class. Attachments are swept too: a file a human added that no engram references, and a reference that points at no stored file, both come back as findings naming the attachment path. Read-only: it changes nothing itself. In a review-mode domain the sweep covers your own drafts too. Each finding names the engram, the evidence and the exact next action with the tool that performs it, and a finding marked mechanical completes intent the archive already records while one marked judgment changes what the archive claims and needs a yes from the user first. Work the queue with the write tools and re-run the same scope to confirm it shrank. Call it when the user asks whether knowledge is still accurate, what needs attention or review, or to tidy, audit, consolidate or spring-clean a domain; after a large ingest lands many engrams at once; and when a search returns hits that disagree, since a half-finished retirement often explains the disagreement. Do not call it at session start, after routine captures or before ordinary recall - it is deliberate maintenance, on demand. When the user rules a finding intentional, acknowledge it (edit_engram set_frontmatter key evolve_ack, value like 'V101 lineage citation, keep') so it stops reappearing while its evidence holds; the sweep reports how many findings acknowledgments suppressed, and an acknowledgment whose evidence changed comes back marked stale. limit caps the queue (default 10), families narrows to detector families (temporal, structure, redundancy or meaning), domains narrows the sweep, include_acknowledged returns the suppressed findings too.",
+        description = "Sweep one domain or every domain for the maintenance the knowledge needs and return a ranked work queue: a to-do list that walks you through tidying, cleaning up, auditing, reviewing or health-checking what has been taught. Detects temporal and lifecycle debt (an elapsed valid_to still marked stable, stale_after past due, long-unverified knowledge, a superseded engram with no successor relation and the half-finished converse, a retired engram still cited as current by live ones, and a team domain holding substantive work nobody has shared for over a week), structural gaps (unresolved [[links]], one-sided supersedes or summarizes pairs, orphans, an engram over the split budget, near-empty stubs, V109 a permalink off its folder - one whose folder part differs from the folder its file sits in, which a build_context folder glob silently misses; repair it with move_engram, destination the engram's own path and permalink \"path\" - V110 a link that spells a domain by this machine's local name instead of its canonical name; rewrite it with edit_engram - V111 an engram an ingestion record fed that names no resource, so an answer from it cannot cite where it came from; set it with edit_engram set_frontmatter key resource - and V112 two sibling folders with close names (planview and planview-work, note and notes), one topic split over two folders; move the engrams of the smaller one into the other with move_engram or acknowledge with evolve_ack V112), redundancy (near-duplicate clusters, drifted tags) and meaning (V301 semantic twins, two current engrams that say the same thing in different words, and V302 possible contradiction, two observation lines a local NLI model read as contradicting each other, raised only when evolve.contradictions is on). It detects by dates, links, graph shape, embedding similarity and stored model scores, and it never confirms a contradiction: similarity is agreement about a topic, and a V302 row is the model's question, never proof - read both engrams and decide. It also surfaces engrams people captured directly (through the Fluid web UI) that nobody reviewed yet, so what a person taught gets verified, tagged against the vocabulary and woven into the graph - those findings are judgment class. Attachments are swept too: a file a human added that no engram references, and a reference that points at no stored file, both come back as findings naming the attachment path. Read-only: it changes nothing itself. In a review-mode domain the sweep covers your own drafts too. Each finding names the engram, the evidence and the exact next action with the tool that performs it, and a finding marked mechanical completes intent the archive already records while one marked judgment changes what the archive claims and needs a yes from the user first. Work the queue with the write tools and re-run the same scope to confirm it shrank. Call it when the user asks whether knowledge is still accurate, what needs attention or review, or to tidy, audit, consolidate or spring-clean a domain; after a large ingest lands many engrams at once; and when a search returns hits that disagree, since a half-finished retirement often explains the disagreement. Do not call it at session start, after routine captures or before ordinary recall - it is deliberate maintenance, on demand. When the user rules a finding intentional, acknowledge it (edit_engram set_frontmatter key evolve_ack, value like 'V101 lineage citation, keep') so it stops reappearing while its evidence holds; the sweep reports how many findings acknowledgments suppressed, and an acknowledgment whose evidence changed comes back marked stale. limit caps the queue (default 10), families narrows to detector families (temporal, structure, redundancy or meaning), domains narrows the sweep, include_acknowledged returns the suppressed findings too.",
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
     async fn evolve_engrams(
@@ -4052,12 +4061,20 @@ impl McpServer {
             }
             // A read-only domain is switched off by a person, never over MCP:
             // a call naming `read_only` on one is this refusal as a whole,
-            // whatever else it names (spec A-1, A-2).
+            // whatever else it names (spec A-1, A-2). Switching it on where it
+            // is on is the one call that passes: the engine answers it as a
+            // no-op.
             if self.engine.domain_is_read_only(&domain).await
                 && p.set
                     .keys()
                     .chain(p.unset.iter())
                     .any(|key| key == crystalline_core::READ_ONLY_KEY)
+                && !(p.unset.is_empty()
+                    && p.set.len() == 1
+                    && p.set
+                        .get(crystalline_core::READ_ONLY_KEY)
+                        .map(String::as_str)
+                        == Some(crystalline_core::ReadOnly::On.as_str()))
             {
                 return refuse(mcp_unlock_refusal(&domain));
             }
@@ -4248,7 +4265,7 @@ impl ServerHandler for McpServer {
     /// `InitializeResult` at all - the handshake is deleted and `instructions`
     /// lives on `DiscoverResult` - so a modern peer is onboarded through
     /// [`McpServer::discover`] instead. Both build their block from
-    /// [`McpServer::arrival_info`], so the two eras hand out the same bytes.
+    /// `McpServer::arrival_info`, so the two eras hand out the same bytes.
     ///
     /// **Nothing here reads who is connecting any more.** This used to be the
     /// only point at which the instructions could depend on the client, so the
@@ -4423,7 +4440,7 @@ impl ServerHandler for McpServer {
     /// construction already accounts for: `DiscoverResult::from_server_info`
     /// sets `cache_scope: Private`, so a per-caller block is never cached
     /// across callers. The block is rendered through
-    /// [`McpServer::arrival_info_scoped`], so a domain this caller may not see
+    /// `McpServer::arrival_info_scoped`, so a domain this caller may not see
     /// is absent from its onboarding rather than named to it.
     async fn discover(
         &self,
@@ -4473,7 +4490,7 @@ impl ServerHandler for McpServer {
     ///
     /// One thing this server can be asked to do moves a list: `configure` can
     /// flip `github.enabled`, and six collaboration tools appear or disappear
-    /// with it (see [`hidden_collab_tool`]). That is the only mover.
+    /// with it (see `hidden_collab_tool`). That is the only mover.
     /// `resources/list` and `prompts/list` read `skills.serve` and
     /// the harness gate, both fixed before the first request arrives, so
     /// those two categories are accepted on a subscription and then never
@@ -4539,10 +4556,10 @@ impl ServerHandler for McpServer {
     /// `skills.serve` is snapshotted at the same point
     /// (`Engine::skills_serve`) and the harness answer was resolved by the
     /// spawned process before the session started - see
-    /// [`hidden_skills_surface`].
+    /// `hidden_skills_surface`.
     ///
     /// The fourth, `github.enabled`, is read **live**, and is the one gate that
-    /// makes this list dynamic (see [`hidden_collab_tool`]). It is a single
+    /// makes this list dynamic (see `hidden_collab_tool`). It is a single
     /// setting on the shared engine, so two clients listing at the same moment
     /// still get the same answer; what varies is the moment, which is the
     /// "MAY change over time" clause rather than a violation of the one after
@@ -4626,7 +4643,7 @@ impl ServerHandler for McpServer {
     /// so a remote client that never runs the CLI can read the same playbooks
     /// an installed harness gets. Empty while the surface is withheld, on the
     /// same two construction-time inputs the tool gate reads (see
-    /// [`hidden_skills_surface`]); nothing about this list can move under a
+    /// `hidden_skills_surface`); nothing about this list can move under a
     /// live connection.
     async fn list_resources(
         &self,
@@ -4659,7 +4676,7 @@ impl ServerHandler for McpServer {
     /// The override also carries the caching hints on its own account: rmcp's
     /// default returns `ListResourceTemplatesResult::default()` (rmcp 3.1.2
     /// `handler/server.rs:387-395`), a **complete** result with no hints on one
-    /// of the six operations SEP-2549 names. See [`CacheHinted`].
+    /// of the six operations SEP-2549 names. See `CacheHinted`.
     async fn list_resource_templates(
         &self,
         _request: Option<PaginatedRequestParams>,
@@ -4679,7 +4696,7 @@ impl ServerHandler for McpServer {
     /// a puzzle.
     ///
     /// An attachment uri is anything [`CrystallineUrl::asset_path`] recognizes
-    /// once its path has been percent-decoded (see [`decoded_uri_path`]), and
+    /// once its path has been percent-decoded (see `decoded_uri_path`), and
     /// the bytes come back the way the file is read rather than the way it was
     /// asked for: a text mime as `TextResourceContents`, everything else base64
     /// in `BlobResourceContents`. This is the one place base64 is ever emitted
@@ -5375,7 +5392,7 @@ fn names_manifest_path(raw: &str) -> bool {
         }
     }
     let joined = parts.join("/");
-    joined.eq_ignore_ascii_case("MANIFEST.md") || joined.eq_ignore_ascii_case("MANIFEST")
+    crate::engine::names_the_manifest(&joined) || joined.eq_ignore_ascii_case("MANIFEST")
 }
 
 /// An engine error as the shape its content deserves: a refusal the model must
@@ -5514,6 +5531,7 @@ fn remote_to_error(e: RemoteError) -> ErrorData {
         | RemoteError::AuthPending
         | RemoteError::Api { .. }
         | RemoteError::Io(_)
+        | RemoteError::WorkingTree { .. }
         | RemoteError::State(_)
         | RemoteError::Credential { .. }
         | RemoteError::ServerCredential { .. }

@@ -1124,7 +1124,7 @@ pub struct SearchQuery {
     /// Filter by `type`.
     pub engram_type: Option<String>,
     /// Filter by `status`. `stable` and `current` are one equivalence class in
-    /// both directions (see [`CURRENT_STATUS_CLASS`]); any other value is an
+    /// both directions (see `CURRENT_STATUS_CLASS`); any other value is an
     /// exact match.
     pub status: Option<String>,
     /// Require all of these tags.
@@ -1496,6 +1496,21 @@ pub(crate) fn folder_slash(prefix: &str) -> String {
         prefix.to_string()
     } else {
         format!("{prefix}/")
+    }
+}
+
+/// The half-open byte range `[low, high)` every path under a folder falls in,
+/// for [`Store::folder_holds_other`]: `notes/` up to `notes0`, `0` being the
+/// character after `/`. Compared bytewise (SQLite's default collation, and
+/// `COLLATE "C"` on Postgres), so the match folds no case and reads no
+/// wildcard, and a plain range over `path` is one an index can seek
+/// (`idx_engram_path_actor` on Turso, `idx_engram_base_path_c` on Postgres).
+/// The root is every path.
+pub(crate) fn folder_range(prefix: &str) -> (String, String) {
+    let prefix = folder_slash(prefix);
+    match prefix.strip_suffix('/') {
+        Some(folder) => (prefix.clone(), format!("{folder}0")),
+        None => (String::new(), char::MAX.to_string()),
     }
 }
 
@@ -2228,7 +2243,7 @@ pub(crate) fn build_vocabulary(
 /// This exists for the one caller that cannot ask SQL for what it wants: a
 /// vocabulary sweep for a caller who may not read every domain. The store's own
 /// sweep is all-domains or one domain, so such a caller reads the domains it may
-/// see and merges here - and the merge is [`build_vocabulary`] itself, fed the
+/// see and merges here - and the merge is `build_vocabulary` itself, fed the
 /// summed per-name counts, so the result cannot order or shape itself
 /// differently from a sweep the store answered in one query.
 pub fn merge_vocabularies(parts: Vec<Vocabulary>) -> Vocabulary {
@@ -2638,6 +2653,27 @@ pub trait Store: Send + Sync {
         limit: usize,
     ) -> Result<BrowseLevel>;
 
+    /// Whether a base engram other than `except` stands anywhere under the
+    /// folder `prefix` (with or without its trailing slash), at any depth. One
+    /// `LIMIT 1` probe that stops at the first row, for a caller that asks
+    /// only "is this folder new", which is the close-folder hint on a write
+    /// receipt; [`Store::browse_level`] answers a bigger question with a count
+    /// and a `DISTINCT` scan.
+    ///
+    /// The prefix is matched exactly, case included and never as a pattern:
+    /// `Plan/` is not `plan/`, the same way the hint compares folder names,
+    /// and `a_b/` is not `axb/`. Drafts are not base rows and are not counted,
+    /// and neither is a reserved `index.md` or `log.md` at any depth, matched
+    /// exactly as [`crystalline_core::is_reserved_path`] matches: sync skips
+    /// both names and every write refuses them, but a virtual domain's import
+    /// stores any `.md` file it is handed.
+    async fn folder_holds_other(
+        &self,
+        domain: DomainId,
+        prefix: &str,
+        except: &str,
+    ) -> Result<bool>;
+
     /// Every engram carrying a tag, on its frontmatter or on one of its
     /// observations, optionally scoped to one domain. The bound tag is
     /// case-folded to match the case-folded `tag.name`. Ordered by domain name
@@ -2779,7 +2815,7 @@ pub trait Store: Send + Sync {
     /// caller has open. First what dangles is unbound: a `to_id` naming a row
     /// nobody holds any more is the trace of a draft that went away, and
     /// leaving it would be an edge into nothing. Then what is pending is bound,
-    /// against [`ReferenceCandidates::View`] - their own drafts first, then the
+    /// against `ReferenceCandidates::View` - their own drafts first, then the
     /// base - so the author's links follow their own rows as those rows are
     /// written, dropped and folded.
     ///
@@ -3192,9 +3228,18 @@ pub trait Store: Send + Sync {
     /// included, for the same reason.
     async fn overlay_entries(&self, domain: DomainId, actor: &str) -> Result<Vec<StoredEngram>>;
 
+    /// [`Store::overlay_entries`] without the bodies: every draft path one
+    /// actor holds in a domain with its tombstone flag, ordered by path. For a
+    /// caller that only asks where drafts stand, such as the close-folder hint
+    /// on a write receipt, so it never loads a draft's text to learn its path.
+    async fn overlay_paths(&self, domain: DomainId, actor: &str) -> Result<Vec<(String, bool)>>;
+
     /// Drop one actor's draft at a path. Returns whether a row was there to
     /// drop, so a caller can tell "cleared" from "there was nothing to clear"
     /// without asking twice.
+    ///
+    /// Opens no transaction of its own: its caller (`clear_row`) holds one, so
+    /// the child rows and the unbinding go with the row or not at all.
     async fn clear_overlay_entry(&self, domain: DomainId, actor: &str, path: &str) -> Result<bool>;
 
     /// How many drafts each actor holds in a domain, ordered by actor. Base
