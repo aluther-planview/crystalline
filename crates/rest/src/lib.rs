@@ -75,7 +75,7 @@ pub use oauth::ALWAYS_ALLOWED_HOSTS;
 pub use oauth::{
     AUTHORIZATION_SERVER_PATH, AUTHORIZATIONS_PATH, AUTHORIZE_PATH, CONSENT_PAGE,
     MAX_OAUTH_CLIENTS, MAX_REGISTER_BYTES, MAX_TOKEN_BYTES, OauthError, OauthServer, OriginRule,
-    PROTECTED_RESOURCE_PATH, REGISTER_PATH, REGISTRATION_BURST, REGISTRATION_WINDOW,
+    PROTECTED_RESOURCE_PATH, REGISTER_PATH, REGISTRATION_BURST, REGISTRATION_WINDOW, REVOKE_PATH,
     RegistrationLimiter, TOKEN_PATH, redirect_matches, redirect_uri_problem, resource_metadata_url,
     well_known_routes,
 };
@@ -225,6 +225,7 @@ use crate::scope::{DomainAccess, DomainRight};
         oauth_grants::list,
         oauth_grants::revoke,
         oauth::token,
+        oauth::revoke,
         identity_links::list,
         identity_links::unlink,
         draft_links::mint,
@@ -313,6 +314,7 @@ use crate::scope::{DomainAccess, DomainRight};
         oauth::DecisionResponse,
         schemas::OauthGrantInfo,
         oauth::TokenForm,
+        oauth::RevokeForm,
         oauth::TokenResponse,
         schemas::EngramChanged,
         schemas::DomainChanged,
@@ -366,6 +368,11 @@ pub struct RestState {
     /// collab upgrade route joins rooms in it, and every save it makes goes
     /// back through the engine above.
     pub collab: Arc<crate::collab::session::CollabSessions>,
+    /// The path this instance is served under, from `service.public_url`:
+    /// every cookie is scoped to it, so two instances on one host keep
+    /// separate sessions, and the sign-in landing and `return_to` are built
+    /// under it. The root where the key has no path.
+    pub base_path: crystalline_core::base::BasePath,
     /// The one-time token that lets a non-local caller reach
     /// `POST /auth/setup`, generated once per `serve` process and only for a
     /// non-loopback bind. `None` means the token path is closed: there is no
@@ -428,6 +435,7 @@ impl RestState {
         // `Engine::set_collab_sessions`.
         engine.set_collab_sessions(&collab);
         Ok(RestState {
+            base_path: crate::settings::base_path(&config),
             collab,
             engine,
             oauth,
@@ -684,6 +692,13 @@ fn routes(state: RestState) -> Router {
         .route(
             oauth::TOKEN_PATH,
             post(oauth::token).route_layer(DefaultBodyLimit::max(oauth::MAX_TOKEN_BYTES)),
+        )
+        // RFC 7009 revocation, public by path for the token route's reason:
+        // the caller is a program holding a token, never a session. Its own
+        // small body limit, for the same reason too.
+        .route(
+            oauth::REVOKE_PATH,
+            post(oauth::revoke).route_layer(DefaultBodyLimit::max(oauth::MAX_TOKEN_BYTES)),
         )
         .route("/domains", get(domains::list).post(domains_admin::create))
         // Admin only, enforced in the handler like every other admin route
@@ -1111,6 +1126,47 @@ pub(crate) async fn require_domain_read(
     Ok(())
 }
 
+/// Refuse with the write list's sentence when the caller's write list is
+/// what keeps it from a step on `domain`.
+///
+/// `needed` is `None` for the write question
+/// ([`crate::scope::DomainAccess::write_list_excludes`]) and `Some(Own)` or
+/// `Some(Manage)` for an owner or manager step, where the list is named only
+/// when the caller would hold `needed` without it
+/// ([`crate::scope::DomainAccess::write_list_refuses`]).
+///
+/// The cap itself is in the rights resolver, so every gate that reads
+/// `right` or `write_right` already refuses; this is the sentence for those
+/// gates, and the whole gate for the admin-only routes that read neither
+/// (the MANIFEST save, privatizing, the archive import). A resolver that
+/// cannot answer refuses, never a fallback.
+pub(crate) async fn refuse_off_write_list(
+    state: &RestState,
+    identity: &Identity,
+    domain: &str,
+    needed: Option<DomainRight>,
+) -> Result<(), ApiError> {
+    let scope = identity.scope();
+    let answer = match needed {
+        None => state.access.write_list_excludes(&scope, domain).await,
+        Some(needed) => {
+            state
+                .access
+                .write_list_refuses(&scope, domain, needed)
+                .await
+        }
+    };
+    let excluded = answer.map_err(|e| {
+        ApiError::internal(format!("this domain's membership is unreadable: {e:#}"))
+    })?;
+    if let Some(account) = excluded {
+        return Err(ApiError::forbidden(
+            crate::engine::WriteBlock::WriteList { account }.sentence(domain),
+        ));
+    }
+    Ok(())
+}
+
 /// The caller, when the request may mutate content in `domain`.
 ///
 /// Three refusals in the order they have to happen:
@@ -1121,6 +1177,7 @@ pub(crate) async fn require_domain_read(
 /// 2. then the instance role, unchanged: a domain invitation widens what an
 ///    account may *reach*, never what its instance role lets it *do*, so a
 ///    domain editor who is an instance viewer is still refused here;
+///    2b. then the write list, which names itself (`refuse_off_write_list`);
 /// 3. then the membership level, which is what a private domain adds. The
 ///    message names the level the caller holds, because "forbidden" on a
 ///    domain they can see and read is otherwise indistinguishable from a bug.
@@ -1129,12 +1186,11 @@ pub(crate) async fn require_domain_read(
 /// instance role's own (the policy in `crate::scope`), so a caller past step 2
 /// holds `Write` or better by construction.
 ///
-/// Two routes carry no domain gate of any kind, deliberately: saving a domain's
-/// MANIFEST and the origin pull. Both are `require_admin`, and an instance
-/// admin resolves to [`DomainRight::Own`] on every domain, private ones
-/// included, so a gate there is a store round trip that cannot refuse. If that
-/// early return is ever narrowed, those two are what has to be revisited -
-/// which is why this sentence sits here rather than nowhere.
+/// Saving a domain's MANIFEST, privatizing a domain and the archive import are
+/// `require_admin` and carry no membership gate, since an admin resolves to
+/// [`DomainRight::Own`] everywhere; the write list narrows that, so each of
+/// them calls `refuse_off_write_list`. The origin pull is a pull and is not
+/// affected.
 ///
 /// `DELETE /domains/{domain}` used to be the third. It is not admin-only any
 /// more: it runs `Identity::require_account` and hands the decision to
@@ -1151,6 +1207,7 @@ pub(crate) async fn require_domain_write(
     let scope = identity.scope();
     state.engine.require_domain(domain, &scope).await?;
     let caller = identity.require_editor()?;
+    refuse_off_write_list(state, identity, domain, None).await?;
     // The capped right rather than the bare domain answer, so this gate and the
     // MCP one are one rule with one spelling (`DomainAccess::write_right`).
     // `require_editor` above already refuses every account the cap would catch,

@@ -97,6 +97,7 @@ import { DOMAINS_QUERY_KEY } from "../api/domains";
 import { domainEngramsRoot } from "../api/engrams";
 import { asNumber, asObject, asString } from "../api/json";
 import { useAuth } from "../auth/AuthContext";
+import { useDomainWritable } from "../domainWritable";
 import { isWebAddress, plural } from "../format";
 import { ChangeList } from "./ChangeList";
 import { DiffPane } from "./DiffPaneLazy";
@@ -133,6 +134,10 @@ export default function ShareDialogBody({
    * reader who may not write is offered no control that would be refused.
    */
   const mayDiscard = capabilities.canWrite && !capabilities.readOnly;
+  // Sharing is refused on a locked domain (discard is not, decision D5), so
+  // the button says so instead of failing.
+  const { domainLocked } = useDomainWritable(domain);
+  const lockedReasonId = useId();
   const titleField = useId();
   const descriptionField = useId();
   const proposalField = useId();
@@ -277,7 +282,7 @@ export default function ShareDialogBody({
     real.length > 0 && !real.some((change) => selected.has(change.path));
 
   const share = useMutation({
-    mutationFn: () =>
+    mutationFn: (asProposal: boolean) =>
       shareDomain(domain, {
         ...(ownTitle ? { title: typed } : {}),
         ...(description.trim() !== ""
@@ -298,8 +303,12 @@ export default function ShareDialogBody({
                 .filter((change) => selected.has(change.path))
                 .map((change) => change.path),
             }),
+        // Only when somebody pressed "Share as a proposal": every other share
+        // leaves the route to the engine.
+        ...(asProposal ? { as_proposal: true } : {}),
       }),
     onSuccess: (result) => {
+      setProblem(null);
       setOutcome(describeOutcome(result));
     },
     onError: (error: Error) => {
@@ -512,12 +521,40 @@ export default function ShareDialogBody({
                 )}
                 {outcome.after}
               </p>
-              <div className="flex justify-end">
+              {outcome.note != null && outcome.note !== "" && (
+                <p className="text-sm text-slate-600 dark:text-slate-300">
+                  {outcome.note}
+                </p>
+              )}
+              {problem !== null && (
+                <p role="alert" className={ALERT_CLASSES}>
+                  {problem}
+                </p>
+              )}
+              <div className="flex justify-end gap-2">
+                {outcome.offerProposal === true && (
+                  <button
+                    type="button"
+                    autoFocus
+                    disabled={share.isPending}
+                    onClick={() => {
+                      setProblem(null);
+                      share.mutate(true);
+                    }}
+                    className={BUTTON.primary}
+                  >
+                    Share as a proposal
+                  </button>
+                )}
                 <button
                   type="button"
-                  autoFocus
+                  autoFocus={outcome.offerProposal !== true}
                   onClick={onClose}
-                  className={BUTTON.primary}
+                  className={
+                    outcome.offerProposal === true
+                      ? BUTTON.secondary
+                      : BUTTON.primary
+                  }
                 >
                   Close
                 </button>
@@ -561,7 +598,7 @@ export default function ShareDialogBody({
                   !identity.asking
                 ) {
                   setProblem(null);
-                  share.mutate();
+                  share.mutate(false);
                 }
               }}
             >
@@ -621,7 +658,9 @@ export default function ShareDialogBody({
               <Dialog.Description className="text-sm text-slate-500 dark:text-slate-400">
                 {planProblem === null
                   ? amending === null
-                    ? actionLine(plan.data ?? null)
+                    ? plan.data?.note
+                      ? plan.data.note
+                      : actionLine(plan.data ?? null)
                     : amendLine(amending, chosenLayersAbove)
                   : "This share could not be planned."}
               </Dialog.Description>
@@ -756,6 +795,17 @@ export default function ShareDialogBody({
                   }}
                 />
               </Field>
+              {/* Said in plain view, beside the grey Share button it
+                  explains, rather than only to a screen reader: a person who
+                  sees the button go grey reads why. */}
+              {domainLocked && (
+                <p
+                  id={lockedReasonId}
+                  className="text-sm text-slate-600 dark:text-slate-300"
+                >
+                  {`'${domain}' is read-only; its owner switches read_only off in the domain policies`}
+                </p>
+              )}
               <div className="flex flex-wrap items-center justify-end gap-2">
                 {identity.sharingAs !== null && (
                   <SharingAs login={identity.sharingAs} />
@@ -809,8 +859,12 @@ export default function ShareDialogBody({
                       !shareable ||
                       nothingPicked ||
                       share.isPending ||
-                      identity.asking
+                      identity.asking ||
+                      domainLocked
                     }
+                    {...(domainLocked
+                      ? { "aria-describedby": lockedReasonId }
+                      : {})}
                     className={BUTTON.primary}
                   >
                     {action === "commit"
@@ -878,6 +932,7 @@ function actionLine(plan: SharePlan | null): string {
     layersAbove = null,
     branch = null,
     title = null,
+    own = true,
   } = plan ?? {};
   const named =
     number === null ? "the proposal" : `proposal #${String(number)}`;
@@ -911,6 +966,11 @@ function actionLine(plan: SharePlan | null): string {
     case "proposal_open":
       // The one state a direct domain adds: the branch this share would
       // commit onto is the one a proposal is still waiting to land on.
+      if (!own) {
+        return number === null
+          ? "Another person's proposal is still open; share again once it is merged or closed."
+          : `Proposal #${String(number)} (${title ?? "untitled"}) is another person's and is still open; share again once it is merged or closed.`;
+      }
       return number === null
         ? "A proposal is still open; merge or withdraw it before sharing directly."
         : `Proposal #${String(number)} (${title ?? "untitled"}) is still open; merge or withdraw it before sharing directly.`;
@@ -965,6 +1025,13 @@ interface OutcomeSentence {
    * them; every other outcome leaves the working tree where it was.
    */
   folded?: boolean;
+  /** The server's extra line about how the share went, if it sent one. */
+  note?: string | null;
+  /**
+   * Whether the refusal offers the same share as a proposal: a direct
+   * commit the branch refused, answered with `fallback: "proposal"`.
+   */
+  offerProposal?: boolean;
 }
 
 /** A sentence with nothing to link. */
@@ -1049,12 +1116,15 @@ function describeOutcome(result: unknown): OutcomeSentence {
         asString(proposal?.url),
       );
     case "proposed":
-      return numberSentence(
-        "Opened ",
-        number,
-        `${placementLine(proposal ?? record)}.`,
-        asString(record?.url),
-      );
+      return {
+        ...numberSentence(
+          "Opened ",
+          number,
+          `${placementLine(proposal ?? record)}.`,
+          asString(record?.url),
+        ),
+        note: asString(record?.note),
+      };
     case "nothing_to_share":
       return plainSentence(
         "Nothing to share: the team already has all of this.",
@@ -1080,13 +1150,24 @@ function describeOutcome(result: unknown): OutcomeSentence {
               ` to ${branch}.`,
               asString(record?.url),
             );
-      return { ...sentence, folded };
+      return { ...sentence, folded, note: asString(record?.note) };
     }
     // The three a direct domain refuses with. Each carries the server's own
     // guidance, which names the verb that settles it, so nothing is
-    // paraphrased here.
+    // paraphrased here - except where the dialog offers the proposal itself:
+    // that guidance names a tool call for an agent, and a person beside the
+    // button is told in plain words what the button does.
+    case "branch_protected": {
+      const offerProposal = asString(record?.fallback) === "proposal";
+      const branch = asString(record?.branch);
+      const message = asString(record?.message);
+      const sentence =
+        offerProposal && branch !== null && message !== null
+          ? `The branch ${branch} does not accept direct commits from you (${message}). Share the same changes as a proposal instead.`
+          : (asString(record?.guidance) ?? "Nothing was shared.");
+      return { ...plainSentence(sentence), offerProposal };
+    }
     case "proposal_open":
-    case "branch_protected":
     case "branch_moved":
       return plainSentence(asString(record?.guidance) ?? "Nothing was shared.");
     case "proposal_diverged":

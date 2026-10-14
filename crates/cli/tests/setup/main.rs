@@ -8,8 +8,15 @@
 
 #[path = "../common/mod.rs"]
 mod common;
+#[cfg(unix)]
+#[path = "../common/daemon_env.rs"]
+mod daemon_env;
+#[path = "../common/remote_server.rs"]
+mod remote_server;
 
 mod configure;
+mod daemon_task;
+mod desktop_state;
 mod doctor;
 mod doctor_names;
 #[cfg(unix)]
@@ -21,4 +28,7 @@ mod install;
 mod prompt;
 #[cfg(unix)]
 mod provision;
+#[cfg(unix)]
+mod source_hooks;
 mod version;
+mod wix;

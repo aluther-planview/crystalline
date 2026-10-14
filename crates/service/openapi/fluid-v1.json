@@ -588,7 +588,7 @@
           "auth"
         ],
         "summary": "Start a single sign-on against the configured provider.",
-        "description": "Redirects to the provider's authorization endpoint with PKCE (S256), a server-generated state and a server-generated nonce, and sets the short-lived `fluid_oidc_state` cookie that binds the sign-in to this browser. Public, like the password login: there is no session yet. Linking a provider identity to an existing account is the POST on this same path, not a flag here: a GET carrying `link=true` is refused with a 400 that says so, because a GET could be sent by another origin. `return_to` names where the callback should land the browser once the sign-in completes - the OAuth consent page is what it exists for. It must be a path on this instance (starts with `/`, not `//`, no backslash, at most 512 printable ASCII characters); anything else is dropped and the sign-in lands on `/`.",
+        "description": "Redirects to the provider's authorization endpoint with PKCE (S256), a server-generated state and a server-generated nonce, and sets the short-lived `fluid_oidc_state` cookie that binds the sign-in to this browser. Public, like the password login: there is no session yet. Linking a provider identity to an existing account is the POST on this same path, not a flag here: a GET carrying `link=true` is refused with a 400 that says so, because a GET could be sent by another origin. `return_to` names where the callback should land the browser once the sign-in completes - the OAuth consent page is what it exists for. It must be a path on this instance, under its base path (starts with `/`, not `//`, no backslash, no `.` or `..` segment, at most 512 printable ASCII characters); anything else is dropped and the sign-in lands on the root of the base path (`/` at the root).",
         "operationId": "oidc_login",
         "parameters": [
           {
@@ -603,7 +603,7 @@
           {
             "name": "return_to",
             "in": "query",
-            "description": "Where to send the browser once the sign-in completes: a path on this\ninstance, which the callback 302s to instead of `/`.\n\nThe OAuth consent page is what this exists for. A client sends a\nbrowser to `/authorize?request=<id>`, Fluid finds nobody signed in and\ncarries the intended location to the login page, and a provider sign-in\nhas to come back to that exact request: the pending authorization is\nonly reachable by its id, so landing anywhere else loses it.\n\nAnything [`safe_return_path`] does not accept is dropped rather than\nrefused, and the sign-in lands on `/`: the person did sign in, and only\nthe destination was unusable.",
+            "description": "Where to send the browser once the sign-in completes: a path on this\ninstance, which the callback 302s to instead of the root of the base\npath.\n\nThe OAuth consent page is what this exists for. A client sends a\nbrowser to `/authorize?request=<id>`, Fluid finds nobody signed in and\ncarries the intended location to the login page, and a provider sign-in\nhas to come back to that exact request: the pending authorization is\nonly reachable by its id, so landing anywhere else loses it.\n\nAnything [`safe_return_path`] does not accept is dropped rather than\nrefused, and the sign-in lands on the root of the base path (`/` at the\nroot): the person did sign in, and only the destination was unusable.",
             "required": false,
             "schema": {
               "type": "string"
@@ -1129,7 +1129,7 @@
         "operationId": "list_domains",
         "responses": {
           "200": {
-            "description": "The engine's own domain listing, unchanged.\n\nA domain that reviews changes before they land carries `review: \"overlay\"` and, for a caller with an account, `my_drafts`: how many draft changes of theirs are waiting to be shared. Both are absent on a domain that takes changes directly, and `my_drafts` is absent rather than zero when there is no account to count for - a client reads presence, since null and 0 are different facts.\n\nEvery domain also carries `canonical_name` (the name its content carries), `aliases` (its former local names, still accepted as input), `name_origin` (`explicit` or `derived`, `null` for a legacy entry nothing has inferred yet), `shadowed` (whether another domain's local name already holds this one's canonical name - a bool, never naming the other domain) and `renaming` (whether a rename has this domain paused right now; always present, so every row keeps the same columns).",
+            "description": "The engine's own domain listing, unchanged.\n\nA domain that reviews changes before they land carries `review: \"overlay\"` and, for a caller with an account, `my_drafts`: how many draft changes of theirs are waiting to be shared. Both are absent on a domain that takes changes directly, and `my_drafts` is absent rather than zero when there is no account to count for - a client reads presence, since null and 0 are different facts.\n\nEvery domain also carries `canonical_name` (the name its content carries), `aliases` (its former local names, still accepted as input), `name_origin` (`explicit` or `derived`, `null` for a legacy entry nothing has inferred yet), `shadowed` (whether another domain's local name already holds this one's canonical name - a bool, never naming the other domain) and `renaming` (whether a rename has this domain paused right now; always present, so every row keeps the same columns).\n\nFor an instance admin, `mounted` lists the domains this machine offers from connected servers (`crystalline connect`): each one's local `name`, its `source`, the server's `source_url`, its `remote_name` there and the `web_url` of its page on that server (`null` unless the address is http or https). They are not served here.",
             "content": {
               "application/json": {
                 "schema": {
@@ -3610,7 +3610,7 @@
           "domains"
         ],
         "summary": "The domain's MANIFEST markdown as written.",
-        "description": "The source, not a reduction of it, so a client can render or edit it directly.\n\nThe response carries an `ETag` of `\"{checksum}-{version}\"`: the plain content checksum plus this binary's own version, so a shape `sections` gains across a release is never masked by a 304 answered from a browser's pre-upgrade cache. It is the same validator a later `PUT` compares an `If-Match` against, which accepts either this full tag or the bare checksum. `If-None-Match` naming the current tag answers 304 with no body, and `Cache-Control: no-cache` on both the 200 and the 304 keeps a stored copy revalidating instead of going heuristically fresh, so a save elsewhere is picked up on its next use.\n\n`sections` is what the core crate reads out of the source: the routing bullets and which of them an agent reads, the provisioning and tag alias declarations with every bullet that did not parse, and every frontmatter policy key with what it declares and what holds. `null` for `provisioning` or `tag_aliases` means the section is absent.\n\n`starters` and `starter_document` come from the core registry rather than from this document, so a client can show what a MANIFEST CAN say whether or not this one says any of it.",
+        "description": "The source, not a reduction of it, so a client can render or edit it directly.\n\nThe response carries an `ETag` of `\"{checksum}-{version}\"`: the plain content checksum plus this binary's own version, so a shape `sections` gains across a release is never masked by a 304 answered from a browser's pre-upgrade cache. It is the same validator a later `PUT` compares an `If-Match` against, which accepts either this full tag or the bare checksum. `If-None-Match` naming the current tag answers 304 with no body, and `Cache-Control: no-cache` on both the 200 and the 304 keeps a stored copy revalidating instead of going heuristically fresh, so a save elsewhere is picked up on its next use.\n\n`sections` is what the core crate reads out of the source: the routing bullets and which of them an agent reads, the provisioning and tag alias declarations with every bullet that did not parse, and every frontmatter policy key with what it declares and what holds. `null` for `provisioning` or `tag_aliases` means the section is absent.\n\n`starters` and `starter_document` come from the core registry rather than from this document, so a client can show what a MANIFEST CAN say whether or not this one says any of it.\n\nA domain with no MANIFEST yet answers 200 with `missing: true`, empty markdown and the checksum of the empty text; a `PUT` carrying that checksum creates it.",
         "operationId": "get_domain_manifest",
         "parameters": [
           {
@@ -3662,6 +3662,7 @@
                   "checksum": "3f8a1c05e2",
                   "domain": "eng",
                   "markdown": "---\ntitle: eng\n---\n\n## Scope\n\n- Everything about eng\n\n## When to Use\n\n- Route here for eng questions.\n",
+                  "missing": false,
                   "sections": {
                     "missing": [],
                     "policies": [
@@ -3751,7 +3752,7 @@
             }
           },
           "404": {
-            "description": "No such domain, or the domain carries no MANIFEST yet.",
+            "description": "No such domain.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -3767,7 +3768,7 @@
           "domains"
         ],
         "summary": "Save a domain's MANIFEST markdown, guarded by If-Match.",
-        "description": "The text lands verbatim, frontmatter included, apart from line endings, which are stored as LF, guarded the same way an engram save is: 428 with no `If-Match`, 412 when the token is stale (carrying the version the server holds now), 200 once it lands. A read-only instance answers 403 ahead of the precondition check, so it is never 428.",
+        "description": "The text lands verbatim, frontmatter included, apart from line endings, which are stored as LF, guarded the same way an engram save is: 428 with no `If-Match`, 412 when the token is stale (carrying the version the server holds now), 200 once it lands. A read-only instance answers 403 ahead of the precondition check, so it is never 428. A MANIFEST that is not there yet is created by a save whose `If-Match` is the checksum the read answered for it, the checksum of the empty text.",
         "operationId": "save_domain_manifest",
         "parameters": [
           {
@@ -3820,6 +3821,7 @@
                   "checksum": "3f8a1c05e2",
                   "domain": "eng",
                   "markdown": "---\ntitle: eng\n---\n\n## Scope\n\n- Everything about eng\n\n## When to Use\n\n- Route here for eng questions.\n",
+                  "missing": false,
                   "sections": {
                     "missing": [],
                     "policies": [
@@ -3916,7 +3918,7 @@
             }
           },
           "404": {
-            "description": "No such domain, or the domain carries no MANIFEST yet.",
+            "description": "No such domain.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -4025,6 +4027,7 @@
                   "checksum": "3f8a1c05e2",
                   "domain": "kb",
                   "markdown": "---\ntitle: kb\nsharing: direct\n---\n\n## Scope\n\n- Everything about kb\n\n## When to Use\n\n- Route here for kb questions.\n",
+                  "missing": false,
                   "sections": {
                     "missing": [],
                     "policies": [
@@ -4963,7 +4966,7 @@
         ],
         "responses": {
           "200": {
-            "description": "The engine's own status report for this one domain, plus the mode it is synced in and this instance's GitHub connection. `local_changes` is the unshared-work count a client shows as pending, counting real work only: a refreshed folder listing (`index.md`) is derived from the engrams beside it and is never the reason for a share, riding along with one where the domain's MANIFEST declares `generated_indexes: shared` and staying on this machine where it does not. On a stacked chain the count is taken against the chain tip, so work an open proposal already carries is not counted as unshared and the count agrees with the share plan. `owned_changes` counts how many of those changes THIS session's account last wrote, by the changed file's own `generated.by` line - last-writer provenance, never authorship - so a surface can say `2 of 5 unshared changes are yours`. It is null when the request carries no session account or the domain's origin state cannot be read, which is a different thing from zero; `probe_error` is set when the live check could not reach GitHub and the rest of the report came from local state alone; `connection.connected` is false when no credential is on file, which is why a disconnected instance still answers here instead of refusing. `merged_unconsumed` names, by number, the proposals a live check found merged upstream that this domain has not pulled in yet: they stand in neither proposal list, and the next sync consumes them. Each proposal record carries `author_login`, the GitHub login the share that wrote it acted as - null on records shared before this was recorded and whenever the acting credential has no login to name, so a client shows it where it is present and nothing where it is not. `sharing` names the domain's policy and `direct_shares` the commits this machine put straight on the branch.\n\nFour keys say where the domain's chain of stacked proposals stands. `stack_number` is the chain's number on the forge, null when nothing is stacked. `stack_wedged` lists the declined layers still carrying open layers above them, empty when the chain is sound - a client surfaces those numbers, because a wedged chain cannot grow until one of them is withdrawn or reopened. `repair_pending` and `stack_link_pending` are the two debts a caller settles by sharing or by checking status again: a rebuild left half-done, and a chain whose layers all exist but are not grouped on the forge yet. All four are always present, quiet rather than absent off the stacked path, so one reader handles either path.\n\n`kept_branches` lists share branches Crystalline keeps upstream instead of deleting them: a merged, declined or withdrawn share's branch that an open pull request is based on or comes from, one whose pull request cannot move because the target branch no longer exists, one GitHub refused to delete and a declined or withdrawn share's branch that a waiting move still needs. Each entry carries `branch`, `number`, `onto`, `why` (`merged`, `declined` or `withdrawn`), `kind` (`base`, `head`, `target_gone`, `delete_refused` or `awaited`), `blocked_by` (the pull request in the way, null when the open pull requests could not be listed or the delete was refused), `reason` (the forge's answer, null when there is none) and `message`, the sentence to show. Always present, empty when nothing is kept.\n\nOn a domain that reviews changes three more keys say where the drafts stand. `my_drafts` counts this account's own draft changes, `drafts` counts every actor's, and `out_of_band` names the changed files in the folder the team reviewed that no draft accounts for - work written past review mode, which a client surfaces because sharing carries it along. All three are absent on a domain that takes changes directly.",
+            "description": "The engine's own status report for this one domain, plus the mode it is synced in and this instance's GitHub connection. `local_changes` is the unshared-work count a client shows as pending, counting real work only: a refreshed folder listing (`index.md`) is derived from the engrams beside it and is never the reason for a share, riding along with one where the domain's MANIFEST declares `generated_indexes: shared` and staying on this machine where it does not. On a stacked chain the count is taken against the chain tip, so work an open proposal already carries is not counted as unshared and the count agrees with the share plan. `owned_changes` counts how many of those changes THIS session's account last wrote, by the changed file's own `generated.by` line - last-writer provenance, never authorship - so a surface can say `2 of 5 unshared changes are yours`. It is null when the request carries no session account or the domain's origin state cannot be read, which is a different thing from zero; `probe_error` is set when the live check could not reach GitHub and the rest of the report came from local state alone; `connection.connected` is false when no credential is on file, which is why a disconnected instance still answers here instead of refusing. `merged_unconsumed` names, by number, the proposals a live check found merged upstream that this domain has not pulled in yet: they stand in neither proposal list, and the next sync consumes them. Each proposal record carries `author_login`, the GitHub login the share that wrote it acted as - null on records shared before this was recorded and whenever the acting credential has no login to name, so a client shows it where it is present and nothing where it is not. `sharing` names the domain's policy and `direct_shares` the commits this machine put straight on the branch. `direct_refused` is null, or names the `branch`, the forge's `message`, `refused_at` and the `line` to show when the branch refused a direct commit made under the GitHub login this session's shares go out on; another login's refusal never shows, nor any on a domain that opens proposals. Show that line as given.\n\nFour keys say where the domain's chain of stacked proposals stands. `stack_number` is the chain's number on the forge, null when nothing is stacked. `stack_wedged` lists the declined layers still carrying open layers above them, empty when the chain is sound - a client surfaces those numbers, because a wedged chain cannot grow until one of them is withdrawn or reopened. `repair_pending` and `stack_link_pending` are the two debts a caller settles by sharing or by checking status again: a rebuild left half-done, and a chain whose layers all exist but are not grouped on the forge yet. All four are always present, quiet rather than absent off the stacked path, so one reader handles either path.\n\n`kept_branches` lists share branches Crystalline keeps upstream instead of deleting them: a merged, declined or withdrawn share's branch that an open pull request is based on or comes from, one whose pull request cannot move because the target branch no longer exists, one GitHub refused to delete and a declined or withdrawn share's branch that a waiting move still needs. Each entry carries `branch`, `number`, `onto`, `why` (`merged`, `declined` or `withdrawn`), `kind` (`base`, `head`, `target_gone`, `delete_refused` or `awaited`), `blocked_by` (the pull request in the way, null when the open pull requests could not be listed or the delete was refused), `reason` (the forge's answer, null when there is none) and `message`, the sentence to show. Always present, empty when nothing is kept.\n\nOn a domain that reviews changes three more keys say where the drafts stand. `my_drafts` counts this account's own draft changes, `drafts` counts every actor's, and `out_of_band` names the changed files in the folder the team reviewed that no draft accounts for - work written past review mode, which a client surfaces because sharing carries it along. All three are absent on a domain that takes changes directly.",
             "content": {
               "application/json": {
                 "schema": {
@@ -5141,7 +5144,7 @@
           "domains"
         ],
         "summary": "Preview what sharing this team domain would do.",
-        "description": "Admin only, or an editor when this instance shares with personal GitHub identities (`github.share_identity` = `personal`). Pulls the origin first, then reports the action a share would take (`create`, `update` with the proposal number and url, `stack` with the layer it would sit on, `amend` with the layer it would land on, `nothing_to_share`, `conflicts_pending`, `proposal_diverged`, `commit` with the branch a direct domain would commit onto, `proposal_open` with the number, url and title of the proposal that blocks a direct share), the effective title and the changed files. The plan also carries `sharing` (`proposal` or `direct`, the domain's MANIFEST policy) and `repo`, so a client knows what kind of domain it is looking at before the action is read. A generated folder listing (`index.md`) is a change like any other here, because a share really carries it, but it is derived rather than written and is left out of the domain's `local_changes` count: a renderer counts these into one line rather than listing them beside the engrams. Each entry also carries `last_author`, the actor the file's own frontmatter records as having written it (`human:ada` for a person, an agent's own name for an agent) and null wherever there is nothing to read - a deleted file, one edited outside the engine. It is last-writer provenance rather than authorship, and it is what lets a client offer somebody their own changes first. Writes nothing to the origin; refused on a read-only instance because the freshness pull writes the working tree. Where this instance shares with personal GitHub identities, a caller who has connected none of their own still gets the plan - reading it needs nobody's personal credential - while `POST /domains/{domain}/sync/share` refuses until they connect.",
+        "description": "Admin only, or an editor when this instance shares with personal GitHub identities (`github.share_identity` = `personal`). Pulls the origin first, then reports the action a share would take (`create`, `update` with the proposal number and url, `stack` with the layer it would sit on, `amend` with the layer it would land on, `nothing_to_share`, `conflicts_pending`, `proposal_diverged`, `commit` with the branch a direct domain would commit onto, `proposal_open` with the number, url and title of the proposal that blocks a direct share), the effective title and the changed files. The plan also carries `sharing` (`proposal` or `direct`, the domain's MANIFEST policy) and `repo`, so a client knows what kind of domain it is looking at before the action is read. On a direct domain the plan may also carry `note`, one or two sentences to show as given that say how the share will go: it opens a proposal if the branch refuses it again, or it opens a proposal because your proposal is still open. A generated folder listing (`index.md`) is a change like any other here, because a share really carries it, but it is derived rather than written and is left out of the domain's `local_changes` count: a renderer counts these into one line rather than listing them beside the engrams. Each entry also carries `last_author`, the actor the file's own frontmatter records as having written it (`human:ada` for a person, an agent's own name for an agent) and null wherever there is nothing to read - a deleted file, one edited outside the engine. It is last-writer provenance rather than authorship, and it is what lets a client offer somebody their own changes first. Writes nothing to the origin; refused on a read-only instance because the freshness pull writes the working tree. Where this instance shares with personal GitHub identities, a caller who has connected none of their own still gets the plan - reading it needs nobody's personal credential - while `POST /domains/{domain}/sync/share` refuses until they connect.",
         "operationId": "get_domain_share_changes",
         "parameters": [
           {
@@ -5591,7 +5594,7 @@
           "domains"
         ],
         "summary": "Share a team domain's local changes as a proposal.",
-        "description": "Admin only, or an editor when this instance shares with personal GitHub identities (`github.share_identity` = `personal`). Opens a pull request against the domain's origin, stacks a new layer on the chain already open, or updates the one living proposal in place. With `proposal` in the body it amends that open layer instead, rebuilding the layers above it. Answers `nothing_to_share` when the team already has everything, `conflicts_pending` with the conflicts that need resolving first, and `proposal_diverged` when a reviewer moved the proposal branch and nothing was written. On a domain whose MANIFEST declares `sharing: direct` the share commits the selected files straight onto the connected branch instead and answers `committed` with the commit's sha and url; it answers `proposal_open` while any proposal is still open, `branch_protected` when the branch's rules refuse a direct commit and `branch_moved` when the branch moved twice while the share was prepared, each with guidance. A `proposal` in the body on a direct domain is a 422. Refused on a read-only instance.",
+        "description": "Admin only, or an editor when this instance shares with personal GitHub identities (`github.share_identity` = `personal`). Opens a pull request against the domain's origin, stacks a new layer on the chain already open, or updates the one living proposal in place. With `proposal` in the body it amends that open layer instead, rebuilding the layers above it. Answers `nothing_to_share` when the team already has everything, `conflicts_pending` with the conflicts that need resolving first, and `proposal_diverged` when a reviewer moved the proposal branch and nothing was written. On a domain whose MANIFEST declares `sharing: direct` the share commits the selected files straight onto the connected branch instead and answers `committed` with the commit's sha and url; it answers `proposal_open` while any proposal is still open, `branch_protected` when the branch's rules refuse a direct commit and `branch_moved` when the branch moved twice while the share was prepared, each with guidance. `as_proposal: true` opens a proposal on a direct domain instead. A `branch_protected` answer carries `fallback: \"proposal\"` unless only another login's proposal is open, which no share may go into; after one, a refused share opens the proposal itself and answers `proposed` with `fell_back: true` and a `note`, and a commit that lands again carries a `note` too. The refusal is kept per GitHub login the share goes out on. While that login has a proposal open, a share with `proposal` naming it amends it, and one with `as_proposal: true` or after a refusal stacks on it or amends it. A `proposal` that names no open proposal of that login on a direct domain is a 422. Refused on a read-only instance.",
         "operationId": "share_domain",
         "parameters": [
           {
@@ -7752,6 +7755,72 @@
         }
       }
     },
+    "/api/v1/oauth/revoke": {
+      "post": {
+        "tags": [
+          "oauth"
+        ],
+        "summary": "Revoke an OAuth grant by one of its tokens.",
+        "description": "RFC 7009 token revocation, form-encoded. `token` is the access or the refresh token and `client_id` the registration it was issued to; either token ends the whole grant. The answer is 200 with an empty body whether or not a grant matched.",
+        "operationId": "oauth_revoke",
+        "requestBody": {
+          "description": "The revocation request.",
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "$ref": "#/components/schemas/RevokeForm"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Revoked, or nothing to revoke."
+          },
+          "400": {
+            "description": "The body is not a form, or it lacks `token` or `client_id` (`invalid_request`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OauthErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A cookie session did not echo its CSRF token.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "This instance does not serve OAuth: `auth.oauth` is off.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The accounts database could not be reached.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OauthErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/oauth/token": {
       "post": {
         "tags": [
@@ -8824,7 +8893,7 @@
           "engrams"
         ],
         "summary": "Pre-save validation: the findings a save would raise, without writing.",
-        "description": "Runs verify's format (`E`) and temporal (`T`) rule families over the document text, the same families `crystalline verify` runs for a single document. Link, manifest, schema and quality rules need a whole domain for context and are not run here.\n\n`T006` (missing write provenance) is dropped, so a fresh unsaved document is not nagged about a field the save is about to stamp.\n\nRefused like every other write on this surface - editor role, read-only answered first - even though nothing is ever written.",
+        "description": "Runs verify's format (`E`) and temporal (`T`) rule families over the document text, the same families `crystalline verify` runs for a single document. Link, manifest, schema and quality rules need a whole domain for context and are not run here.\n\n`T006` (missing write provenance) is dropped, so a fresh unsaved document is not nagged about a field the save is about to stamp. A document named into a registered domain is held to that domain's `.crystalline.yaml` rule overrides: `off` drops a rule, a severity re-ranks it.\n\nRefused like every other write on this surface - editor role, read-only answered first - even though nothing is ever written.",
         "operationId": "validate_document",
         "requestBody": {
           "content": {
@@ -10047,6 +10116,7 @@
           "domain",
           "markdown",
           "checksum",
+          "missing",
           "sections"
         ],
         "properties": {
@@ -10063,6 +10133,11 @@
           "markdown": {
             "type": "string",
             "description": "The MANIFEST markdown as written, frontmatter included."
+          },
+          "missing": {
+            "type": "boolean",
+            "description": "True when the domain has no MANIFEST yet. `markdown` is then empty,\n`checksum` is the checksum of the empty text, and a `PUT` carrying it\nas `If-Match` creates the MANIFEST.",
+            "example": false
           },
           "sections": {
             "$ref": "#/components/schemas/ManifestSections",
@@ -10992,6 +11067,34 @@
           "direct"
         ]
       },
+      "RevokeForm": {
+        "type": "object",
+        "description": "The form of `POST /oauth/revoke` (RFC 7009 section 2.1).",
+        "properties": {
+          "client_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The registration the token was issued to.",
+            "example": "coc_0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+          },
+          "token": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The access token (`coa_`) or refresh token (`cor_`) to revoke. Either\nends the whole grant."
+          },
+          "token_type_hint": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`access_token` or `refresh_token`. A hint only: the prefix decides."
+          }
+        }
+      },
       "Role": {
         "type": "string",
         "description": "What a user may do. Ordered least to most privileged; the REST layer maps\neach endpoint to the minimum role it accepts.",
@@ -11080,6 +11183,14 @@
         "type": "object",
         "description": "The proposal's title and description, optionally the open proposal to amend instead of stacking a new layer, and optionally the files to carry. All optional: with none of them, the share carries every unshared change under a title the engine generates from the changes themselves, and targets the layer it picks itself.",
         "properties": {
+          "as_proposal": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "On a domain that shares directly: `true` opens a proposal for this\nshare, `false` tries the direct commit only and never falls back.\nAbsent lets the engine decide from the refusal it recorded.",
+            "example": true
+          },
           "description": {
             "type": [
               "string",

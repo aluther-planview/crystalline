@@ -65,6 +65,12 @@ pub struct PromptDomain {
     /// Whether this domain was named in the workspace's repo-local
     /// `preferred_domains`.
     pub preferred: bool,
+    /// Whether this domain takes no write from whoever the block is for: its
+    /// MANIFEST says `read_only: on` (a file domain reads that from disk here),
+    /// or the engine marked it for the caller (a virtual domain's lock, a
+    /// viewer's role, a domain off the caller's write list). The routing line
+    /// then says "(read-only)".
+    pub read_only: bool,
 }
 
 /// The result of building a routing prompt for a workspace.
@@ -124,12 +130,16 @@ pub fn generate_prompt(
     for name in ordered {
         let entry = &global.domains[name];
         let is_preferred = preferred.iter().any(|p| p == name);
-        let (bullets, warning) = if entry.is_virtual() {
-            virtual_routing_bullets(name, virtual_bullets.get(name))
+        let virtual_row = |name: &str| {
+            let (bullets, warning) = virtual_routing_bullets(name, virtual_bullets.get(name));
+            (bullets, warning, false)
+        };
+        let (bullets, warning, read_only) = if entry.is_virtual() {
+            virtual_row(name)
         } else {
             match &entry.path {
-                Some(path) => load_routing_bullets(name, path),
-                None => virtual_routing_bullets(name, virtual_bullets.get(name)),
+                Some(path) => load_routing_facts(name, path),
+                None => virtual_row(name),
             }
         };
         if let Some(w) = warning {
@@ -139,6 +149,7 @@ pub fn generate_prompt(
             name: name.to_string(),
             bullets,
             preferred: is_preferred,
+            read_only,
         });
     }
 
@@ -198,12 +209,16 @@ pub fn generate_prompt_unscoped(
     let mut registered: Vec<_> = global.domains.iter().collect();
     registered.sort_by_cached_key(|(name, _)| (name.to_lowercase(), (*name).clone()));
     for (name, entry) in registered {
-        let (bullets, warning) = if entry.is_virtual() {
-            virtual_routing_bullets(name, virtual_bullets.get(name))
+        let virtual_row = |name: &str| {
+            let (bullets, warning) = virtual_routing_bullets(name, virtual_bullets.get(name));
+            (bullets, warning, false)
+        };
+        let (bullets, warning, read_only) = if entry.is_virtual() {
+            virtual_row(name)
         } else {
             match &entry.path {
-                Some(path) => load_routing_bullets(name, path),
-                None => virtual_routing_bullets(name, virtual_bullets.get(name)),
+                Some(path) => load_routing_facts(name, path),
+                None => virtual_row(name),
             }
         };
         if let Some(w) = warning {
@@ -213,6 +228,7 @@ pub fn generate_prompt_unscoped(
             name: name.clone(),
             bullets,
             preferred: false,
+            read_only,
         });
     }
 
@@ -245,7 +261,20 @@ fn virtual_routing_bullets(
 }
 
 fn included_domain_names(global: &GlobalConfig, workspace: &Path) -> BTreeSet<String> {
-    let all: BTreeSet<String> = global.domains.keys().cloned().collect();
+    included_domain_names_among(global, workspace, &[])
+}
+
+/// The names `prompt.rules` keeps for `workspace`, out of the registered
+/// domains plus `extra`: the domains a connected server lends this machine,
+/// which a rule names by their local name like any other. With no rule that
+/// matches, every name is kept, so a block with no rules is unchanged.
+pub fn included_domain_names_among(
+    global: &GlobalConfig,
+    workspace: &Path,
+    extra: &[String],
+) -> BTreeSet<String> {
+    let mut all: BTreeSet<String> = global.domains.keys().cloned().collect();
+    all.extend(extra.iter().cloned());
     let Some(prompt_cfg) = &global.prompt else {
         return all;
     };
@@ -309,7 +338,7 @@ fn load_repo_config(workspace: &Path) -> Option<RepoConfig> {
     crate::config::load_yaml(&path).ok()
 }
 
-fn load_routing_bullets(name: &str, path: &Path) -> (Vec<String>, Option<String>) {
+fn load_routing_facts(name: &str, path: &Path) -> (Vec<String>, Option<String>, bool) {
     let resolved = expand_tilde(&path.to_string_lossy());
     let manifest_path = resolved.join("MANIFEST.md");
     match std::fs::read_to_string(&manifest_path) {
@@ -317,6 +346,7 @@ fn load_routing_bullets(name: &str, path: &Path) -> (Vec<String>, Option<String>
             Ok(engram) => {
                 let manifest = Manifest::from_engram(&engram, &source);
                 let bullets = manifest.routing_bullets().to_vec();
+                let read_only = manifest.read_only().is_on();
                 if bullets.is_empty() {
                     (
                         vec![placeholder(
@@ -326,9 +356,10 @@ fn load_routing_bullets(name: &str, path: &Path) -> (Vec<String>, Option<String>
                             "domain `{name}`: MANIFEST.md at {} has no Scope or When to Use bullets",
                             manifest_path.display()
                         )),
+                        read_only,
                     )
                 } else {
-                    (bullets, None)
+                    (bullets, None, read_only)
                 }
             }
             Err(e) => (
@@ -337,6 +368,7 @@ fn load_routing_bullets(name: &str, path: &Path) -> (Vec<String>, Option<String>
                     "domain `{name}`: MANIFEST.md at {} could not be parsed: {e}",
                     manifest_path.display()
                 )),
+                false,
             ),
         },
         Err(e) => (
@@ -345,6 +377,7 @@ fn load_routing_bullets(name: &str, path: &Path) -> (Vec<String>, Option<String>
                 "domain `{name}`: MANIFEST.md is missing or unreadable at {}: {e}",
                 manifest_path.display()
             )),
+            false,
         ),
     }
 }
@@ -413,11 +446,13 @@ fn render_domain_lines(
         return;
     }
     for d in &output.domains {
-        let label = if d.preferred {
-            format!("{} (preferred)", d.name)
-        } else {
-            d.name.clone()
-        };
+        let mut label = d.name.clone();
+        if d.preferred {
+            label.push_str(" (preferred)");
+        }
+        if d.read_only {
+            label.push_str(" (read-only)");
+        }
         let bullets = d
             .bullets
             .iter()
@@ -690,6 +725,11 @@ struct JsonPromptDomain<'a> {
     name: &'a str,
     bullets: &'a [String],
     preferred: bool,
+    /// Present and true only on a row the caller cannot write; a writable
+    /// row keeps the shape it always had. Not the top-level `read_only`,
+    /// which is the instance.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    read_only: bool,
 }
 
 #[derive(Serialize)]
@@ -702,7 +742,7 @@ struct JsonPrompt<'a> {
 }
 
 /// Render the prompt as JSON: `{version: 1, kind: "system", read_only,
-/// workspace, domains: [{name, bullets, preferred}]}`. `read_only` is always
+/// workspace, domains: [{name, bullets, preferred, read_only?}]}`. `read_only` is always
 /// present; `kind` is additive and `version` stays 1.
 pub fn render_json(output: &PromptOutput) -> String {
     let wrapped = JsonPrompt {
@@ -717,6 +757,7 @@ pub fn render_json(output: &PromptOutput) -> String {
                 name: &d.name,
                 bullets: &d.bullets,
                 preferred: d.preferred,
+                read_only: d.read_only,
             })
             .collect(),
     };
@@ -904,6 +945,31 @@ mod tests {
         );
         global.prompt = Some(crate::config::PromptConfig { rules });
         (tmp, global)
+    }
+
+    /// Review M4: a rule names a lent domain by its local name like any
+    /// other. An include list that names only a lent domain keeps only it,
+    /// an exclude drops it, and no matching rule keeps everything.
+    #[test]
+    fn prompt_rules_apply_to_the_names_a_server_lends() {
+        let (tmp, mut global) = fixture_with_prompt_rules();
+        let lent = vec!["jordi-acme".to_string()];
+        let names = |g: &GlobalConfig| -> Vec<String> {
+            included_domain_names_among(g, tmp.path(), &lent)
+                .into_iter()
+                .collect()
+        };
+        assert_eq!(names(&global), vec!["alpha"], "include alpha only");
+        fn rule(g: &mut GlobalConfig) -> &mut crate::config::PromptRule {
+            g.prompt.as_mut().unwrap().rules.get_mut("**").unwrap()
+        }
+        rule(&mut global).include = Some(vec!["jordi-acme".to_string()]);
+        assert_eq!(names(&global), vec!["jordi-acme"]);
+        rule(&mut global).include = None;
+        rule(&mut global).exclude = Some(vec!["jordi-acme".to_string()]);
+        assert_eq!(names(&global), vec!["alpha", "beta"]);
+        global.prompt = None;
+        assert_eq!(names(&global), vec!["alpha", "beta", "jordi-acme"]);
     }
 
     #[test]
@@ -1389,5 +1455,77 @@ mod tests {
             rendered_names(&global, std::path::Path::new(".")),
             vec!["alpha"]
         );
+    }
+
+    /// A read-only domain's routing line says so, on both renderers, after
+    /// `(preferred)` when it is both; a writable one is unchanged byte for
+    /// byte. The JSON prompt names it on the locked row only.
+    #[test]
+    fn a_read_only_domain_line_is_marked() {
+        let output = PromptOutput {
+            workspace: PathBuf::new(),
+            domains: vec![
+                PromptDomain {
+                    name: "archive".into(),
+                    bullets: vec!["Old incidents".into()],
+                    preferred: true,
+                    read_only: true,
+                },
+                PromptDomain {
+                    name: "eng".into(),
+                    bullets: vec!["Route here".into()],
+                    preferred: false,
+                    read_only: false,
+                },
+            ],
+            warnings: Vec::new(),
+            read_only: false,
+        };
+        let text = render_text(&output);
+        assert!(
+            text.contains("- archive (preferred) (read-only): Old incidents\n"),
+            "{text}"
+        );
+        assert!(text.contains("- eng: Route here\n"), "{text}");
+        let instructions = render_instructions(&output);
+        assert!(
+            instructions.contains("- archive (preferred) (read-only): Old incidents\n"),
+            "{instructions}"
+        );
+        let json: serde_json::Value = serde_json::from_str(&render_json(&output)).unwrap();
+        assert_eq!(json["domains"][0]["read_only"], true, "{json}");
+        assert!(
+            json["domains"][1].get("read_only").is_none(),
+            "a writable row keeps its shape: {json}"
+        );
+        assert_eq!(
+            json["read_only"], false,
+            "the top-level key is still the instance"
+        );
+    }
+
+    /// A file domain's flag is read from its MANIFEST on disk, like its
+    /// bullets; a virtual one is the caller's to set.
+    #[test]
+    fn a_file_domain_reads_its_flag_from_the_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("archive");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("MANIFEST.md"),
+            "---\ntype: manifest\ntitle: archive\npermalink: manifest\nread_only: on\n---\n\n## When to Use\n\n- Old incidents\n",
+        )
+        .unwrap();
+        let mut global = GlobalConfig::default();
+        global
+            .domains
+            .insert("archive".into(), DomainEntry::file(dir));
+        global
+            .domains
+            .insert("notes".into(), DomainEntry::virtual_domain());
+        let output = generate_prompt_unscoped(&global, &BTreeMap::new());
+        let row = |name: &str| output.domains.iter().find(|d| d.name == name).unwrap();
+        assert!(row("archive").read_only);
+        assert!(!row("notes").read_only);
     }
 }

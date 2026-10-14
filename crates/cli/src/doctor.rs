@@ -12,7 +12,9 @@
 //! against the configured one, plus the cached model directories with sizes,
 //! marking any the config does not use as stale (visible between a config
 //! change and the next daemon start, which prunes them on a writable
-//! instance running a local model); (g) when `github.enabled`, whether this
+//! instance running a local model), and the lock folders hf-hub left for a
+//! model that is no longer cached, which `--fix` removes; (g) when
+//! `github.enabled`, whether this
 //! machine is connected to GitHub and, per team domain, whether its local
 //! origin state is present and its base snapshot still matches what was
 //! recorded (`verify_base`); (h) which `CRYSTALLINE_*` environment variables
@@ -65,6 +67,7 @@ use std::path::Path;
 use anyhow::{Result, anyhow};
 use crystalline_core::config::{self, DatabaseBackend, DomainEntry, GlobalConfig, OriginConfig};
 use crystalline_core::provision;
+use crystalline_core::text::plural;
 use crystalline_core::verify::{self, VerifyOptions};
 use crystalline_core::{HarnessKind, harness_paths};
 use crystalline_index::{
@@ -329,6 +332,11 @@ pub struct ServiceDoctor {
     /// recorded one (none running, or one older than 0.21.1), or `--fix`
     /// dislodged it.
     pub runs_in: Option<crystalline_service::runs_in::RunsIn>,
+    /// The ways the running daemon differs from what this shell would have
+    /// started, each explained by a variable set here
+    /// ([`crystalline_service::shaping::config_mismatches`]). Warnings only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub config_mismatch: Vec<crystalline_service::shaping::ConfigMismatch>,
 }
 
 impl ServiceDoctor {
@@ -337,6 +345,7 @@ impl ServiceDoctor {
     fn mark_dislodged(&mut self) {
         self.daemon_dislodged = true;
         self.runs_in = None;
+        self.config_mismatch.clear();
     }
 }
 
@@ -382,6 +391,28 @@ pub struct GithubDoctor {
     /// Diagnostics for every domain connected to an origin (filtered by
     /// `--domain` like every other section).
     pub origins: Vec<OriginDoctor>,
+}
+
+/// One connected server, as doctor checks it.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SourceDoctor {
+    /// The source and what it said; the same row `status` prints.
+    #[serde(flatten)]
+    pub row: crate::sources::SourceRow,
+    /// What is wrong, when something is: the words a person acts on.
+    pub problem: Option<String>,
+}
+
+/// Every connected server, each asked at once within its own short limit.
+async fn check_sources(cfg: &crystalline_core::config::GlobalConfig) -> Vec<SourceDoctor> {
+    crate::sources::source_rows(cfg)
+        .await
+        .into_iter()
+        .map(|row| SourceDoctor {
+            problem: row.error.clone(),
+            row,
+        })
+        .collect()
 }
 
 /// One flat setting override from the environment, `(variable, key, value)`
@@ -881,6 +912,419 @@ pub struct NamesDoctor {
     pub error: Option<String>,
 }
 
+/// What Task Scheduler holds for this user: the task that starts the daemon
+/// at sign-in, outside any app package.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", content = "name", rename_all = "snake_case")]
+pub enum TaskFinding {
+    Missing,
+    ForOthers(String),
+    Ready(String),
+    /// Task Scheduler refused the query for this task name.
+    Refused(String),
+}
+
+/// The text of every `<tag>` element in `xml`, trimmed. Tag names compare
+/// without case.
+fn element_texts<'a>(xml: &'a str, tag: &str) -> Vec<&'a str> {
+    let lower = xml.to_ascii_lowercase();
+    let open = format!("<{}>", tag.to_ascii_lowercase());
+    let close = format!("</{}>", tag.to_ascii_lowercase());
+    let mut texts = Vec::new();
+    let mut from = 0;
+    while let Some(start) = lower[from..].find(&open).map(|i| from + i + open.len()) {
+        let Some(end) = lower[start..].find(&close).map(|i| start + i) else {
+            break;
+        };
+        texts.push(xml[start..end].trim());
+        from = end + close.len();
+    }
+    texts
+}
+
+/// The `<Principals>` block of a task definition, or the whole text when it
+/// has none. A per-user task names its account in the logon trigger too,
+/// and only the principal says who the task runs for.
+fn principals_block(xml: &str) -> &str {
+    let lower = xml.to_ascii_lowercase();
+    match (lower.find("<principals>"), lower.find("</principals>")) {
+        (Some(start), Some(end)) if start < end => &xml[start..end],
+        _ => xml,
+    }
+}
+
+/// `DOMAIN\name` split into its domain (if any) and its name.
+fn account_parts(account: &str) -> (Option<&str>, &str) {
+    match account.rsplit_once('\\') {
+        Some((domain, name)) => (Some(domain), name),
+        None => (None, account),
+    }
+}
+
+/// Whether two account names are the same account: compared without case,
+/// as Windows compares them, and the name alone when one side carries no
+/// domain.
+fn same_account(a: &str, b: &str) -> bool {
+    let (a_domain, a_name) = account_parts(a);
+    let (b_domain, b_name) = account_parts(b);
+    let names_match = a_name.to_lowercase() == b_name.to_lowercase();
+    match (a_domain, b_domain) {
+        (Some(x), Some(y)) => names_match && x.to_lowercase() == y.to_lowercase(),
+        _ => names_match,
+    }
+}
+
+/// A task runs for this user when its principal is a group (only the MSI
+/// registers one, for the Users group) or this account, and is taken to
+/// when its principal cannot be read at all. A principal that is this
+/// account's SID is this account too. The task under this user's own name
+/// with their SID (`\Crystalline Daemon for <name> (<SID>)`) is taken as
+/// theirs, as the bridge takes it: Task Scheduler may print the account as
+/// a SID, and a name outside ASCII may not survive the decoding of its
+/// output. The 0.24.0 name without the SID is judged by its principal like
+/// any other.
+pub(crate) fn task_finding(
+    name: Option<&str>,
+    xml: Option<&str>,
+    account: &str,
+    sid: Option<&str>,
+) -> TaskFinding {
+    let Some(name) = name else {
+        return TaskFinding::Missing;
+    };
+    let own_name = !account.is_empty()
+        && sid.is_some_and(|sid| {
+            name.eq_ignore_ascii_case(&crystalline_service::daemon_task::user_task_name(
+                account_parts(account).1,
+                sid,
+            ))
+        });
+    if own_name {
+        return TaskFinding::Ready(name.to_string());
+    }
+    // No definition, or one with no principal doctor can read: doctor
+    // cannot tell, so it says nothing, as it does for the command.
+    let Some(xml) = xml else {
+        return TaskFinding::Ready(name.to_string());
+    };
+    let principals = principals_block(xml);
+    let groups = element_texts(principals, "GroupId");
+    let users = element_texts(principals, "UserId");
+    let unreadable = groups.is_empty() && users.is_empty();
+    let for_me = (!account.is_empty() && users.iter().any(|user| same_account(user, account)))
+        || sid.is_some_and(|sid| users.iter().any(|user| user.eq_ignore_ascii_case(sid)));
+    if unreadable || !groups.is_empty() || for_me {
+        TaskFinding::Ready(name.to_string())
+    } else {
+        TaskFinding::ForOthers(name.to_string())
+    }
+}
+
+/// The program a task definition starts: the text of its `<Command>`,
+/// without the quotes around it and with the XML escapes undone. `None`
+/// when the definition names none.
+pub(crate) fn task_command(xml: &str) -> Option<std::path::PathBuf> {
+    let text = element_texts(xml, "Command").into_iter().next()?;
+    let text = text
+        .replace("&quot;", "\"")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&");
+    let path = text.trim().trim_matches('"').trim();
+    (!path.is_empty()).then(|| std::path::PathBuf::from(path))
+}
+
+/// The daemon task as doctor found it and what `--fix` did about it.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct TaskDoctor {
+    pub finding: Option<TaskFinding>,
+    /// The program a task that runs for this user starts, when that file is
+    /// gone (the task survived an uninstall, or the binary moved).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gone_command: Option<String>,
+    /// The task `--fix` registered for this user.
+    pub registered_now: Option<String>,
+    /// Why `--fix` could not register it.
+    pub error: Option<String>,
+    /// This user's task under the name 0.24.0 gave it, without the SID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_name: Option<String>,
+    /// The 0.24.0-named task `--fix` removed, after it registered the new
+    /// one or because the machine task is ready.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moved_old: Option<String>,
+    /// Why Task Scheduler would not remove the 0.24.0-named task: a fix that
+    /// did not finish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_refused: Option<String>,
+    /// Windows' words when Task Scheduler refused the query.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
+}
+
+impl TaskDoctor {
+    /// Whether the task still keeps Claude Desktop from starting the daemon.
+    fn is_problem(&self) -> bool {
+        let ready =
+            matches!(self.finding, Some(TaskFinding::Ready(_))) && self.gone_command.is_none();
+        (!ready && self.registered_now.is_none()) || self.old_refused.is_some()
+    }
+}
+
+/// What `--fix` may do about the task doctor found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TaskRepair {
+    /// The task runs for this user and starts a binary that is there.
+    Nothing,
+    /// Register this user's own task (again, with `/F`).
+    Register,
+    /// Only an administrator can help: the machine task is found first by
+    /// every bridge, so a per-user task beside it would never run.
+    Administrator,
+}
+
+/// What `--fix` does, from the task doctor found, its repair and this
+/// user's 0.24.0-named task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TaskFix {
+    Nothing,
+    /// Register this user's task under the name with the SID, then remove
+    /// the 0.24.0-named one if there is one.
+    Register,
+    /// Only remove the 0.24.0-named task: the machine task, which every
+    /// bridge finds first, or this user's own task with the SID is ready.
+    RemoveOld,
+}
+
+/// What `--fix` does about `task` with `repair`. An old-named task beside a
+/// ready machine task, or beside this user's own ready task under the name
+/// with the SID, is redundant, so it is removed and nothing is registered;
+/// when the old-named task is itself the ready one it is moved to the new
+/// name.
+/// A refused query is repaired as a missing task: register this user's
+/// own, which also moves an old-named one.
+pub(crate) fn task_fix(task: &TaskDoctor, repair: TaskRepair) -> TaskFix {
+    match repair {
+        _ if matches!(task.finding, Some(TaskFinding::Refused(_))) => TaskFix::Register,
+        TaskRepair::Register => TaskFix::Register,
+        TaskRepair::Administrator => TaskFix::Nothing,
+        TaskRepair::Nothing if task.old_name.is_none() => TaskFix::Nothing,
+        TaskRepair::Nothing => match &task.finding {
+            Some(TaskFinding::Ready(name)) if is_machine_task(name) => TaskFix::RemoveOld,
+            // This user's own task under the name with the SID is ready, so
+            // the 0.24.0-named one is a leftover (Task Scheduler refused its
+            // delete before): removing it needs no MSI binary.
+            Some(TaskFinding::Ready(name))
+                if task
+                    .old_name
+                    .as_deref()
+                    .is_some_and(|old| !old.eq_ignore_ascii_case(name)) =>
+            {
+                TaskFix::RemoveOld
+            }
+            _ => TaskFix::Register,
+        },
+    }
+}
+
+/// The report for a task query Task Scheduler refused, and what `--fix`
+/// may do about it: what it does for a missing task. The not-found words
+/// are in the system's default language and `schtasks` speaks the user's
+/// display language, so where the two differ a missing task reads as
+/// refused.
+pub(crate) fn refused_task(
+    refused: crystalline_service::daemon_task::Refused,
+) -> (TaskDoctor, TaskRepair) {
+    (
+        TaskDoctor {
+            finding: Some(TaskFinding::Refused(refused.task)),
+            refused: Some(refused.detail),
+            ..TaskDoctor::default()
+        },
+        TaskRepair::Register,
+    )
+}
+
+fn is_machine_task(name: &str) -> bool {
+    name.eq_ignore_ascii_case(crystalline_service::daemon_task::MACHINE_TASK_NAME)
+}
+
+/// The task found under `name` (with its definition `xml`, when it could be
+/// read) for `account`, and what `--fix` may do about it. `exists` says
+/// whether the program the task starts is there. Arguments and trigger are
+/// not checked, and a definition that names no program is taken as fine.
+pub(crate) fn assess_task(
+    name: Option<&str>,
+    xml: Option<&str>,
+    account: &str,
+    sid: Option<&str>,
+    exists: impl Fn(&Path) -> bool,
+) -> (TaskDoctor, TaskRepair) {
+    let finding = task_finding(name, xml, account, sid);
+    let gone_command = match finding {
+        TaskFinding::Ready(_) => xml
+            .and_then(task_command)
+            .filter(|command| !exists(command))
+            .map(|command| command.display().to_string()),
+        _ => None,
+    };
+    let repair = match (&finding, &gone_command) {
+        (TaskFinding::Missing, _) => TaskRepair::Register,
+        (TaskFinding::Ready(_), None) => TaskRepair::Nothing,
+        (TaskFinding::Ready(name) | TaskFinding::ForOthers(name), _) if is_machine_task(name) => {
+            TaskRepair::Administrator
+        }
+        _ => TaskRepair::Register,
+    };
+    let task = TaskDoctor {
+        finding: Some(finding),
+        gone_command,
+        ..TaskDoctor::default()
+    };
+    (task, repair)
+}
+
+/// Whether the task concerns this machine at all: the binary is the one the
+/// MSI installed (under `Program Files\Crystalline\bin`), or Claude Desktop
+/// is installed (a `Packages\Claude_*` folder under `LOCALAPPDATA`). A
+/// Windows user who took the zip or `cargo install` and has no Claude Desktop
+/// needs no task, and a test binary under `target\` must never register one.
+pub(crate) fn task_concerns_this_machine(
+    exe: &Path,
+    program_files: &[std::path::PathBuf],
+    claude_desktop_installed: bool,
+) -> bool {
+    let installed = program_files
+        .iter()
+        .any(|root| exe.starts_with(root.join("Crystalline").join("bin")));
+    installed || claude_desktop_installed
+}
+
+fn claude_desktop_installed() -> bool {
+    std::env::var_os("LOCALAPPDATA")
+        .map(|local| std::path::PathBuf::from(local).join("Packages"))
+        .and_then(|packages| std::fs::read_dir(packages).ok())
+        .is_some_and(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .any(|e| e.file_name().to_string_lossy().starts_with("Claude_"))
+        })
+}
+
+/// Why `--fix` registers no task for this binary: it registers only for the
+/// binary in the MSI's default folder.
+const NOT_THE_MSI_BINARY: &str = r"this crystalline is not in Program Files\Crystalline\bin, so --fix registers no task for it. Install the MSI";
+
+/// Windows only: the task, and with `fix` a task for this user when none
+/// runs for them or theirs starts a binary that is gone. `--fix` registers
+/// only for the binary the MSI installed, so the task never points at a
+/// copy that may move or go, and never beside a machine task, which every
+/// bridge finds first. This user's task under the 0.24.0 name is removed
+/// when the machine task is ready, and otherwise moved to the name with the
+/// SID ([`task_fix`]).
+fn check_task(fix: bool) -> Option<TaskDoctor> {
+    use crystalline_service::daemon_task;
+    if !cfg!(windows) {
+        return None;
+    }
+    let exe = std::env::current_exe().ok()?;
+    let program_files: Vec<std::path::PathBuf> = ["ProgramFiles", "ProgramFiles(x86)"]
+        .iter()
+        .filter_map(std::env::var_os)
+        .map(std::path::PathBuf::from)
+        .collect();
+    if !task_concerns_this_machine(&exe, &program_files, claude_desktop_installed()) {
+        return None;
+    }
+    let installed = task_concerns_this_machine(&exe, &program_files, false);
+    // The runner every bridge uses, so a debug build's test seam
+    // (`CRYSTALLINE_TEST_DAEMON_TASK`) stands in for Task Scheduler here too.
+    let tasks = daemon_task::for_this_process();
+    let me = daemon_task::ThisUser::here();
+    let found = tasks.find();
+    let name = found.clone().ok().flatten();
+    let xml = name.as_deref().and_then(|name| tasks.definition(name));
+    let (mut report, repair) = match found {
+        Err(refused) => refused_task(refused),
+        Ok(_) => assess_task(
+            name.as_deref(),
+            xml.as_deref(),
+            &me.account,
+            me.sid.as_deref(),
+            Path::is_file,
+        ),
+    };
+    report.old_name = tasks.legacy();
+    if !fix {
+        return Some(report);
+    }
+    let what = task_fix(&report, repair);
+    apply_task_fix(
+        &mut report,
+        what,
+        installed,
+        // The real schtasks, past the DaemonTask seam: no seam stands for a delete.
+        daemon_task::remove_legacy_for_this_user,
+        || daemon_task::register_for_this_user(&exe),
+    );
+    Some(report)
+}
+
+/// Carry out `fix` on `report`: `remove_old` only removes this user's
+/// 0.24.0-named task, `register` registers this user's own and then moves
+/// the old one. `installed` is whether this binary is the one the MSI
+/// installed; `--fix` registers only for that one. Split from
+/// [`check_task`], which runs only on Windows, so the wiring is tested on
+/// every platform.
+pub(crate) fn apply_task_fix(
+    report: &mut TaskDoctor,
+    fix: TaskFix,
+    installed: bool,
+    remove_old: impl FnOnce() -> crystalline_service::daemon_task::Moved,
+    register: impl FnOnce() -> Result<(String, crystalline_service::daemon_task::Moved), String>,
+) {
+    use crystalline_service::daemon_task::Moved;
+    let moved = match fix {
+        TaskFix::Nothing => Moved::Nothing,
+        TaskFix::RemoveOld => remove_old(),
+        TaskFix::Register if !installed => {
+            report.error = Some(NOT_THE_MSI_BINARY.to_string());
+            Moved::Nothing
+        }
+        // The new name is registered first, the old one removed after.
+        TaskFix::Register => match register() {
+            Ok((name, moved)) => {
+                report.registered_now = Some(name);
+                moved
+            }
+            Err(e) => {
+                report.error = Some(e);
+                Moved::Nothing
+            }
+        },
+    };
+    match moved {
+        Moved::Nothing => {}
+        Moved::Removed(old) => report.moved_old = Some(old),
+        Moved::Refused { task, why } => {
+            report.old_name = Some(task);
+            report.old_refused = Some(why);
+        }
+    }
+}
+
+/// Lock folders hf-hub left in the model cache for a model that is not cached
+/// any more (see [`crystalline_index::stale_model_lock_dirs`]). Never a
+/// problem: `remaining_problems` does not count it, as for stale weights.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ModelLocksDoctor {
+    /// The repository ids whose lock folder is left behind, sorted.
+    pub stale: Vec<String>,
+    /// The ones `--fix` removed.
+    pub removed: Vec<String>,
+}
+
 /// The full `doctor` report.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DoctorReport {
@@ -906,6 +1350,11 @@ pub struct DoctorReport {
     /// (plan correction 15: doctor never reads the index for this). Never a
     /// problem: `remaining_problems` is unchanged by it.
     pub contradictions: Option<serde_json::Value>,
+    /// Lock folders in the model cache whose model is gone. `None` when there
+    /// are none. Read from the filesystem alone, so it is there whatever route
+    /// the index took.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_locks: Option<ModelLocksDoctor>,
     /// The device the local embedding model runs on: the running daemon's
     /// own answer when one served this run and has the model loaded (so a
     /// load-time or runtime fallback to the CPU shows with its reason),
@@ -936,6 +1385,20 @@ pub struct DoctorReport {
     pub rename: Option<RenameDoctor>,
     /// Whether this report was produced with `--fix`.
     pub fix: bool,
+    /// Every connected server; empty when none.
+    pub sources: Vec<SourceDoctor>,
+    /// The Windows daemon task. `None` off Windows, and on a Windows machine
+    /// the task does not concern (see `task_concerns_this_machine`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_task: Option<TaskDoctor>,
+    /// Private state folders an old Claude Desktop extension left. After a
+    /// merge, the ones still there.
+    pub desktop_states: Vec<crate::desktop_state::DesktopState>,
+    /// What `--merge-desktop-state` did. `None` without that flag.
+    pub merge: Option<crate::desktop_state::MergeReport>,
+    /// Why `--merge-desktop-state` stopped, such as a daemon from the
+    /// private folder that still runs.
+    pub merge_error: Option<String>,
 }
 
 /// A rename journal waiting in the state directory: a domain rename an
@@ -1110,6 +1573,26 @@ impl DoctorReport {
         // answer, and drift, edited and orphaned rows all self-heal at the
         // next `crystalline provision` (edited rows are left alone by
         // design, never "fixed").
+        // A connected server that does not answer, or whose sign-in no
+        // longer works, is one problem each: its domains are unavailable
+        // until it answers again.
+        n += self.sources.iter().filter(|s| s.problem.is_some()).count();
+        // A task that does not run for this user leaves Claude Desktop with no
+        // way to start the daemon, until `--fix` registers one.
+        if let Some(task) = &self.daemon_task
+            && task.is_problem()
+        {
+            n += 1;
+        }
+        // Each private state is knowledge that is not where this machine
+        // reads it, until the merge.
+        n += self.desktop_states.len();
+        // A name the two sides mean differently waits for the person.
+        n += self
+            .merge
+            .as_ref()
+            .map_or(0, |m| m.conflicts.len() + m.not_moved.len());
+        n += usize::from(self.merge_error.is_some());
         n
     }
 }
@@ -1119,22 +1602,76 @@ pub async fn run(
     domain_filter: Option<&str>,
     fix: bool,
     discard_rename: bool,
+    merge_desktop_state: bool,
     config_override: Option<&Path>,
     db_override: Option<&Path>,
 ) -> Result<DoctorReport> {
-    // The single load chokepoint: the effective config drives every target and
-    // the db factory. The whole `LoadedConfig` stays in scope so a later
-    // milestone can surface the environment overlay in the report.
-    let loaded = cmd::load(config_override)?;
-    let cfg = &loaded.effective;
-    let targets = select_domains(cfg, domain_filter)?;
+    if merge_desktop_state {
+        if crystalline_service::runs_in::PackageContext::here().is_packaged() {
+            anyhow::bail!(
+                "--merge-desktop-state runs only outside Claude Desktop: run it in a terminal, with Claude Desktop closed"
+            );
+        }
+        if db_override.is_some() {
+            anyhow::bail!(
+                "--merge-desktop-state merges into this machine's own index: leave out --db"
+            );
+        }
+        if domain_filter.is_some() {
+            anyhow::bail!(
+                "--merge-desktop-state merges every domain of Claude Desktop's state: leave out --domain"
+            );
+        }
+    }
+    // A domain filter nobody registers fails before anything is fixed.
+    let early = cmd::load(config_override)?;
+    select_domains(&early.effective, domain_filter)?;
     let db = cmd::db_path(db_override)?;
+    // What this shell would have started, compared with the daemon's own
+    // facts. Only without an override: a --config or --db names files, not
+    // a variable, so no line would explain a difference.
+    let client = (config_override.is_none() && db_override.is_none()).then(|| {
+        crystalline_service::shaping::ClientView::of(
+            &early,
+            crystalline_service::shaping::shaping_set_here(),
+        )
+    });
 
     // Ahead of the store, deliberately. A wedged daemon holds the index
     // database as well as the service lock, so opening the store first would
     // fail with a locking error before `--fix` ever got the chance to dislodge
     // the process causing it - the one state where doctor matters most.
-    let service = check_service(fix).await?;
+    let service = check_service(fix, client.as_ref()).await?;
+
+    // The merge comes next, for the reason the collection below gives: the
+    // import opens the real index itself (or asks the daemon), so doctor must
+    // not hold its own handle yet. Running first also lets every later check
+    // see the merged domains.
+    let mut desktop_states = crate::desktop_state::scan_here();
+    let mut merge = None;
+    let mut merge_error = None;
+    if merge_desktop_state {
+        let today = chrono::Local::now().date_naive();
+        let mut merged = crate::desktop_state::MergeReport::default();
+        for state in &desktop_states {
+            if let Err(e) =
+                crate::desktop_state::merge_into(state, config_override, today, &mut merged).await
+            {
+                merge_error = Some(format!("{e:#}"));
+                break;
+            }
+        }
+        merge = Some(merged);
+        desktop_states = crate::desktop_state::scan_here();
+    }
+
+    // The single load chokepoint, after the merge so it sees what the merge
+    // registered: the effective config drives every target and the db
+    // factory. The whole `LoadedConfig` stays in scope so a later milestone
+    // can surface the environment overlay in the report.
+    let loaded = cmd::load(config_override)?;
+    let cfg = &loaded.effective;
+    let targets = select_domains(cfg, domain_filter)?;
 
     // Ahead of doctor's own store, and deliberately: the collection needs the
     // index too, and it asks the daemon first or opens the file itself. Doing
@@ -1293,6 +1830,8 @@ pub async fn run(
         probed_device.filter(|_| contradictions_on),
     ));
 
+    let model_locks = check_model_locks(fix, cfg.read_only());
+
     let harnesses = check_harnesses();
 
     let provisioning = check_provisioning(cfg, &loaded.overlay, &targets)?;
@@ -1300,6 +1839,16 @@ pub async fn run(
     let tags = check_tags(store_ref, cfg).await?;
 
     let rename = check_rename_journal(discard_rename);
+
+    // An override names an exact config and index, so doctor checks this
+    // machine's own state alone, as status does.
+    let sources = if config_override.is_none() && db_override.is_none() {
+        check_sources(cfg).await
+    } else {
+        Vec::new()
+    };
+
+    let daemon_task = check_task(fix);
 
     Ok(DoctorReport {
         index,
@@ -1309,6 +1858,7 @@ pub async fn run(
         github,
         embeddings,
         contradictions,
+        model_locks,
         embedding_device,
         harnesses,
         provisioning,
@@ -1317,6 +1867,11 @@ pub async fn run(
         names,
         rename,
         fix,
+        sources,
+        daemon_task,
+        desktop_states,
+        merge,
+        merge_error,
     })
 }
 
@@ -1878,6 +2433,15 @@ async fn check_domain_checks(
     let path = cmd::resolve_domain_path(entry).unwrap_or_default();
     let path_exists = path.is_dir();
     let manifest_present = path_exists && path.join("MANIFEST.md").is_file();
+    // Why `--fix` leaves this domain's files alone, if it does: the instance
+    // is read-only, or the domain is. `None` lets `--fix` repair.
+    let refusal: Option<String> = if read_only {
+        Some(READ_ONLY_NOTE.to_string())
+    } else if path_exists && crystalline_core::read_only_at(&path).is_on() {
+        Some(crystalline_service::engine::read_only_sentence(name))
+    } else {
+        None
+    };
 
     let mut d = DomainDoctor {
         name: name.to_string(),
@@ -1951,9 +2515,12 @@ async fn check_domain_checks(
             .and_then(|dir| read_base_file(dir, &rel).ok().flatten())
             .and_then(|bytes| String::from_utf8(bytes).ok());
         let mut plan = plan_duplicate_fix(&source, base.as_deref(), entry.is_overlay());
-        // A read-only instance never writes a domain file, doctor included.
-        if read_only && plan.is_ok() {
-            plan = Err(READ_ONLY_NOTE.to_string());
+        // A read-only instance or domain never has a file written, doctor
+        // included.
+        if let Some(note) = &refusal
+            && plan.is_ok()
+        {
+            plan = Err(note.clone());
         }
         let mut report = DuplicateKeyFile {
             path: rel,
@@ -1975,7 +2542,7 @@ async fn check_domain_checks(
     // included: a fix is an ordinary local change the next share carries.
     let mut stray_files: HashSet<String> = HashSet::new();
     for pair in stray_pairs(&path) {
-        let report = settle_stray(&path, &pair, entry.is_overlay(), read_only, fix);
+        let report = settle_stray(&path, &pair, entry.is_overlay(), refusal.as_deref(), fix);
         // Only a pair still on disk is its own finding. After a fix the
         // engram's file may not be indexed yet (the copy was the indexed
         // one), and then `unindexed` says so and sends the person to sync.
@@ -2065,10 +2632,29 @@ async fn check_domain_checks(
         // Only the direct route can delete. Over a daemon the orphans are
         // still reported, with the render saying plainly what removing them
         // takes, rather than being silently left in place.
-        if let (true, Some(store), Some(domain_id)) = (fix, store, domain_id) {
-            for p in &orphans {
-                store.delete_engram(domain_id, p).await?;
-                d.orphans_removed += 1;
+        if let (true, Some(store), Some(domain_id)) = (fix, store, domain_id)
+            && !orphans.is_empty()
+        {
+            // One transaction for the whole removal: each row, its children
+            // and the unbinding of every reference that named it land
+            // together or not at all.
+            store.begin().await?;
+            let removed = async {
+                for p in &orphans {
+                    store.delete_engram(domain_id, p).await?;
+                }
+                Ok::<usize, crystalline_index::IndexError>(orphans.len())
+            }
+            .await;
+            match removed {
+                Ok(n) => {
+                    store.commit().await?;
+                    d.orphans_removed += n;
+                }
+                Err(e) => {
+                    let _ = store.rollback().await;
+                    return Err(e.into());
+                }
             }
         }
         d.orphans = orphans;
@@ -2269,13 +2855,13 @@ fn written_at(file: &StrayFile) -> Option<chrono::DateTime<chrono::Utc>> {
 
 /// What doctor reports about one stray pair, and what `--fix` did about it,
 /// in the order the spec rules: a reviewing domain and a read-only instance
-/// are left, an identical copy is deleted, a newer copy's text moves into the
+/// or domain are left, an identical copy is deleted, a newer copy's text moves into the
 /// original and the copy goes, and a copy the original changed after is left.
 fn settle_stray(
     root: &Path,
     pair: &StrayPair,
     reviewing: bool,
-    read_only: bool,
+    refusal: Option<&str>,
     fix: bool,
 ) -> StrayCopy {
     let stray_abs = root.join(&pair.stray.rel);
@@ -2317,8 +2903,8 @@ fn settle_stray(
         report.note = Some(REVIEWED_NOTE.to_string());
         return report;
     }
-    if read_only {
-        report.note = Some(READ_ONLY_NOTE.to_string());
+    if let Some(note) = refusal {
+        report.note = Some(note.to_string());
         return report;
     }
     report.fixable = same_text || newer;
@@ -2466,7 +3052,10 @@ fn stale_lock_holder_desc(pid: Option<u32>) -> String {
     }
 }
 
-async fn check_service(fix: bool) -> Result<ServiceDoctor> {
+async fn check_service(
+    fix: bool,
+    client: Option<&crystalline_service::shaping::ClientView>,
+) -> Result<ServiceDoctor> {
     // The record's primary home is `service.json`; a still-present pre-split
     // daemon's record sitting in the lock file itself counts as present too
     // (see `instance::read_lock_info`'s legacy fallback), so an upgraded
@@ -2512,13 +3101,22 @@ async fn check_service(fix: bool) -> Result<ServiceDoctor> {
         }
         _ => None,
     };
-    // Read from the record, not asked over the socket: a daemon's working
-    // directory, job and package identity do not change while it runs, and a
-    // wedged daemon still has a record to read.
-    let runs_in = if alive {
-        info.as_ref().and_then(|i| i.runs_in.clone())
-    } else {
-        None
+    // Asked over the pipe whatever the record says, since a record can be
+    // stale or private: a daemon that answers there is the one to describe.
+    // When nothing listens, a live record still describes a daemon that has
+    // lost its pipe, and its working directory, job and package identity do
+    // not change while it runs.
+    let facts = instance::ask_holder().await;
+    let config_mismatch = match (&facts, client) {
+        (Some(facts), Some(client)) => {
+            crystalline_service::shaping::config_mismatches(facts, client)
+        }
+        _ => Vec::new(),
+    };
+    let runs_in = match facts {
+        Some(facts) => facts.runs_in,
+        None if alive => info.as_ref().and_then(|i| i.runs_in.clone()),
+        None => None,
     };
 
     let mut s = ServiceDoctor {
@@ -2533,6 +3131,7 @@ async fn check_service(fix: bool) -> Result<ServiceDoctor> {
         daemon_dislodged: false,
         holder_unknown,
         runs_in,
+        config_mismatch,
     };
 
     if fix {
@@ -2549,31 +3148,55 @@ async fn check_service(fix: bool) -> Result<ServiceDoctor> {
                 Err(e) => s.holder_unknown = Some(e.to_string()),
             }
         }
-        // Re-probed right before the delete, not trusted from the diagnosis
-        // above: `diagnose_holder`'s socket probe alone can take up to
-        // `HOLDER_PROBE_TIMEOUT`, and a daemon starting up in that window
-        // would take the lock after this run decided it was free but before
-        // it acted on that verdict - the exact "delete a lock a starting
-        // daemon holds" shape the 2026-09-23 incident's doctor produced. A
-        // lock that is held now is reported as recovered rather than
-        // removed, the same treatment `daemon_unresponsive`'s `NotNeeded`
-        // case gets above.
-        if s.lock_stale && !instance::service_lock_is_free() {
-            s.lock_stale = false;
-        }
-        if s.lock_stale {
-            let info_removed = std::fs::remove_file(&info_path).is_ok();
-            let legacy_removed = std::fs::remove_file(&legacy_path).is_ok();
-            s.lock_removed = info_removed || legacy_removed;
-        }
-        if s.socket_orphaned && !instance::service_lock_is_free() {
-            s.socket_orphaned = false;
-        }
-        if s.socket_orphaned {
-            s.socket_removed = std::fs::remove_file(&sock_path).is_ok();
+        // One hold of the service lock across every removal below, not a
+        // probe before each: the diagnosis above can take up to
+        // `HOLDER_PROBE_TIMEOUT`, and a daemon that started in that window,
+        // or starts while this deletes, would otherwise have its fresh record
+        // and its lock file deleted under it (the 2026-09-23 incident's
+        // shape). Held, a starting daemon waits in its own retry loop. A lock
+        // that is held now is reported as recovered rather than removed, the
+        // same treatment `daemon_unresponsive`'s `NotNeeded` case gets above.
+        if s.lock_stale || s.socket_orphaned {
+            remove_stale_service_files(
+                &mut s,
+                instance::hold_service_lock(),
+                &info_path,
+                &sock_path,
+            );
         }
     }
     Ok(s)
+}
+
+/// The removals `--fix` makes for a stale lock and an orphaned socket,
+/// under `hold`, the service lock taken without waiting. `None` means
+/// something took the lock after the diagnosis, a daemon that started
+/// meanwhile: nothing is removed, and both findings read as recovered.
+fn remove_stale_service_files(
+    s: &mut ServiceDoctor,
+    hold: Option<instance::ServiceLockHold>,
+    info_path: &Path,
+    sock_path: &Path,
+) {
+    match hold {
+        Some(hold) => {
+            let info_removed = s.lock_stale && std::fs::remove_file(info_path).is_ok();
+            if s.socket_orphaned {
+                s.socket_removed = std::fs::remove_file(sock_path).is_ok();
+            }
+            // Last, while still held. A free service.lock with no daemon is
+            // itself a leftover, and when only the socket was the finding,
+            // the hold created this file.
+            let lock_file_removed = hold.release_removing_file();
+            if s.lock_stale {
+                s.lock_removed = info_removed || lock_file_removed;
+            }
+        }
+        None => {
+            s.lock_stale = false;
+            s.socket_orphaned = false;
+        }
+    }
 }
 
 /// Which `CRYSTALLINE_*` environment variables are active, straight off the
@@ -3303,6 +3926,25 @@ fn live_device(block: Option<&serde_json::Value>, probed: Option<String>) -> Opt
         .or(probed)
 }
 
+/// The model cache's stale lock folders, removed with `fix` unless the
+/// instance is read-only. `None` when the cache has none or cannot be named.
+fn check_model_locks(fix: bool, read_only: bool) -> Option<ModelLocksDoctor> {
+    let dir = config::models_dir().ok()?;
+    let stale: Vec<String> = crystalline_index::stale_model_lock_dirs(&dir)
+        .into_iter()
+        .map(|(repo, _)| repo)
+        .collect();
+    if stale.is_empty() {
+        return None;
+    }
+    let removed = if fix && !read_only {
+        crystalline_index::remove_stale_model_lock_dirs(&dir)
+    } else {
+        Vec::new()
+    };
+    Some(ModelLocksDoctor { stale, removed })
+}
+
 /// The contradictions row: the profile and its model from config, whether the
 /// model's weights are in the cache (filesystem only, no index read - plan
 /// correction 15, so this runs the same under a running daemon as without
@@ -3544,6 +4186,115 @@ fn is_profile_harness(name: &str) -> bool {
     HarnessKind::from_id(name).is_some_and(|k| !k.profile().is_legacy())
 }
 
+/// What `--merge-desktop-state` did, under `claude desktop:`.
+/// "1 engram" or "N engrams", for the merge lines.
+fn engrams(count: u64) -> String {
+    if count == 1 {
+        "1 engram".to_string()
+    } else {
+        format!("{count} engrams")
+    }
+}
+
+fn render_merge(out: &mut String, merge: &crate::desktop_state::MergeReport) {
+    use std::fmt::Write as _;
+    if merge.folders.is_empty() {
+        let _ = writeln!(out, "  no private Claude Desktop state to merge");
+        return;
+    }
+    for name in &merge.registered {
+        let _ = writeln!(out, "  registered {name} from Claude Desktop's state");
+    }
+    for key in &merge.github_carried {
+        // The API address is shown, never another value: it is not a
+        // secret, and it names the GitHub the token will be sent to.
+        let value = match merge.github_api_url.as_deref() {
+            Some(url) if key == "github.api_url" => format!(" ({url})"),
+            _ => String::new(),
+        };
+        let _ = writeln!(
+            out,
+            "  carried the setting {key}{value} from Claude Desktop's state"
+        );
+    }
+    for name in &merge.already_registered {
+        let _ = writeln!(
+            out,
+            "  {name} is already registered here the same way: left as it is"
+        );
+    }
+    for line in &merge.kept_this_machine {
+        let _ = writeln!(out, "  {line}");
+    }
+    for (name, count) in &merge.imported {
+        let _ = writeln!(
+            out,
+            "  moved {} of the virtual domain {name}",
+            engrams(*count)
+        );
+    }
+    for (name, count) in &merge.kept_both {
+        let _ = writeln!(
+            out,
+            "  {name} exists on both sides: kept this machine's copy of {}",
+            engrams(*count)
+        );
+    }
+    for conflict in &merge.conflicts {
+        let _ = writeln!(out, "  [problem] {conflict}");
+    }
+    for line in &merge.not_moved {
+        let _ = writeln!(out, "  [problem] {line}");
+    }
+    const TURN_ON: &str = "crystalline config set github.enabled true";
+    for name in &merge.origins_copied {
+        if merge.github_enabled {
+            let _ = writeln!(
+                out,
+                "  copied the team state of {name} from Claude Desktop's state, so it updates and shares as before"
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "  copied the team state of {name} from Claude Desktop's state. Team domains are turned off here: run {TURN_ON} to update and share it"
+            );
+        }
+    }
+    if !merge.private_kept.is_empty() {
+        let place = if merge.renamed_to.is_some() {
+            "the renamed folder"
+        } else {
+            "Claude Desktop's private folder"
+        };
+        let _ = writeln!(
+            out,
+            "  kept this machine's {} as they are; the private copies stay in {place}",
+            merge.private_kept.join(", ")
+        );
+        if merge.private_kept.iter().any(|k| k == "origins") {
+            let first = if merge.github_enabled {
+                String::new()
+            } else {
+                format!("run {TURN_ON}, then ")
+            };
+            let _ = writeln!(
+                out,
+                "  team edits you did not share yet are still in the domain's folder: {first}share them with crystalline origin share, and get new team changes with crystalline origin update"
+            );
+        }
+    }
+    if let Some(to) = &merge.renamed_to {
+        let _ = writeln!(
+            out,
+            "  renamed the private folder to {} (nothing was deleted)",
+            to.display()
+        );
+    }
+    if !merge.changed_something() {
+        let _ = writeln!(out, "  the merge changed nothing");
+    }
+}
+
 /// Render a report for a human.
 pub fn render_human(report: &DoctorReport) -> String {
     use std::fmt::Write as _;
@@ -3613,7 +4364,11 @@ pub fn render_human(report: &DoctorReport) -> String {
         if d.is_virtual {
             match d.engrams {
                 Some(n) => {
-                    let _ = writeln!(out, "  ok (virtual, {n} engram(s) in the database)");
+                    let _ = writeln!(
+                        out,
+                        "  ok (virtual, {} in the database)",
+                        plural(usize::try_from(n).unwrap_or(0), "engram", "engrams")
+                    );
                 }
                 // A virtual domain lives entirely in the index, so with no
                 // route to it there is nothing to count and nothing to
@@ -3654,8 +4409,8 @@ pub fn render_human(report: &DoctorReport) -> String {
             if d.orphans_removed > 0 {
                 let _ = writeln!(
                     out,
-                    "  removed {} orphan row(s): {}",
-                    d.orphans_removed,
+                    "  removed {}: {}",
+                    plural(d.orphans_removed, "orphan row", "orphan rows"),
                     d.orphans.join(", ")
                 );
             } else if report.index == IndexAccess::Daemon {
@@ -3665,15 +4420,20 @@ pub fn render_human(report: &DoctorReport) -> String {
                 // nothing.
                 let _ = writeln!(
                     out,
-                    "  [problem] {} orphan row(s) (file missing on disk): {}. The running daemon owns the index, so removing them needs it stopped: run `crystalline ctl shutdown`, then `crystalline doctor --fix`",
-                    d.orphans.len(),
-                    d.orphans.join(", ")
+                    "  [problem] {} (file missing on disk): {}. The running daemon owns the index, so removing {} needs it stopped: run `crystalline ctl shutdown`, then `crystalline doctor --fix`",
+                    plural(d.orphans.len(), "orphan row", "orphan rows"),
+                    d.orphans.join(", "),
+                    if d.orphans.len() == 1 {
+                        "the row"
+                    } else {
+                        "them"
+                    }
                 );
             } else {
                 let _ = writeln!(
                     out,
-                    "  [problem] {} orphan row(s) (file missing on disk), rerun with --fix to remove: {}",
-                    d.orphans.len(),
+                    "  [problem] {} (file missing on disk), rerun with --fix to remove: {}",
+                    plural(d.orphans.len(), "orphan row", "orphan rows"),
                     d.orphans.join(", ")
                 );
             }
@@ -3681,8 +4441,8 @@ pub fn render_human(report: &DoctorReport) -> String {
         if !d.unindexed.is_empty() {
             let _ = writeln!(
                 out,
-                "  [problem] {} file(s) not indexed yet, run: crystalline sync --domain {}",
-                d.unindexed.len(),
+                "  [problem] {} not indexed yet, run: crystalline sync --domain {}",
+                plural(d.unindexed.len(), "file", "files"),
                 d.name
             );
             for p in &d.unindexed {
@@ -3692,8 +4452,8 @@ pub fn render_human(report: &DoctorReport) -> String {
         if !d.unsyncable.is_empty() {
             let _ = writeln!(
                 out,
-                "  [problem] {} file(s) cannot be indexed until the frontmatter is fixed (verify rule E001):",
-                d.unsyncable.len()
+                "  [problem] {} cannot be indexed until the frontmatter is fixed (verify rule E001):",
+                plural(d.unsyncable.len(), "file", "files")
             );
             for f in &d.unsyncable {
                 let _ = writeln!(out, "    {}: {}", f.path, f.message);
@@ -3702,8 +4462,8 @@ pub fn render_human(report: &DoctorReport) -> String {
         if !d.encoding_issues.is_empty() {
             let _ = writeln!(
                 out,
-                "  [problem] {} encoding issue(s), see verify rule E006:",
-                d.encoding_issues.len()
+                "  [problem] {}, see verify rule E006:",
+                plural(d.encoding_issues.len(), "encoding issue", "encoding issues")
             );
             for e in &d.encoding_issues {
                 let _ = writeln!(out, "    {}: {}", e.path, e.message);
@@ -3901,6 +4661,7 @@ pub fn render_human(report: &DoctorReport) -> String {
         && !s.daemon_unresponsive
         && s.holder_unknown.is_none()
         && warnings.is_empty()
+        && s.config_mismatch.is_empty()
     {
         let _ = writeln!(out, "  ok");
     }
@@ -3913,8 +4674,140 @@ pub fn render_human(report: &DoctorReport) -> String {
     for warning in &warnings {
         let _ = writeln!(out, "  [warning] {warning}");
     }
+    for mismatch in &s.config_mismatch {
+        let _ = writeln!(out, "  [warning] {}", mismatch.line());
+    }
     if let Ok(log_path) = config::daemon_log_path() {
         let _ = writeln!(out, "  daemon log: {}", log_path.display());
+    }
+
+    if let Some(task) = &report.daemon_task {
+        let _ = writeln!(out, "daemon task:");
+        let fix_error = |out: &mut String| {
+            if let Some(error) = &task.error {
+                let _ = writeln!(out, "  --fix could not register it: {error}");
+            }
+        };
+        match (&task.finding, &task.gone_command, &task.registered_now) {
+            (Some(TaskFinding::Refused(name)), _, Some(new)) => {
+                let _ = writeln!(
+                    out,
+                    "  registered the task {new} for this user. Task Scheduler had refused to say whether the task {name} exists ({})",
+                    task.refused.as_deref().unwrap_or("no reason given")
+                );
+            }
+            (_, _, Some(name)) => {
+                let _ = writeln!(out, "  registered the task {name} for this user");
+            }
+            (Some(TaskFinding::Ready(name)), None, _) => {
+                let _ = writeln!(out, "  ok ({name})");
+            }
+            (Some(TaskFinding::Ready(name)), Some(command), _) if is_machine_task(name) => {
+                let _ = writeln!(
+                    out,
+                    "  [problem] the task {name} starts {command}, which is gone. Repair or reinstall Crystalline with the MSI, or ask an administrator to remove the task."
+                );
+            }
+            (Some(TaskFinding::Ready(name)), Some(command), _) => {
+                let _ = writeln!(
+                    out,
+                    "  [problem] the task {name} starts {command}, which is gone. Run crystalline doctor --fix to register it again."
+                );
+                fix_error(&mut out);
+            }
+            (Some(TaskFinding::ForOthers(name)), _, _) if is_machine_task(name) => {
+                let _ = writeln!(
+                    out,
+                    "  [problem] the task {name} does not run for this user. Ask an administrator to repair or remove it."
+                );
+            }
+            (Some(TaskFinding::ForOthers(name)), _, _) => {
+                let _ = writeln!(
+                    out,
+                    "  [problem] the task {name} does not run for this user, so Claude Desktop cannot start the daemon. Run crystalline doctor --fix to register one for you"
+                );
+                fix_error(&mut out);
+            }
+            (Some(TaskFinding::Refused(name)), _, _) => {
+                let _ = writeln!(
+                    out,
+                    "  [problem] Task Scheduler refused to say whether the task {name} exists ({}), so doctor cannot tell whether Claude Desktop can start the daemon. Ask an administrator to check the task.",
+                    task.refused.as_deref().unwrap_or("no reason given")
+                );
+                fix_error(&mut out);
+            }
+            (Some(TaskFinding::Missing) | None, _, _) => {
+                let _ = writeln!(
+                    out,
+                    "  [problem] the task {} is missing, so Claude Desktop cannot start the daemon. Run crystalline doctor --fix to register it for you, or install the newest MSI",
+                    crystalline_service::daemon_task::MACHINE_TASK_NAME
+                );
+                fix_error(&mut out);
+            }
+        }
+        if let Some(old) = &task.moved_old {
+            let _ = writeln!(
+                out,
+                "  removed the task {old}, which had the name from Crystalline 0.24.0"
+            );
+        } else if let (Some(old), Some(why)) = (&task.old_name, &task.old_refused) {
+            let _ = writeln!(
+                out,
+                "  [problem] --fix could not remove the task {old}, which has the name from Crystalline 0.24.0 ({why})"
+            );
+        } else if let Some(old) = &task.old_name {
+            // Beside another ready task --fix only removes it (task_fix).
+            let ready_other = match (&task.finding, &task.gone_command) {
+                (Some(TaskFinding::Ready(name)), None) if !name.eq_ignore_ascii_case(old) => {
+                    Some(name)
+                }
+                _ => None,
+            };
+            let _ = if let Some(ready) = ready_other {
+                writeln!(
+                    out,
+                    "  [warning] the task {old} has the name from Crystalline 0.24.0. The task {ready} starts the daemon for this user, so run crystalline doctor --fix to remove it"
+                )
+            } else {
+                writeln!(
+                    out,
+                    "  [warning] the task {old} has the name from Crystalline 0.24.0. Run crystalline doctor --fix to give it a name with this account's SID"
+                )
+            };
+            // The match above says --fix's error only for a problem.
+            if matches!(
+                (&task.finding, &task.gone_command, &task.registered_now),
+                (Some(TaskFinding::Ready(_)), None, None)
+            ) {
+                fix_error(&mut out);
+            }
+        }
+    }
+    if !report.desktop_states.is_empty() || report.merge.is_some() {
+        let _ = writeln!(out, "claude desktop:");
+        for state in &report.desktop_states {
+            let _ = writeln!(
+                out,
+                "  [problem] {}",
+                crate::desktop_state::describe_line(state)
+            );
+        }
+        // A merge stopped before its first folder has nothing to say but
+        // the reason it stopped.
+        if let Some(merge) = &report.merge
+            && (report.merge_error.is_none() || !merge.folders.is_empty())
+        {
+            render_merge(&mut out, merge);
+        }
+        if let Some(e) = &report.merge_error {
+            let _ = writeln!(out, "  [problem] {e}");
+        }
+        if report.merge.is_none() {
+            let _ = writeln!(
+                out,
+                "  quit Claude Desktop, then run crystalline doctor --fix --merge-desktop-state to merge it into this machine's state (the folder is renamed, never deleted)"
+            );
+        }
     }
 
     if let Some(e) = &report.environment {
@@ -3987,10 +4880,14 @@ pub fn render_human(report: &DoctorReport) -> String {
             } else if !o.base_mismatches.is_empty() {
                 let _ = writeln!(
                     out,
-                    "  [problem] {} ({}): {} base snapshot file(s) missing or modified: {}",
+                    "  [problem] {} ({}): {} missing or modified: {}",
                     o.name,
                     o.repo,
-                    o.base_mismatches.len(),
+                    plural(
+                        o.base_mismatches.len(),
+                        "base snapshot file",
+                        "base snapshot files"
+                    ),
                     o.base_mismatches.join(", ")
                 );
             } else {
@@ -4009,11 +4906,15 @@ pub fn render_human(report: &DoctorReport) -> String {
         };
         let _ = writeln!(
             out,
-            "embeddings: {}/{} chunks embedded with '{}'{named} ({} stale chunk(s) from a different model)",
+            "embeddings: {}/{} chunks embedded with '{}'{named} ({} from a different model)",
             e["embedded_with_configured_model"],
             e["total_chunks"],
             e["configured_model"].as_str().unwrap_or_default(),
-            e["stale_chunks"]
+            plural(
+                e["stale_chunks"].as_u64().unwrap_or(0) as usize,
+                "stale chunk",
+                "stale chunks"
+            )
         );
         if let Some(cached) = e["cached_models"].as_array().filter(|c| !c.is_empty()) {
             let listed: Vec<String> = cached
@@ -4163,12 +5064,28 @@ pub fn render_human(report: &DoctorReport) -> String {
             let names: Vec<&str> = stale.iter().filter_map(|v| v.as_str()).collect();
             let _ = writeln!(
                 out,
-                "  stale NLI checkpoint(s) no profile uses now, still on disk: {}",
+                "  {} no profile uses now, still on disk: {}",
+                plural(names.len(), "stale NLI checkpoint", "stale NLI checkpoints"),
                 names.join(", ")
             );
         }
     }
 
+    if let Some(locks) = &report.model_locks {
+        if locks.removed.is_empty() {
+            let _ = writeln!(
+                out,
+                "model cache: lock folders of models that are not cached any more: {} (crystalline doctor --fix removes them)",
+                locks.stale.join(", ")
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "model cache: removed the lock folders of models that are not cached any more: {}",
+                locks.removed.join(", ")
+            );
+        }
+    }
     if let Some(harnesses) = &report.harnesses {
         let _ = writeln!(out, "harnesses:");
         for h in harnesses {
@@ -4292,10 +5209,10 @@ pub fn render_human(report: &DoctorReport) -> String {
             }
             let _ = writeln!(
                 out,
-                "  {}: {} file(s) installed, {} mcp(s) installed, {} drifted, {} edited, {} orphaned, {} missing",
+                "  {}: {} installed, {} installed, {} drifted, {} edited, {} orphaned, {} missing",
                 h.harness,
-                h.installed_files,
-                h.installed_mcps,
+                plural(h.installed_files, "file", "files"),
+                plural(h.installed_mcps, "mcp", "mcps"),
                 h.drift,
                 h.edited,
                 h.orphaned,
@@ -4305,8 +5222,16 @@ pub fn render_human(report: &DoctorReport) -> String {
         for st in &p.stranded {
             let _ = writeln!(
                 out,
-                "  [problem] {}: {} provisioned skill file(s) left in {}, which {} still reads - run `crystalline provision` to retire them.",
-                st.harness, st.files, st.folder, st.read_by
+                "  [problem] {}: {} left in {}, which {} still reads - run `crystalline provision` to retire {}.",
+                st.harness,
+                plural(
+                    st.files,
+                    "provisioned skill file",
+                    "provisioned skill files"
+                ),
+                st.folder,
+                st.read_by,
+                if st.files == 1 { "it" } else { "them" }
             );
         }
         if !p.pending.is_empty() {
@@ -4346,8 +5271,57 @@ pub fn render_human(report: &DoctorReport) -> String {
         }
     }
 
+    for source in &report.sources {
+        let row = &source.row;
+        let _ = writeln!(
+            out,
+            "source {} ({}) as {} ({})",
+            row.name, row.url, row.account, row.kind
+        );
+        if let Some(store) = &row.credential_store {
+            let _ = writeln!(out, "  credential: {store}");
+        }
+        if let Some(at) = &row.expires_at {
+            let _ = writeln!(out, "  access token valid until {at}, renewed on its own");
+        }
+        for hidden in &row.shadowed {
+            let _ = writeln!(out, "  {}", hidden.note);
+        }
+        for skipped in &row.skipped {
+            let _ = writeln!(out, "  {}", skipped.note);
+        }
+        // A note, never a problem: the name is kept and taken once the
+        // server offers it.
+        for name in &row.not_offered {
+            let _ = writeln!(
+                out,
+                "  note: '{name}' is on the list, but the server does not offer it to {} (missing rights, or not there yet)",
+                row.account
+            );
+        }
+        match &source.problem {
+            Some(problem) => {
+                let _ = writeln!(out, "  PROBLEM: {problem}");
+                if let Some(detail) = &row.error_detail {
+                    let _ = writeln!(out, "  the server wrote: {detail}");
+                }
+            }
+            None => {
+                let _ = writeln!(
+                    out,
+                    "  the server answers; {} mounted",
+                    plural(row.mounts.len(), "domain", "domains")
+                );
+            }
+        }
+    }
+
     let remaining = report.remaining_problems();
-    let _ = writeln!(out, "{remaining} problem(s) remaining");
+    let _ = writeln!(
+        out,
+        "{} remaining",
+        plural(remaining, "problem", "problems")
+    );
     out
 }
 
@@ -4362,9 +5336,24 @@ pub fn render_human(report: &DoctorReport) -> String {
 /// build cannot read gets a sentence that asserts nothing about it.
 fn orphaned_domain_line(d: &OrphanedDomainDoctor) -> String {
     let name = &d.name;
-    let engrams = d.engrams;
+    let one = d.engrams == 1;
+    let rows = plural(
+        usize::try_from(d.engrams).unwrap_or(0),
+        "engram row",
+        "engram rows",
+    );
+    // What the sentences after the count call those rows.
+    let (they_are, them, they_stay) = if one {
+        ("It is", "it", "it stays")
+    } else {
+        ("They are", "them", "they stay")
+    };
+    let they_are_lower = if one { "it is" } else { "they are" };
     let age = match d.age_days {
-        Some(days) => format!("last seen registered {days} day(s) ago"),
+        Some(days) => format!(
+            "last seen registered {} ago",
+            plural(usize::try_from(days).unwrap_or(0), "day", "days")
+        ),
         // Not an age of zero: an index inherited from a version that never
         // recorded a registration has no evidence either way.
         None => "never seen registered by this version".to_string(),
@@ -4376,7 +5365,7 @@ fn orphaned_domain_line(d: &OrphanedDomainDoctor) -> String {
             ""
         };
         return format!(
-            "  collected {engrams} engram row(s) of '{name}' ({age}); the files on disk are untouched{row}"
+            "  collected {rows} of '{name}' ({age}); the files on disk are untouched{row}"
         );
     }
     // An empty row left behind, a file domain's or a virtual one's: the only
@@ -4395,30 +5384,30 @@ fn orphaned_domain_line(d: &OrphanedDomainDoctor) -> String {
     }
     if d.collectable {
         return format!(
-            "  [problem] {name}: {engrams} engram row(s), {age}. They are not served any more and will be collected; to clear them now run: crystalline doctor --fix"
+            "  [problem] {name}: {rows}, {age}. {they_are} not served any more and will be collected; to clear {them} now run: crystalline doctor --fix"
         );
     }
     match d.kept.as_deref().and_then(KeptReason::from_word) {
         Some(KeptReason::Virtual) => format!(
-            "  {name}: {engrams} engram row(s) in a virtual domain, {age}. They are not served any more, and a virtual domain's rows are its only copy, so nothing collects them on its own: end it with `crystalline domain remove {name} --purge`, which asks first"
+            "  {name}: {rows} in a virtual domain, {age}. {they_are} not served any more, and a virtual domain's rows are its only copy, so nothing collects {them} on its own: end it with `crystalline domain remove {name} --purge`, which asks first"
         ),
         // The live peer is serving these rows. Nothing here will ever collect
         // them, on either path, so nothing here may say it will.
         Some(KeptReason::HostedElsewhere) => format!(
-            "  {name}: {engrams} engram row(s), {age}. Another instance hosts this domain over the shared database and is still serving those rows, so they are not this instance's to collect"
+            "  {name}: {rows}, {age}. Another instance hosts this domain over the shared database and is still serving {them}, so {they_are_lower} not this instance's to collect"
         ),
         // A read-only instance collects nothing at all. The skipped line below
         // says the same thing about the run; this says it about the rows,
         // without promising a collection that needs a writable instance.
         Some(KeptReason::ReadOnly) => format!(
-            "  {name}: {engrams} engram row(s), {age}. This instance is read-only and collects nothing: they stay until a writable instance sweeps them, or until `crystalline doctor --fix` is run against one"
+            "  {name}: {rows}, {age}. This instance is read-only and collects nothing: {they_stay} until a writable instance sweeps {them}, or until `crystalline doctor --fix` is run against one"
         ),
         // Neither reaches a `doctor` run (both need a grace period, and both
         // doctor routes ask on the on-demand path), but both are honest about
         // a domain that is only waiting.
-        Some(KeptReason::Grace) | Some(KeptReason::Unstamped) => format!(
-            "  {name}: {engrams} engram row(s), {age}. They are not served any more and will be collected"
-        ),
+        Some(KeptReason::Grace) | Some(KeptReason::Unstamped) => {
+            format!("  {name}: {rows}, {age}. {they_are} not served any more and will be collected")
+        }
         // Filtered out before the render; a line that claims nothing is the
         // right answer if one ever arrives here anyway.
         Some(KeptReason::NoRows) => {
@@ -4430,7 +5419,7 @@ fn orphaned_domain_line(d: &OrphanedDomainDoctor) -> String {
         None => {
             let word = d.kept.as_deref().unwrap_or("no reason given");
             format!(
-                "  {name}: {engrams} engram row(s), {age}. They are not served any more, and this instance is not collecting them ({word})"
+                "  {name}: {rows}, {age}. {they_are} not served any more, and this instance is not collecting {them} ({word})"
             )
         }
     }
@@ -4515,7 +5504,8 @@ fn name_lines(names: &NamesDoctor, fix: bool) -> Vec<String> {
         && fixed > 0
     {
         lines.push(format!(
-            "wrote the domain's name into {fixed} link(s) that named a domain by a name only this machine uses"
+            "wrote the domain's name into {} that named a domain by a name only this machine uses",
+            plural(fixed as usize, "link", "links")
         ));
     }
     if let Some(err) = &names.fix_error {
@@ -4528,7 +5518,9 @@ fn name_lines(names: &NamesDoctor, fix: bool) -> Vec<String> {
     if !drafted.is_empty() {
         let total: u64 = drafted.iter().map(|s| s.count).sum();
         lines.push(format!(
-            "{total} link(s) that name a domain by a name only this machine uses are fixed in a draft that waits for review"
+            "{} a domain by a name only this machine uses {} fixed in a draft that waits for review",
+            plural(total as usize, "link that names", "links that name"),
+            if total == 1 { "is" } else { "are" }
         ));
         for s in &drafted {
             lines.push(format!(
@@ -4954,6 +5946,41 @@ mod tests {
         }
     }
 
+    /// A mismatch the daemon's facts show is a warning in the service
+    /// section, never a problem, so doctor's exit code is unchanged.
+    #[test]
+    fn a_config_mismatch_is_a_warning_in_the_service_section() {
+        let mismatch = crystalline_service::shaping::ConfigMismatch {
+            variable: "CRYSTALLINE_SERVICE_HTTP".to_string(),
+            daemon: "no HTTP endpoint".to_string(),
+            here: "127.0.0.1:7499".to_string(),
+        };
+        let report = DoctorReport {
+            service: ServiceDoctor {
+                config_mismatch: vec![mismatch.clone()],
+                ..ServiceDoctor::default()
+            },
+            ..DoctorReport::default()
+        };
+        let out = render_human(&report);
+        assert!(
+            out.contains(&format!("  [warning] {}\n", mismatch.line())),
+            "{out}"
+        );
+        assert!(
+            !out.contains("service:\n  ok\n"),
+            "a section with a warning does not say ok: {out}"
+        );
+        assert_eq!(report.remaining_problems(), 0);
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            json["service"]["config_mismatch"][0]["variable"],
+            "CRYSTALLINE_SERVICE_HTTP"
+        );
+        let clean = serde_json::to_value(DoctorReport::default()).unwrap();
+        assert!(clean["service"].get("config_mismatch").is_none(), "{clean}");
+    }
+
     /// A rebuild marker that outlived the run that set it: the finding names
     /// the instant and the command that finishes it, says plainly that the
     /// rows are still there, counts toward the exit code, and puts the caveat
@@ -5128,7 +6155,7 @@ mod tests {
         );
         assert!(out.contains("crystalline model download"), "{out}");
         assert_eq!(report.remaining_problems(), 0);
-        assert!(out.contains("0 problem(s) remaining"), "{out}");
+        assert!(out.contains("0 problems remaining"), "{out}");
 
         // The pinned commit cached with other weights: still a warning only.
         let pinned = tmp
@@ -5282,12 +6309,12 @@ mod tests {
     fn an_orphan_found_over_a_daemon_says_what_removing_it_takes() {
         let daemon = render_human(&report_with_orphans(IndexAccess::Daemon, &["gone.md"]));
         assert!(
-            daemon.contains("[problem] 1 orphan row(s) (file missing on disk): gone.md."),
+            daemon.contains("[problem] 1 orphan row (file missing on disk): gone.md."),
             "{daemon}"
         );
         assert!(
             daemon.contains(
-                "The running daemon owns the index, so removing them needs it stopped: run `crystalline ctl shutdown`, then `crystalline doctor --fix`"
+                "The running daemon owns the index, so removing the row needs it stopped: run `crystalline ctl shutdown`, then `crystalline doctor --fix`"
             ),
             "{daemon}"
         );
@@ -5472,8 +6499,8 @@ mod tests {
     fn an_aged_orphan_is_named_with_its_age_and_a_proportionate_remedy() {
         let report = orphan_report(vec![orphan("gone", 30, Some(13))], None, false);
         let out = render_human(&report);
-        assert!(out.contains("gone: 30 engram row(s)"), "{out}");
-        assert!(out.contains("last seen registered 13 day(s) ago"), "{out}");
+        assert!(out.contains("gone: 30 engram rows"), "{out}");
+        assert!(out.contains("last seen registered 13 days ago"), "{out}");
         assert!(out.contains("not served any more"), "{out}");
         assert!(out.contains("crystalline doctor --fix"), "{out}");
         assert!(
@@ -5496,10 +6523,7 @@ mod tests {
         row.collected = true;
         let report = orphan_report(vec![row], None, true);
         let out = render_human(&report);
-        assert!(
-            out.contains("collected 30 engram row(s) of 'gone'"),
-            "{out}"
-        );
+        assert!(out.contains("collected 30 engram rows of 'gone'"), "{out}");
         assert!(out.contains("files on disk are untouched"), "{out}");
         assert_eq!(report.remaining_problems(), 0);
     }
@@ -5524,7 +6548,7 @@ mod tests {
         let report = orphan_report(vec![row], None, false);
         let out = render_human(&report);
         assert!(
-            out.contains("vault: 12 engram row(s) in a virtual domain"),
+            out.contains("vault: 12 engram rows in a virtual domain"),
             "{out}"
         );
         assert!(
@@ -5558,7 +6582,7 @@ mod tests {
             false,
         );
         let out = render_human(&report);
-        assert!(out.contains("gone: 30 engram row(s)"), "{out}");
+        assert!(out.contains("gone: 30 engram rows"), "{out}");
         assert!(
             out.contains("This instance is read-only and collects nothing"),
             "the row says what will happen to it: {out}"
@@ -5798,7 +6822,7 @@ mod tests {
         assert_eq!(report.remaining_problems(), 1, "one open file");
         let out = render_human(&report);
         assert!(
-            out.contains("1 link(s) that name a domain by a name only this machine uses are fixed in a draft that waits for review"),
+            out.contains("1 link that names a domain by a name only this machine uses is fixed in a draft that waits for review"),
             "{out}"
         );
 
@@ -5845,7 +6869,7 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.contains("  stale NLI checkpoint(s) no profile uses now, still on disk: MoritzLaurer/multilingual-MiniLMv2-L12-mnli-xnli"),
+            out.contains("  1 stale NLI checkpoint no profile uses now, still on disk: MoritzLaurer/multilingual-MiniLMv2-L12-mnli-xnli"),
             "{out}"
         );
         assert_eq!(
@@ -6209,6 +7233,124 @@ mod tests {
             "{out}"
         );
         assert!(!out.contains("crystalline config set"), "{out}");
+    }
+
+    #[test]
+    fn a_lock_folder_left_by_a_removed_model_is_listed_and_fix_removes_it() {
+        let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = ModelsDirOverride::set(tmp.path());
+        let locks = tmp
+            .path()
+            .join(".locks")
+            .join(crystalline_index::hub_dir_name("BAAI/bge-small-en-v1.5"));
+        std::fs::create_dir_all(&locks).unwrap();
+        std::fs::write(locks.join("abc.lock"), b"").unwrap();
+
+        let found = check_model_locks(false, false).expect("the folder is reported");
+        assert_eq!(found.stale, ["BAAI/bge-small-en-v1.5"]);
+        assert!(found.removed.is_empty());
+        assert!(locks.is_dir(), "without --fix nothing is removed");
+
+        let read_only = check_model_locks(true, true).unwrap();
+        assert!(
+            read_only.removed.is_empty(),
+            "a read-only instance removes nothing"
+        );
+        assert!(locks.is_dir());
+
+        let fixed = check_model_locks(true, false).unwrap();
+        assert_eq!(fixed.removed, ["BAAI/bge-small-en-v1.5"]);
+        assert!(!locks.exists());
+        assert!(
+            check_model_locks(false, false).is_none(),
+            "nothing is left to report"
+        );
+    }
+
+    /// A lock folder whose model is gone but whose lock file somebody holds
+    /// is a download in flight: doctor lists nothing and `--fix` keeps it,
+    /// until the lock is let go.
+    #[test]
+    fn a_held_model_lock_is_never_listed_or_removed_by_doctor() {
+        let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = ModelsDirOverride::set(tmp.path());
+        let locks = tmp
+            .path()
+            .join(".locks")
+            .join(crystalline_index::hub_dir_name("BAAI/bge-small-en-v1.5"));
+        std::fs::create_dir_all(&locks).unwrap();
+        let held = std::fs::File::create(locks.join("abc.lock")).unwrap();
+        held.lock().unwrap();
+        assert!(
+            check_model_locks(true, false).is_none(),
+            "a held lock is a download in flight"
+        );
+        assert!(locks.join("abc.lock").is_file());
+        drop(held);
+        assert_eq!(
+            check_model_locks(true, false).unwrap().removed,
+            ["BAAI/bge-small-en-v1.5"],
+            "let go, it is a leftover"
+        );
+    }
+
+    /// A lock folder that is a symlink loses the link and never what it
+    /// points at: the removal does not follow links.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_model_lock_folder_loses_the_link_and_never_its_target() {
+        let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("cache");
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(cache.join(".locks")).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("keep.lock"), b"").unwrap();
+        let _env = ModelsDirOverride::set(&cache);
+        let link = cache
+            .join(".locks")
+            .join(crystalline_index::hub_dir_name("BAAI/bge-small-en-v1.5"));
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+
+        let fixed = check_model_locks(true, false).expect("the linked folder is listed");
+        assert_eq!(fixed.removed, ["BAAI/bge-small-en-v1.5"]);
+        assert!(
+            std::fs::symlink_metadata(&link).is_err(),
+            "the link is gone"
+        );
+        assert!(
+            elsewhere.join("keep.lock").is_file(),
+            "what it pointed at is untouched"
+        );
+    }
+
+    #[test]
+    fn the_model_lock_line_names_the_folders_and_is_never_a_problem() {
+        let mut report = DoctorReport {
+            model_locks: Some(ModelLocksDoctor {
+                stale: vec!["BAAI/bge-small-en-v1.5".to_string()],
+                removed: Vec::new(),
+            }),
+            ..DoctorReport::default()
+        };
+        let out = render_human(&report);
+        assert!(
+            out.contains("model cache: lock folders of models that are not cached any more: BAAI/bge-small-en-v1.5 (crystalline doctor --fix removes them)"),
+            "{out}"
+        );
+        assert_eq!(report.remaining_problems(), 0);
+
+        report.model_locks = Some(ModelLocksDoctor {
+            stale: vec!["BAAI/bge-small-en-v1.5".to_string()],
+            removed: vec!["BAAI/bge-small-en-v1.5".to_string()],
+        });
+        let out = render_human(&report);
+        assert!(
+            out.contains("model cache: removed the lock folders of models that are not cached any more: BAAI/bge-small-en-v1.5"),
+            "{out}"
+        );
     }
 
     /// V302: a remote embedding model has no measured line floor, so doctor
@@ -6900,7 +8042,7 @@ mod tests {
         // Somebody writes the original between doctor's read and its fix.
         let edited = review_standards("Edited meanwhile.", OLDER);
         std::fs::write(root.join(O_PATH), &edited).unwrap();
-        let s = settle_stray(&root, &pairs[0], false, false, true);
+        let s = settle_stray(&root, &pairs[0], false, None, true);
         assert!(!s.fixed, "{s:?}");
         assert_eq!(s.note.as_deref(), Some(CHANGED_NOTE));
         assert_eq!(std::fs::read_to_string(root.join(O_PATH)).unwrap(), edited);
@@ -6990,7 +8132,7 @@ mod tests {
             // Somebody writes the copy between doctor's read and its delete.
             let edited = review_standards("Written meanwhile.", NEWER);
             std::fs::write(root.join(S_PATH), &edited).unwrap();
-            let s = settle_stray(&root, &pairs[0], false, false, true);
+            let s = settle_stray(&root, &pairs[0], false, None, true);
             assert!(!s.fixed, "{original_body}: {s:?}");
             assert_eq!(
                 std::fs::read_to_string(root.join(S_PATH)).unwrap(),
@@ -7136,9 +8278,8 @@ mod tests {
         };
         assert_eq!(report.remaining_problems(), 1);
         assert!(
-            render_human(&report).contains(
-                "  [problem] 1 file(s) not indexed yet, run: crystalline sync --domain kb"
-            ),
+            render_human(&report)
+                .contains("  [problem] 1 file not indexed yet, run: crystalline sync --domain kb"),
         );
     }
 
@@ -7206,5 +8347,902 @@ mod tests {
         let s = &d.stray_copies[0];
         assert_eq!((s.path.as_str(), s.original.as_str()), (S_PATH, O_PATH));
         assert!(s.from_overwrite && s.newer && s.fixable, "{s:?}");
+    }
+
+    /// The refusal names the folder `--fix` looks at, so it is true for an
+    /// MSI installed to another folder too.
+    #[test]
+    fn the_fix_refusal_names_the_folder_it_looks_at() {
+        assert_eq!(
+            NOT_THE_MSI_BINARY,
+            r"this crystalline is not in Program Files\Crystalline\bin, so --fix registers no task for it. Install the MSI"
+        );
+    }
+
+    // Windows paths, so only the windows-latest leg runs it.
+    #[cfg(windows)]
+    #[test]
+    fn the_task_concerns_only_an_msi_install_or_a_machine_with_claude_desktop() {
+        let pf = [std::path::PathBuf::from(r"C:\Program Files")];
+        let msi = std::path::Path::new(r"C:\Program Files\Crystalline\bin\crystalline.exe");
+        let dev = std::path::Path::new(r"C:\src\crystalline\target\debug\crystalline.exe");
+        assert!(task_concerns_this_machine(msi, &pf, false));
+        assert!(
+            !task_concerns_this_machine(dev, &pf, false),
+            "a test or zip binary without Desktop"
+        );
+        assert!(
+            task_concerns_this_machine(dev, &pf, true),
+            "Desktop is there, so the report matters"
+        );
+    }
+
+    #[test]
+    fn doctor_says_a_task_another_user_owns_does_not_run_for_this_user() {
+        assert_eq!(
+            task_finding(None, None, r"WORK\ada", None),
+            TaskFinding::Missing
+        );
+        let group = r"<Principal id='Author'><GroupId>S-1-5-32-545</GroupId></Principal>";
+        assert_eq!(
+            task_finding(Some(r"\Crystalline\Daemon"), Some(group), r"WORK\ada", None),
+            TaskFinding::Ready(r"\Crystalline\Daemon".to_string())
+        );
+        let mine = r"<Principal id='Author'><UserId>work\ADA</UserId></Principal>";
+        assert_eq!(
+            task_finding(
+                Some(r"\Crystalline Daemon for ada"),
+                Some(mine),
+                r"WORK\ada",
+                None
+            ),
+            TaskFinding::Ready(r"\Crystalline Daemon for ada".to_string()),
+            "account names compare without case"
+        );
+        let other = r"<Principal id='Author'><UserId>WORK\bob</UserId></Principal>";
+        assert_eq!(
+            task_finding(Some(r"\Crystalline\Daemon"), Some(other), r"WORK\ada", None),
+            TaskFinding::ForOthers(r"\Crystalline\Daemon".to_string())
+        );
+    }
+
+    /// The definitions this binary registers, read back as Task Scheduler
+    /// prints them (indented, with the account in the trigger as well).
+    #[test]
+    fn doctor_reads_the_principal_of_a_definition_as_schtasks_prints_it() {
+        use crystalline_service::daemon_task::{TaskPrincipal, task_xml};
+        let exe = std::path::Path::new(r"C:\Program Files\Crystalline\bin\crystalline.exe");
+        let machine = task_xml(exe, &TaskPrincipal::AllUsers);
+        assert_eq!(
+            task_finding(
+                Some(r"\Crystalline\Daemon"),
+                Some(&machine),
+                r"WORK\ada",
+                None
+            ),
+            TaskFinding::Ready(r"\Crystalline\Daemon".to_string())
+        );
+        let own = task_xml(
+            exe,
+            &TaskPrincipal::User {
+                account: r"WORK\ada".to_string(),
+            },
+        );
+        assert_eq!(
+            task_finding(Some(r"\Crystalline\Daemon"), Some(&own), r"WORK\ada", None),
+            TaskFinding::Ready(r"\Crystalline\Daemon".to_string())
+        );
+        assert_eq!(
+            task_finding(Some(r"\Crystalline\Daemon"), Some(&own), r"WORK\bob", None),
+            TaskFinding::ForOthers(r"\Crystalline\Daemon".to_string())
+        );
+        let spaced = "<Principals>\r\n  <Principal id=\"Author\">\r\n    <UserId>\r\n      WORK\\ada\r\n    </UserId>\r\n  </Principal>\r\n</Principals>";
+        assert_eq!(
+            task_finding(
+                Some(r"\Crystalline\Daemon"),
+                Some(spaced),
+                r"WORK\ada",
+                None
+            ),
+            TaskFinding::Ready(r"\Crystalline\Daemon".to_string()),
+            "the account is read without the space around it"
+        );
+    }
+
+    /// Only the principal decides who a task runs for. An account named in
+    /// the logon trigger only says when it starts.
+    #[test]
+    fn an_account_in_the_trigger_alone_does_not_make_the_task_run_for_this_user() {
+        let xml = r"<Task><Triggers><LogonTrigger><UserId>WORK\ada</UserId></LogonTrigger></Triggers><Principals><Principal id='Author'><UserId>WORK\bob</UserId></Principal></Principals></Task>";
+        assert_eq!(
+            task_finding(Some(r"\Crystalline\Daemon"), Some(xml), r"WORK\ada", None),
+            TaskFinding::ForOthers(r"\Crystalline\Daemon".to_string())
+        );
+    }
+
+    /// A name with letters outside ASCII compares without case too, and an
+    /// account without its domain half still names the same user.
+    #[test]
+    fn doctor_compares_any_account_name_without_case_and_without_a_missing_domain() {
+        let upper = "<Principal><UserId>WORK\\\u{dc}LKER</UserId></Principal>";
+        assert_eq!(
+            task_finding(
+                Some(r"\Crystalline\Daemon"),
+                Some(upper),
+                "WORK\\\u{fc}lker",
+                None
+            ),
+            TaskFinding::Ready(r"\Crystalline\Daemon".to_string())
+        );
+        let bare = "<Principal><UserId>ada</UserId></Principal>";
+        assert_eq!(
+            task_finding(Some(r"\Crystalline\Daemon"), Some(bare), r"WORK\ada", None),
+            TaskFinding::Ready(r"\Crystalline\Daemon".to_string())
+        );
+        let elsewhere = "<Principal><UserId>HOME\\ada</UserId></Principal>";
+        assert_eq!(
+            task_finding(
+                Some(r"\Crystalline\Daemon"),
+                Some(elsewhere),
+                r"WORK\ada",
+                None
+            ),
+            TaskFinding::ForOthers(r"\Crystalline\Daemon".to_string()),
+            "two domains are two accounts"
+        );
+    }
+
+    /// The task under this user's own name is theirs even when its account
+    /// does not read back as text this binary can compare: a name outside
+    /// ASCII that the output decoding mangled, a SID, or no definition at
+    /// all. Only `doctor --fix` run by this user registers that name.
+    #[test]
+    fn this_users_own_task_counts_when_its_account_does_not_read_back() {
+        let own = crystalline_service::daemon_task::user_task_name("ada", ADA_SID);
+        let mangled = "<Principal><UserId>WORK\\\u{fffd}\u{fffd}da</UserId></Principal>";
+        let sid =
+            "<Principal><UserId>S-1-5-21-1004336348-1177238915-682003330-1001</UserId></Principal>";
+        let unreadable = "\u{fffd}\u{fffd}\u{fffd}";
+        for xml in [Some(mangled), Some(sid), Some(unreadable), None] {
+            assert_eq!(
+                task_finding(Some(own.as_str()), xml, r"WORK\ada", Some(ADA_SID)),
+                TaskFinding::Ready(own.clone()),
+                "{xml:?}"
+            );
+        }
+        assert_eq!(
+            task_finding(
+                Some(r"\Crystalline\Daemon"),
+                Some(mangled),
+                r"WORK\ada",
+                None
+            ),
+            TaskFinding::ForOthers(r"\Crystalline\Daemon".to_string()),
+            "the machine name carries no user, so its account must match"
+        );
+        let group = "<Principal><GroupId>S-1-5-32-545</GroupId></Principal>";
+        assert_eq!(
+            task_finding(Some(own.as_str()), Some(group), r"WORK\ada", Some(ADA_SID)),
+            TaskFinding::Ready(own.clone())
+        );
+    }
+
+    const ADA_SID: &str = "S-1-5-21-1004336348-1177238915-682003330-1001";
+
+    /// A refused delete of the old task, after the new one was registered,
+    /// is said with its reason and is a fix that did not finish.
+    #[test]
+    fn a_refused_removal_of_the_old_task_is_said_and_counts_as_a_problem() {
+        let old = crystalline_service::daemon_task::legacy_user_task_name("ada");
+        let new = crystalline_service::daemon_task::user_task_name("ada", ADA_SID);
+        let report = DoctorReport {
+            daemon_task: Some(TaskDoctor {
+                finding: Some(TaskFinding::Ready(old.clone())),
+                old_name: Some(old.clone()),
+                registered_now: Some(new.clone()),
+                old_refused: Some("ERROR: Access is denied.".to_string()),
+                ..TaskDoctor::default()
+            }),
+            ..DoctorReport::default()
+        };
+        assert_eq!(report.remaining_problems(), 1);
+        let out = render_human(&report);
+        assert!(
+            out.contains(&format!("  registered the task {new} for this user\n")),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "  [problem] --fix could not remove the task {old}, which has the name from Crystalline 0.24.0 (ERROR: Access is denied.)\n"
+            )),
+            "{out}"
+        );
+        assert!(!out.contains("[warning] the task"), "{out}");
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            json["daemon_task"]["old_refused"],
+            serde_json::json!("ERROR: Access is denied.")
+        );
+    }
+
+    /// Beside a ready machine task, which every bridge finds first, the old
+    /// per-user task is only removed. Without one it is moved to the name
+    /// with the SID.
+    #[test]
+    fn beside_a_ready_machine_task_fix_only_removes_the_old_task() {
+        use crystalline_service::daemon_task::MACHINE_TASK_NAME;
+        let old = crystalline_service::daemon_task::legacy_user_task_name("ada");
+        let doctor = |finding: TaskFinding, old_name: Option<&str>| TaskDoctor {
+            finding: Some(finding),
+            old_name: old_name.map(str::to_string),
+            ..TaskDoctor::default()
+        };
+        let machine = TaskFinding::Ready(MACHINE_TASK_NAME.to_string());
+        assert_eq!(
+            task_fix(&doctor(machine.clone(), Some(&old)), TaskRepair::Nothing),
+            TaskFix::RemoveOld
+        );
+        assert_eq!(
+            task_fix(&doctor(machine.clone(), None), TaskRepair::Nothing),
+            TaskFix::Nothing
+        );
+        assert_eq!(
+            task_fix(
+                &doctor(TaskFinding::Ready(old.clone()), Some(&old)),
+                TaskRepair::Nothing
+            ),
+            TaskFix::Register,
+            "no machine task: the old one is moved"
+        );
+        assert_eq!(
+            task_fix(&doctor(TaskFinding::Missing, None), TaskRepair::Register),
+            TaskFix::Register
+        );
+        assert_eq!(
+            task_fix(
+                &doctor(machine.clone(), Some(&old)),
+                TaskRepair::Administrator
+            ),
+            TaskFix::Nothing,
+            "a broken machine task is for an administrator"
+        );
+
+        let report = DoctorReport {
+            daemon_task: Some(TaskDoctor {
+                moved_old: Some(old.clone()),
+                ..doctor(machine, Some(&old))
+            }),
+            ..DoctorReport::default()
+        };
+        assert_eq!(report.remaining_problems(), 0);
+        let out = render_human(&report);
+        assert!(
+            out.contains(&format!("  ok ({MACHINE_TASK_NAME})\n")),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "  removed the task {old}, which had the name from Crystalline 0.24.0\n"
+            )),
+            "{out}"
+        );
+        assert!(!out.contains("registered the task"), "{out}");
+        assert!(!out.contains("[warning]"), "{out}");
+
+        let before = DoctorReport {
+            daemon_task: Some(doctor(
+                TaskFinding::Ready(MACHINE_TASK_NAME.to_string()),
+                Some(&old),
+            )),
+            ..DoctorReport::default()
+        };
+        let out = render_human(&before);
+        assert!(
+            out.contains(&format!(
+                "  [warning] the task {old} has the name from Crystalline 0.24.0. The task {MACHINE_TASK_NAME} starts the daemon for this user, so run crystalline doctor --fix to remove it\n"
+            )),
+            "{out}"
+        );
+    }
+
+    /// This user's own task under the name with the SID is ready and the
+    /// 0.24.0-named one is still there (Task Scheduler refused its delete
+    /// last time). It is only a leftover: `--fix` removes it, which needs no
+    /// MSI binary, and registers nothing.
+    #[test]
+    fn beside_this_users_ready_task_fix_only_removes_the_old_task() {
+        const OWN: &str = r"\Crystalline Daemon for ada (S-1-5-21-1-2-3-1001)";
+        let old = crystalline_service::daemon_task::legacy_user_task_name("ada");
+        let report = TaskDoctor {
+            finding: Some(TaskFinding::Ready(OWN.to_string())),
+            old_name: Some(old.clone()),
+            ..TaskDoctor::default()
+        };
+        assert_eq!(task_fix(&report, TaskRepair::Nothing), TaskFix::RemoveOld);
+        assert_eq!(
+            task_fix(
+                &TaskDoctor {
+                    finding: Some(TaskFinding::Ready(old.to_uppercase())),
+                    ..report.clone()
+                },
+                TaskRepair::Nothing
+            ),
+            TaskFix::Register,
+            "the old task itself is the ready one: it is moved, in any case"
+        );
+
+        let out = render_human(&DoctorReport {
+            daemon_task: Some(report),
+            ..DoctorReport::default()
+        });
+        assert!(
+            out.contains(&format!(
+                "  [warning] the task {old} has the name from Crystalline 0.24.0. The task {OWN} starts the daemon for this user, so run crystalline doctor --fix to remove it\n"
+            )),
+            "{out}"
+        );
+    }
+
+    /// Each fix reaches exactly its Task Scheduler call: `RemoveOld` only the
+    /// removal, `Register` only the registration (which moves the old task
+    /// itself), and neither for `Nothing` or a binary the MSI did not install.
+    #[test]
+    fn each_task_fix_makes_exactly_its_own_call() {
+        use crystalline_service::daemon_task::Moved;
+        const OWN: &str = r"\Crystalline Daemon for ada (S-1-5-21-1-2-3-1001)";
+        let old = crystalline_service::daemon_task::legacy_user_task_name("ada");
+
+        let mut report = TaskDoctor {
+            old_name: Some(old.clone()),
+            ..TaskDoctor::default()
+        };
+        apply_task_fix(
+            &mut report,
+            TaskFix::RemoveOld,
+            false,
+            || Moved::Removed(old.clone()),
+            || panic!("RemoveOld registers nothing"),
+        );
+        assert_eq!(report.moved_old.as_deref(), Some(old.as_str()));
+        assert!(report.registered_now.is_none() && report.error.is_none());
+
+        let mut report = TaskDoctor::default();
+        apply_task_fix(
+            &mut report,
+            TaskFix::Register,
+            true,
+            || panic!("Register never calls the bare removal"),
+            || {
+                Ok((
+                    OWN.to_string(),
+                    Moved::Refused {
+                        task: old.clone(),
+                        why: "ERROR: Access is denied.".to_string(),
+                    },
+                ))
+            },
+        );
+        assert_eq!(report.registered_now.as_deref(), Some(OWN));
+        assert_eq!(report.old_name.as_deref(), Some(old.as_str()));
+        assert_eq!(
+            report.old_refused.as_deref(),
+            Some("ERROR: Access is denied.")
+        );
+
+        let mut report = TaskDoctor::default();
+        apply_task_fix(
+            &mut report,
+            TaskFix::Register,
+            false,
+            || panic!("not the MSI binary: no call"),
+            || panic!("not the MSI binary: no call"),
+        );
+        assert_eq!(report.error.as_deref(), Some(NOT_THE_MSI_BINARY));
+
+        apply_task_fix(
+            &mut TaskDoctor::default(),
+            TaskFix::Nothing,
+            true,
+            || panic!("nothing to do"),
+            || panic!("nothing to do"),
+        );
+    }
+
+    /// A lock nobody held at the diagnosis that somebody took before `--fix`
+    /// reached it is a daemon that started meanwhile: nothing is removed,
+    /// and the findings read as recovered rather than as removed.
+    #[test]
+    fn a_lock_taken_after_the_diagnosis_removes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let info = tmp.path().join("service.json");
+        let sock = tmp.path().join("service.sock");
+        std::fs::write(&info, b"{\"pid\":1}").unwrap();
+        std::fs::write(&sock, b"").unwrap();
+        let mut s = ServiceDoctor {
+            lock_present: true,
+            lock_stale: true,
+            socket_present: true,
+            socket_orphaned: true,
+            ..ServiceDoctor::default()
+        };
+        remove_stale_service_files(&mut s, None, &info, &sock);
+        assert!(!s.lock_stale, "recovered, not stale");
+        assert!(!s.socket_orphaned, "recovered, not orphaned");
+        assert!(
+            !s.lock_removed && !s.socket_removed,
+            "nothing claimed as removed"
+        );
+        assert!(info.is_file(), "the new daemon's record stays");
+        assert!(sock.exists(), "and so does its socket");
+    }
+
+    /// This user's 0.24.0-named task read back with the account's SID as
+    /// principal runs for this user, as the bridge finds it: a warning about
+    /// the name only, never a problem.
+    #[test]
+    fn the_old_name_with_this_accounts_sid_as_principal_is_this_users() {
+        let old = crystalline_service::daemon_task::legacy_user_task_name("ada");
+        let xml = format!(
+            "<Task><Principals><Principal id=\"Author\"><UserId>{ADA_SID}</UserId></Principal></Principals></Task>"
+        );
+        let (task, repair) = assess_task(
+            Some(old.as_str()),
+            Some(xml.as_str()),
+            r"WORK\ada",
+            Some(ADA_SID),
+            |_: &Path| true,
+        );
+        assert_eq!(task.finding, Some(TaskFinding::Ready(old.clone())));
+        assert_eq!(repair, TaskRepair::Nothing);
+        assert_eq!(
+            task_finding(Some(old.as_str()), Some(xml.as_str()), r"WORK\ada", None),
+            TaskFinding::ForOthers(old.clone()),
+            "without this account's SID the principal is not known as ours"
+        );
+        let report = DoctorReport {
+            daemon_task: Some(TaskDoctor {
+                old_name: Some(old.clone()),
+                ..task
+            }),
+            ..DoctorReport::default()
+        };
+        assert_eq!(report.remaining_problems(), 0);
+        let out = render_human(&report);
+        assert!(out.contains(&format!("  ok ({old})\n")), "{out}");
+        assert!(out.contains("[warning] the task"), "{out}");
+        assert!(!out.contains("[problem]"), "{out}");
+    }
+
+    /// The 0.24.0 name is a warning, never a problem: the task still works.
+    /// After `--fix` the move is said.
+    #[test]
+    fn a_task_with_the_old_name_is_a_warning_until_fix_moves_it() {
+        let old = crystalline_service::daemon_task::legacy_user_task_name("ada");
+        let new = crystalline_service::daemon_task::user_task_name("ada", ADA_SID);
+        let mut report = DoctorReport {
+            daemon_task: Some(TaskDoctor {
+                finding: Some(TaskFinding::Ready(old.clone())),
+                old_name: Some(old.clone()),
+                ..TaskDoctor::default()
+            }),
+            ..DoctorReport::default()
+        };
+        assert_eq!(report.remaining_problems(), 0);
+        let out = render_human(&report);
+        assert!(
+            out.contains(&format!(
+                "  [warning] the task {old} has the name from Crystalline 0.24.0. Run crystalline doctor --fix to give it a name with this account's SID\n"
+            )),
+            "{out}"
+        );
+        report.daemon_task = Some(TaskDoctor {
+            finding: Some(TaskFinding::Ready(old.clone())),
+            old_name: Some(old.clone()),
+            registered_now: Some(new.clone()),
+            moved_old: Some(old.clone()),
+            ..TaskDoctor::default()
+        });
+        let out = render_human(&report);
+        assert!(
+            out.contains(&format!("  registered the task {new} for this user\n")),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "  removed the task {old}, which had the name from Crystalline 0.24.0\n"
+            )),
+            "{out}"
+        );
+        assert!(!out.contains("[warning] the task"), "{out}");
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["daemon_task"]["moved_old"], serde_json::json!(old));
+    }
+
+    /// The own name carries the SID, so it is this user's however its
+    /// account reads back; the 0.24.0 name is not, without a principal.
+    #[test]
+    fn only_the_name_with_this_accounts_sid_is_always_this_users() {
+        let own = crystalline_service::daemon_task::user_task_name("ada", ADA_SID);
+        let old = crystalline_service::daemon_task::legacy_user_task_name("ada");
+        let mangled = "<Principal><UserId>WORK\\\u{fffd}\u{fffd}da</UserId></Principal>";
+        assert_eq!(
+            task_finding(
+                Some(own.as_str()),
+                Some(mangled),
+                r"WORK\ada",
+                Some(ADA_SID)
+            ),
+            TaskFinding::Ready(own.clone())
+        );
+        assert_eq!(
+            task_finding(
+                Some(old.as_str()),
+                Some(mangled),
+                r"WORK\ada",
+                Some(ADA_SID)
+            ),
+            TaskFinding::ForOthers(old.clone()),
+            "the old name carries no SID, so its account must match"
+        );
+    }
+
+    #[test]
+    fn a_task_that_does_not_run_for_this_user_is_a_problem_until_fix_registers_one() {
+        let mut report = DoctorReport {
+            daemon_task: Some(TaskDoctor {
+                finding: Some(TaskFinding::Missing),
+                ..TaskDoctor::default()
+            }),
+            ..DoctorReport::default()
+        };
+        assert_eq!(report.remaining_problems(), 1);
+        let out = render_human(&report);
+        assert!(out.contains("daemon task:\n"), "{out}");
+        assert!(out.contains("[problem] the task"), "{out}");
+        assert!(out.contains("crystalline doctor --fix"), "{out}");
+
+        report.daemon_task = Some(TaskDoctor {
+            finding: Some(TaskFinding::Missing),
+            gone_command: None,
+            registered_now: Some(r"\Crystalline Daemon for ada".to_string()),
+            error: None,
+            ..TaskDoctor::default()
+        });
+        assert_eq!(report.remaining_problems(), 0);
+        assert!(
+            render_human(&report).contains(r"registered the task \Crystalline Daemon for ada"),
+            "{}",
+            render_human(&report)
+        );
+
+        report.daemon_task = Some(TaskDoctor {
+            finding: Some(TaskFinding::Ready(r"\Crystalline\Daemon".to_string())),
+            ..TaskDoctor::default()
+        });
+        assert_eq!(report.remaining_problems(), 0);
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            json["daemon_task"]["finding"],
+            serde_json::json!({ "state": "ready", "name": r"\Crystalline\Daemon" })
+        );
+
+        report.daemon_task = None;
+        let json = serde_json::to_value(&report).unwrap();
+        assert!(json.get("daemon_task").is_none(), "off Windows: {json}");
+        assert_eq!(json["desktop_states"], serde_json::json!([]));
+    }
+
+    /// When the definition says nothing doctor can read about who the task
+    /// runs for, doctor cannot tell, so it says nothing.
+    #[test]
+    fn a_task_whose_principal_cannot_be_read_is_not_reported_as_for_others() {
+        let machine = crystalline_service::daemon_task::MACHINE_TASK_NAME;
+        let ready = TaskFinding::Ready(machine.to_string());
+        assert_eq!(task_finding(Some(machine), None, r"WORK\ada", None), ready);
+        for garbled in [
+            "\u{fffd}\u{fffd}\u{fffd}",
+            "<Task><Principals></Principals></Task>",
+            "<Principals><Principal id=\"Author\"><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>",
+        ] {
+            assert_eq!(
+                task_finding(Some(machine), Some(garbled), r"WORK\ada", None),
+                ready,
+                "{garbled}"
+            );
+        }
+    }
+
+    /// The definition fixture this binary registers, starting `exe`.
+    fn definition_starting(
+        exe: &str,
+        principal: &crystalline_service::daemon_task::TaskPrincipal,
+    ) -> String {
+        crystalline_service::daemon_task::task_xml(std::path::Path::new(exe), principal)
+    }
+
+    const GONE_EXE: &str = r"C:\Program Files\Crystalline & Co\bin\crystalline.exe";
+    const OWN_TASK: &str =
+        r"\Crystalline Daemon for ada (S-1-5-21-1004336348-1177238915-682003330-1001)";
+
+    #[test]
+    fn the_command_is_read_from_the_definition() {
+        use crystalline_service::daemon_task::TaskPrincipal;
+        let xml = definition_starting(GONE_EXE, &TaskPrincipal::AllUsers);
+        assert_eq!(
+            task_command(&xml).as_deref(),
+            Some(std::path::Path::new(GONE_EXE)),
+            "quotes and entities are taken off"
+        );
+        assert_eq!(task_command("<Principals></Principals>"), None);
+    }
+
+    /// Each task doctor may find, what it reports and what `--fix` may do.
+    #[test]
+    fn doctor_assesses_each_task_and_repairs_only_what_this_user_can() {
+        use crystalline_service::daemon_task::{MACHINE_TASK_NAME, TaskPrincipal};
+        let machine_xml = definition_starting(GONE_EXE, &TaskPrincipal::AllUsers);
+        let own_xml = definition_starting(
+            GONE_EXE,
+            &TaskPrincipal::User {
+                account: r"WORK\ada".to_string(),
+            },
+        );
+        let bob = "<Principals><Principal><UserId>WORK\\bob</UserId></Principal></Principals><Command>C:\\x.exe</Command>";
+        let here = |_: &Path| true;
+        let gone = |_: &Path| false;
+
+        let (task, repair) = assess_task(None, None, r"WORK\ada", None, gone);
+        assert_eq!(task.finding, Some(TaskFinding::Missing));
+        assert_eq!(repair, TaskRepair::Register, "nothing found");
+
+        let (task, repair) = assess_task(
+            Some(MACHINE_TASK_NAME),
+            Some(&machine_xml),
+            r"WORK\ada",
+            None,
+            here,
+        );
+        assert_eq!(
+            task.finding,
+            Some(TaskFinding::Ready(MACHINE_TASK_NAME.to_string()))
+        );
+        assert_eq!(task.gone_command, None);
+        assert_eq!(repair, TaskRepair::Nothing);
+
+        let (task, repair) = assess_task(
+            Some(MACHINE_TASK_NAME),
+            Some(&machine_xml),
+            r"WORK\ada",
+            None,
+            gone,
+        );
+        assert_eq!(task.gone_command.as_deref(), Some(GONE_EXE));
+        assert_eq!(
+            repair,
+            TaskRepair::Administrator,
+            "a per-user task would never run: the bridge finds the machine task first"
+        );
+
+        let (task, repair) =
+            assess_task(Some(MACHINE_TASK_NAME), Some(bob), r"WORK\ada", None, here);
+        assert_eq!(
+            task.finding,
+            Some(TaskFinding::ForOthers(MACHINE_TASK_NAME.to_string()))
+        );
+        assert_eq!(repair, TaskRepair::Administrator);
+
+        let (task, repair) = assess_task(
+            Some(OWN_TASK),
+            Some(&own_xml),
+            r"WORK\ada",
+            Some(ADA_SID),
+            gone,
+        );
+        assert_eq!(task.finding, Some(TaskFinding::Ready(OWN_TASK.to_string())));
+        assert_eq!(task.gone_command.as_deref(), Some(GONE_EXE));
+        assert_eq!(
+            repair,
+            TaskRepair::Register,
+            "this user's own task is replaced"
+        );
+
+        let (task, repair) = assess_task(Some(MACHINE_TASK_NAME), None, r"WORK\ada", None, gone);
+        assert_eq!(
+            (task.finding, task.gone_command, repair),
+            (
+                Some(TaskFinding::Ready(MACHINE_TASK_NAME.to_string())),
+                None,
+                TaskRepair::Nothing
+            ),
+            "no definition: doctor cannot tell"
+        );
+    }
+
+    /// What each finding says, and whether it still counts after `--fix`.
+    #[test]
+    fn each_task_problem_names_the_task_and_what_to_do() {
+        use crystalline_service::daemon_task::MACHINE_TASK_NAME;
+        let text = |task: TaskDoctor| {
+            let report = DoctorReport {
+                daemon_task: Some(task),
+                ..DoctorReport::default()
+            };
+            (render_human(&report), report.remaining_problems())
+        };
+
+        let (out, n) = text(TaskDoctor {
+            finding: Some(TaskFinding::Ready(MACHINE_TASK_NAME.to_string())),
+            gone_command: Some(GONE_EXE.to_string()),
+            ..TaskDoctor::default()
+        });
+        assert!(
+            out.contains(&format!(
+                "  [problem] the task {MACHINE_TASK_NAME} starts {GONE_EXE}, which is gone. Repair or reinstall Crystalline with the MSI, or ask an administrator to remove the task.\n"
+            )),
+            "{out}"
+        );
+        assert_eq!(n, 1, "--fix registers nothing for it, so it stays");
+
+        let (out, n) = text(TaskDoctor {
+            finding: Some(TaskFinding::ForOthers(MACHINE_TASK_NAME.to_string())),
+            ..TaskDoctor::default()
+        });
+        assert!(
+            out.contains(&format!(
+                "  [problem] the task {MACHINE_TASK_NAME} does not run for this user. Ask an administrator to repair or remove it.\n"
+            )),
+            "{out}"
+        );
+        assert!(!out.contains("doctor --fix"), "{out}");
+        assert_eq!(n, 1);
+
+        let (out, n) = text(TaskDoctor {
+            finding: Some(TaskFinding::Ready(OWN_TASK.to_string())),
+            gone_command: Some(GONE_EXE.to_string()),
+            ..TaskDoctor::default()
+        });
+        assert!(
+            out.contains(&format!(
+                "[problem] the task {OWN_TASK} starts {GONE_EXE}, which is gone."
+            )),
+            "{out}"
+        );
+        assert!(out.contains("crystalline doctor --fix"), "{out}");
+        assert!(!out.contains(MACHINE_TASK_NAME), "{out}");
+        assert_eq!(n, 1);
+
+        let (out, n) = text(TaskDoctor {
+            finding: Some(TaskFinding::Ready(OWN_TASK.to_string())),
+            gone_command: Some(GONE_EXE.to_string()),
+            registered_now: Some(OWN_TASK.to_string()),
+            error: None,
+            ..TaskDoctor::default()
+        });
+        assert!(
+            out.contains(&format!("registered the task {OWN_TASK} for this user")),
+            "{out}"
+        );
+        assert_eq!(n, 0);
+
+        let (out, _) = text(TaskDoctor {
+            finding: Some(TaskFinding::Missing),
+            ..TaskDoctor::default()
+        });
+        assert!(
+            out.contains(&format!(
+                "[problem] the task {MACHINE_TASK_NAME} is missing"
+            )),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_refused_task_query_is_a_problem_that_names_windows_words() {
+        use crystalline_service::daemon_task::MACHINE_TASK_NAME;
+        let report = DoctorReport {
+            daemon_task: Some(TaskDoctor {
+                finding: Some(TaskFinding::Refused(MACHINE_TASK_NAME.to_string())),
+                refused: Some("ERROR: Access is denied.".to_string()),
+                ..TaskDoctor::default()
+            }),
+            ..DoctorReport::default()
+        };
+        assert_eq!(report.remaining_problems(), 1);
+        let out = render_human(&report);
+        assert!(
+            out.contains(&format!(
+                "  [problem] Task Scheduler refused to say whether the task {MACHINE_TASK_NAME} exists (ERROR: Access is denied.), so doctor cannot tell whether Claude Desktop can start the daemon. Ask an administrator to check the task.\n"
+            )),
+            "{out}"
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            json["daemon_task"]["finding"],
+            serde_json::json!({ "state": "refused", "name": MACHINE_TASK_NAME })
+        );
+        assert_eq!(json["daemon_task"]["refused"], "ERROR: Access is denied.");
+    }
+
+    /// A missing task may read as refused (the not-found words are the
+    /// system's default language, `schtasks` speaks the user's), so `--fix`
+    /// tries the repair it makes for a missing task.
+    #[test]
+    fn a_refused_task_query_is_repaired_like_a_missing_task() {
+        use crystalline_service::daemon_task::{MACHINE_TASK_NAME, Refused};
+        let (report, repair) = refused_task(Refused {
+            task: MACHINE_TASK_NAME.to_string(),
+            detail: "FEHLER: Das System kann die angegebene Datei nicht finden.".to_string(),
+        });
+        assert_eq!(
+            report.finding,
+            Some(TaskFinding::Refused(MACHINE_TASK_NAME.to_string()))
+        );
+        assert_eq!(
+            report.refused.as_deref(),
+            Some("FEHLER: Das System kann die angegebene Datei nicht finden.")
+        );
+        assert_eq!(task_fix(&report, repair), TaskFix::Register);
+        let old = crystalline_service::daemon_task::legacy_user_task_name("ada");
+        for repair in [
+            TaskRepair::Nothing,
+            TaskRepair::Register,
+            TaskRepair::Administrator,
+        ] {
+            assert_eq!(
+                task_fix(
+                    &TaskDoctor {
+                        old_name: Some(old.clone()),
+                        ..report.clone()
+                    },
+                    repair
+                ),
+                TaskFix::Register,
+                "a refused finding always tries the register, an old name or not ({repair:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fix_after_a_refused_query_still_shows_windows_words() {
+        use crystalline_service::daemon_task::MACHINE_TASK_NAME;
+        const OWN_TASK: &str = r"\Crystalline Daemon for ada (S-1-5-21-1-2-3-1001)";
+        let refused = || TaskDoctor {
+            finding: Some(TaskFinding::Refused(MACHINE_TASK_NAME.to_string())),
+            refused: Some("ERROR: Access is denied.".to_string()),
+            ..TaskDoctor::default()
+        };
+        let report = |task: TaskDoctor| DoctorReport {
+            daemon_task: Some(task),
+            ..DoctorReport::default()
+        };
+
+        let registered = report(TaskDoctor {
+            registered_now: Some(OWN_TASK.to_string()),
+            ..refused()
+        });
+        let out = render_human(&registered);
+        assert!(
+            out.contains(&format!("registered the task {OWN_TASK} for this user")),
+            "{out}"
+        );
+        assert!(out.contains("(ERROR: Access is denied.)"), "{out}");
+        assert_eq!(registered.remaining_problems(), 0);
+
+        let failed = report(TaskDoctor {
+            error: Some("ERROR: Access is denied to register.".to_string()),
+            ..refused()
+        });
+        let out = render_human(&failed);
+        assert!(
+            out.contains(&format!(
+                "  [problem] Task Scheduler refused to say whether the task {MACHINE_TASK_NAME} exists (ERROR: Access is denied.)"
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains("--fix could not register it: ERROR: Access is denied to register."),
+            "{out}"
+        );
+        assert_eq!(failed.remaining_problems(), 1);
     }
 }

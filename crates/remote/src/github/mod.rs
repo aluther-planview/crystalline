@@ -17,7 +17,7 @@
 //! still spread files across pages, so [`GitHubProvider::compare`] follows
 //! `page` for as long as a page comes back full; in the documented case that
 //! costs at most one harmless extra request, and it is the shape covered by
-//! the pagination test in `tests/github_client.rs`.
+//! the pagination test in `tests/it/github_client.rs`.
 
 pub mod auth;
 mod types;
@@ -977,9 +977,9 @@ fn organization_policy_error(
 ///
 /// The rule reading is for the connected branch alone. A share branch takes
 /// the same 422 when its own head moved, and that is the fast-forward answer
-/// on every branch; but `BranchProtected` carries the way out "set
-/// `sharing: proposal`", which is wrong advice on a `crystalline/share-*`
-/// branch of a domain that already opens proposals. Any other 422 there stays
+/// on every branch; but `BranchProtected` carries the way out "share as
+/// a proposal", which is no way out on a `crystalline/share-*` branch of a
+/// share that already is one. Any other 422 there stays
 /// the generic `Api` answer `check` would have made of it.
 fn update_branch_refusal(message: &str, branch: &str, connected: &str) -> RemoteError {
     if message.to_lowercase().contains(NOT_FAST_FORWARD_MARKER) {
@@ -1301,16 +1301,16 @@ mod tests {
         .to_string();
         assert!(
             text.starts_with(
-                "The branch main does not accept direct commits (Changes must be made through a pull request.)."
+                "The branch main does not accept direct commits from you (Changes must be made through a pull request.)."
             ),
             "{text}"
         );
-        assert!(text.contains("sharing: proposal"), "{text}");
+        assert!(text.contains("as_proposal: true"), "{text}");
     }
 
     /// A proposal domain's share branch is not the branch the `sharing`
-    /// policy is about: a rules 422 there would tell a domain that already
-    /// opens proposals to set `sharing: proposal`, so it stays the generic
+    /// policy is about: a rules 422 there would tell a share that already
+    /// is a proposal to share as a proposal, so it stays the generic
     /// answer. The fast-forward reading is the same on every branch, since a
     /// share branch that moved is exactly what it says.
     #[test]

@@ -17,7 +17,9 @@ import { acrossElements } from "../test/assert";
 import type { Answer } from "../test/harness";
 import {
   answersFor,
+  defaultPolicyRows,
   domainsResponse,
+  manifestSectionsResponse,
   meResponse,
   renderApp,
   userFixture,
@@ -1595,14 +1597,286 @@ describe("the share dialog", () => {
     ).toBeDisabled();
   });
 
+  it("says in plain view why a locked domain cannot share", async () => {
+    const LOCKED =
+      "'eng' is read-only; its owner switches read_only off in the domain policies";
+    serve({
+      "/domains/eng/manifest": () => ({
+        domain: "eng",
+        markdown: "# eng\n",
+        sections: manifestSectionsResponse({
+          policies: defaultPolicyRows().map((row) =>
+            row.key === "read_only"
+              ? { ...row, declared: "on", effective: "on" }
+              : row,
+          ),
+        }),
+      }),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    const caption = await within(dialog).findByText(LOCKED);
+    expect(caption).toBeVisible();
+    expect(caption).not.toHaveClass("sr-only");
+    const share = within(dialog).getByRole("button", { name: "Share" });
+    expect(share).toBeDisabled();
+    expect(share).toHaveAccessibleDescription(LOCKED);
+  });
+
+  it("says to share again later when another person's proposal blocks the share", async () => {
+    serve({
+      "/domains/eng/sync": () => syncResponse({ sharing: "direct" }),
+      "/domains/eng/sync/changes": () => ({
+        action: "proposal_open",
+        number: 5,
+        url: "https://github.com/acme/knowledge/pull/5",
+        title: "Theirs",
+        own: false,
+        sharing: "direct",
+        effective_title: "",
+        changes: [{ path: "notes/a.md", kind: "modified" }],
+      }),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    expect(
+      await within(dialog).findByText(
+        "Proposal #5 (Theirs) is another person's and is still open; share again once it is merged or closed.",
+      ),
+    ).toBeVisible();
+    expect(
+      within(dialog).getByRole("button", { name: "Share" }),
+    ).toBeDisabled();
+  });
+
+  const PROTECTED_GUIDANCE =
+    "The branch main does not accept direct commits from you (Changes must be made through a pull request.). Share the same changes as a proposal instead: share_changes with as_proposal: true (crystalline origin share --proposal).";
+  // What a person reads beside the button: no tool syntax.
+  const PROTECTED_FOR_PEOPLE =
+    "The branch main does not accept direct commits from you (Changes must be made through a pull request.). Share the same changes as a proposal instead.";
+  const FELL_BACK =
+    "The branch main does not accept direct commits from you, so this share opened a proposal.";
+  const directPlan = () => ({
+    action: "commit",
+    branch: "main",
+    sharing: "direct",
+    effective_title: "t",
+    changes: [{ path: "notes/a.md", kind: "added" }],
+  });
+
+  it("offers the same share as a proposal after a refused direct commit", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    serve({
+      "/domains/eng/sync": () => syncResponse({ sharing: "direct" }),
+      "/domains/eng/sync/changes": directPlan,
+      "/domains/eng/sync/share": (_path, init) => {
+        const body = JSON.parse(
+          typeof init?.body === "string" ? init.body : "{}",
+        ) as Record<string, unknown>;
+        bodies.push(body);
+        return body.as_proposal === true
+          ? {
+              outcome: "proposed",
+              number: 12,
+              url: "https://github.com/acme/knowledge/pull/12",
+              summary: "Share 1 new engram",
+            }
+          : {
+              outcome: "branch_protected",
+              branch: "main",
+              message: "Changes must be made through a pull request.",
+              guidance: PROTECTED_GUIDANCE,
+              fallback: "proposal",
+            };
+      },
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Commit to main" }),
+    );
+    expect(await within(dialog).findByText(PROTECTED_FOR_PEOPLE)).toBeVisible();
+    expect(within(dialog).queryByText(/share_changes/)).toBeNull();
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Share as a proposal" }),
+    );
+    expect(
+      await within(dialog).findByRole("link", { name: "#12" }),
+    ).toBeVisible();
+    expect(bodies[0]).not.toHaveProperty("as_proposal");
+    expect(bodies[1]).toMatchObject({ as_proposal: true });
+    expect(
+      within(dialog).queryByRole("button", { name: "Share as a proposal" }),
+    ).toBeNull();
+  });
+
+  it("keeps the proposal offer when the proposal share itself fails", async () => {
+    serve({
+      "/domains/eng/sync": () => syncResponse({ sharing: "direct" }),
+      "/domains/eng/sync/changes": directPlan,
+      "/domains/eng/sync/share": (_path, init) => {
+        const body = JSON.parse(
+          typeof init?.body === "string" ? init.body : "{}",
+        ) as Record<string, unknown>;
+        if (body.as_proposal === true) {
+          throw new ApiProblem(
+            409,
+            "conflict",
+            "Another share is running on this domain.",
+          );
+        }
+        return {
+          outcome: "branch_protected",
+          branch: "main",
+          message: "Changes must be made through a pull request.",
+          guidance: PROTECTED_GUIDANCE,
+          fallback: "proposal",
+        };
+      },
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Commit to main" }),
+    );
+    expect(await within(dialog).findByText(PROTECTED_FOR_PEOPLE)).toBeVisible();
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Share as a proposal" }),
+    );
+
+    // The refusal is said beside the outcome it did not replace: the branch
+    // still refuses direct commits, and the offer to try again stays.
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent(
+      "Another share is running on this domain.",
+    );
+    expect(within(dialog).getByText(PROTECTED_FOR_PEOPLE)).toBeVisible();
+    expect(
+      within(dialog).getByRole("button", { name: "Share as a proposal" }),
+    ).toBeEnabled();
+    expect(reads("/domains/eng/sync/share")).toBe(2);
+  });
+
+  it("holds the proposal button down while that share is in flight", async () => {
+    let land = () => undefined as void;
+    const landed = new Promise<void>((resolve) => {
+      land = () => {
+        resolve();
+      };
+    });
+    serve({
+      "/domains/eng/sync": () => syncResponse({ sharing: "direct" }),
+      "/domains/eng/sync/changes": directPlan,
+      "/domains/eng/sync/share": async (_path, init) => {
+        const body = JSON.parse(
+          typeof init?.body === "string" ? init.body : "{}",
+        ) as Record<string, unknown>;
+        if (body.as_proposal !== true) {
+          return {
+            outcome: "branch_protected",
+            branch: "main",
+            message: "Changes must be made through a pull request.",
+            guidance: PROTECTED_GUIDANCE,
+            fallback: "proposal",
+          };
+        }
+        await landed;
+        return {
+          outcome: "proposed",
+          number: 12,
+          url: "https://github.com/acme/knowledge/pull/12",
+          summary: "Share 1 new engram",
+        };
+      },
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Commit to main" }),
+    );
+    const offer = await within(dialog).findByRole("button", {
+      name: "Share as a proposal",
+    });
+    await userEvent.click(offer);
+
+    // One proposal per press: while the first is on its way the button is
+    // grey, so a second press cannot open a second proposal.
+    await waitFor(() => {
+      expect(offer).toBeDisabled();
+    });
+    expect(reads("/domains/eng/sync/share")).toBe(2);
+
+    await act(async () => {
+      land();
+      await landed;
+    });
+    expect(
+      await within(dialog).findByRole("link", { name: "#12" }),
+    ).toBeVisible();
+    expect(reads("/domains/eng/sync/share")).toBe(2);
+  });
+
+  it("says when a share fell back to a proposal", async () => {
+    serve({
+      "/domains/eng/sync": () => syncResponse({ sharing: "direct" }),
+      "/domains/eng/sync/changes": directPlan,
+      "/domains/eng/sync/share": () => ({
+        outcome: "proposed",
+        number: 9,
+        url: "https://github.com/acme/knowledge/pull/9",
+        fell_back: true,
+        note: FELL_BACK,
+      }),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Commit to main" }),
+    );
+    expect(await within(dialog).findByText(FELL_BACK)).toBeVisible();
+    expect(within(dialog).getByRole("link", { name: "#9" })).toBeVisible();
+  });
+
+  it("says in the plan line that a share will fall back", async () => {
+    serve({
+      "/domains/eng/sync": () => syncResponse({ sharing: "direct" }),
+      "/domains/eng/sync/changes": () => ({
+        ...directPlan(),
+        note: "This share tries a direct commit first. If the branch refuses it again, it opens a proposal.",
+      }),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+    expect(
+      await within(dialog).findByText(
+        "This share tries a direct commit first. If the branch refuses it again, it opens a proposal.",
+      ),
+    ).toBeVisible();
+  });
+
   it("shows the guidance of a protected or moved branch", async () => {
     for (const receipt of [
       {
         outcome: "branch_protected",
         branch: "main",
         message: "Changes must be made through a pull request.",
+        guidance: PROTECTED_GUIDANCE,
+      },
+      {
+        // Another person's proposal is open, so no proposal is offered.
+        outcome: "branch_protected",
+        branch: "main",
+        message: "Changes must be made through a pull request.",
         guidance:
-          "The branch main does not accept direct commits (Changes must be made through a pull request.). Set `sharing: proposal` in this domain's MANIFEST so shares open a proposal the branch's rules can review, or ask a repository admin to allow direct pushes.",
+          "The branch main does not accept direct commits from you (Changes must be made through a pull request.). Another person's proposal is open on this domain, so share again once it is merged or closed.",
       },
       {
         outcome: "branch_moved",
@@ -1632,6 +1906,10 @@ describe("the share dialog", () => {
       // Nothing was written, and the server's own words say what to do about
       // it rather than the dialog inventing a sentence per refusal.
       expect(await within(dialog).findByText(receipt.guidance)).toBeVisible();
+      // No fallback in the receipt, so no button offers a proposal.
+      expect(
+        within(dialog).queryByRole("button", { name: "Share as a proposal" }),
+      ).toBeNull();
       unmount();
     }
   });

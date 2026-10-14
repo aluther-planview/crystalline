@@ -424,6 +424,7 @@ impl Engine {
         let _admin = self.domain_admin().await;
         let _fence = self.fence_joins().await;
         self.require_domain_owner(domain, scope).await?;
+        self.refuse_read_only_domain(domain, scope).await?;
         if let Some(conflict) = self.env_domain_conflict(domain) {
             return Err(conflict);
         }
@@ -483,12 +484,21 @@ impl Engine {
             && !unshared.paths.is_empty()
         {
             return Err(EngineError::Conflict(format!(
-                "domain '{domain}' has {} unshared change(s) in its folder that the team has not \
+                "domain '{domain}' has {} in its folder that the team has not \
                  reviewed: {}. Review mode is the promise that every change is reviewed before it \
-                 lands, and this work went round it, so share or revert these first, then enable \
+                 lands, and this work went round it, so share or revert {} first, then enable \
                  review",
-                unshared.paths.len(),
-                unshared.paths.join(", ")
+                crystalline_core::text::plural(
+                    unshared.paths.len(),
+                    "unshared change",
+                    "unshared changes"
+                ),
+                unshared.paths.join(", "),
+                if unshared.paths.len() == 1 {
+                    "it"
+                } else {
+                    "these"
+                }
             )));
         }
         if previewing {
@@ -1003,6 +1013,9 @@ impl Engine {
         };
         // Record whether the entry was a file domain before removing it.
         let files_kept = !removed.is_virtual();
+        // A local copy a mount hid is gone now, so nothing hides it any more,
+        // and no server name is decided against a domain that is not there.
+        self.sync_sources_local();
 
         // Tell the runtime: drop it from the discovered overlay and stop
         // watching its root.

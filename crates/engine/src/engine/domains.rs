@@ -125,6 +125,11 @@ impl Engine {
     /// present, `false` when nothing is paused, so a list-shaped rendering of
     /// this array keeps one uniform set of columns.
     ///
+    /// `read_only` is the exception to that rule: a row carries
+    /// `read_only: true` only when this caller cannot write in the domain
+    /// ([`Engine::write_block`] is `Some`), and leaves the key out otherwise,
+    /// never `false` (spec A-5).
+    ///
     /// The rows come back sorted by name, case-insensitively, so the sidebar
     /// and the CLI inherit one order rather than settling it three times.
     /// Registration order is what the config map preserves and it is
@@ -141,6 +146,10 @@ impl Engine {
         scope: &crate::scope::Scope,
     ) -> Result<Value> {
         let (private, hidden) = self.visibility_for(scope).await?;
+        // A local domain a connected server hides is not listed while it is
+        // hidden (decision D19); the mounted domain is listed by the router.
+        let mut hidden = hidden;
+        hidden.extend(self.shadowed_domains());
         let store = self.store.lock().await;
         let stats = store.domain_stats().await.unwrap_or_default();
         drop(store);
@@ -173,6 +182,13 @@ impl Engine {
         for (name, entry) in listed {
             let source = self.source_of(entry);
             let s = stats.iter().find(|d| &d.name == name);
+            // Whether THIS caller can write here (spec A-5): the domain lock, a
+            // viewer's role or a domain off the caller's write list all say
+            // no. Asked through the write gate's own answer, so the MCP open
+            // tier, which writes through its carve-out, is marked only where
+            // the domain is locked or reviews changes. One rights question
+            // per row.
+            let blocked = self.write_block(scope, name).await?.is_some();
             let mut obj = json!({
                 "name": name,
                 "kind": if entry.is_virtual() { "virtual" } else { "file" },
@@ -218,6 +234,12 @@ impl Engine {
                         .is_some_and(|holder| !hidden.contains(holder)),
                 "renaming": self.is_renaming(name),
             });
+            // Present only when true: "you cannot write here", for whatever
+            // reason; a writable row keeps the columns it always had. Not the
+            // top-level `read_only` other answers carry for the instance.
+            if blocked {
+                obj["read_only"] = json!(true);
+            }
             // What THIS caller is holding in a domain that reviews changes, so
             // a screen can say "you have work waiting here" off the listing it
             // already reads. It rides here rather than only on the domain's
@@ -264,6 +286,35 @@ impl Engine {
         Ok(json!({ "domains": out }))
     }
 
+    /// The domains this machine offers from connected servers, for a screen
+    /// that lists them and links to each server's own Fluid (decision D23).
+    /// Names and addresses only, taken from this machine's own
+    /// `sources.json`: nothing a server sent, and nothing is forwarded.
+    /// `web_url` is `null` unless the address is plain http or https.
+    pub fn mounted_listing(&self) -> Value {
+        let Some(sources) = self.sources() else {
+            return json!([]);
+        };
+        let table = sources.table();
+        Value::Array(
+            table
+                .mounts
+                .iter()
+                .filter_map(|m| {
+                    let url = sources.source_url(&m.source)?;
+                    let (url, web_url) = public_source_address(&url, &m.remote);
+                    Some(json!({
+                        "name": m.local,
+                        "source": m.source,
+                        "source_url": url,
+                        "remote_name": m.remote,
+                        "web_url": web_url,
+                    }))
+                })
+                .collect(),
+        )
+    }
+
     /// One domain's MANIFEST markdown, read through the same source its routing
     /// bullets are read through: a file domain's `MANIFEST.md` on disk, a
     /// virtual domain's MANIFEST engram in the database.
@@ -296,12 +347,42 @@ impl Engine {
                 let store = self.store.lock().await;
                 let content = match store.find_engram(domain, "manifest").await? {
                     Some(d) => store.engram_content(d.domain_id, &d.path).await?,
-                    None => None,
+                    // A row at the path under another permalink is the
+                    // MANIFEST all the same, and it is the row
+                    // `save_manifest` compares against: read it the same
+                    // way, so the editor is handed the checksum a save
+                    // accepts rather than the empty text's.
+                    None => match store.domain_id(domain).await? {
+                        Some(domain_id) => store.engram_content(domain_id, "MANIFEST.md").await?,
+                        None => None,
+                    },
                 };
                 content.ok_or_else(|| {
                     EngineError::NotFound(format!("domain '{domain}' has no MANIFEST engram yet"))
                 })
             }
+        }
+    }
+
+    /// [`Engine::manifest_markdown`] for the editor: a domain that carries no
+    /// MANIFEST yet answers `missing: true` with empty markdown instead of a
+    /// `NotFound`, on file and virtual domains alike. An unregistered domain
+    /// still errors with the registered set named.
+    ///
+    /// Built on `manifest_markdown` because its only `NotFound`s are the two
+    /// "no MANIFEST yet" answers; `content_source` fails with
+    /// `UnknownDomain`, never `NotFound`.
+    pub async fn manifest_source(&self, domain: &str) -> Result<ManifestSource> {
+        match self.manifest_markdown(domain).await {
+            Ok(markdown) => Ok(ManifestSource {
+                markdown,
+                missing: false,
+            }),
+            Err(EngineError::NotFound(_)) => Ok(ManifestSource {
+                markdown: String::new(),
+                missing: true,
+            }),
+            Err(e) => Err(e),
         }
     }
 
@@ -317,11 +398,22 @@ impl Engine {
     /// `routing_text` at request time, so a file-domain save has nothing in
     /// the cache to refresh. Calling it unconditionally keeps this call site
     /// correct without the caller needing to know which kind answered.
+    ///
+    /// A MANIFEST that is not there yet reads as the empty text (see
+    /// [`Engine::manifest_source`]), so a save whose `expected_checksum` is
+    /// the checksum of the empty text creates it: the file for a file
+    /// domain, the `MANIFEST.md` row for a virtual one. Any other token is a
+    /// stale edit, and so is a second create with the empty token.
+    ///
+    /// `scope` decides the read-only screen and the switch-on (decision D10):
+    /// on a read-only domain the editor is refused like every other write,
+    /// and an off-to-on MANIFEST is the owner's or an instance admin's.
     pub async fn save_manifest(
         &self,
         domain: &str,
         markdown: &str,
         expected_checksum: &str,
+        scope: &crate::scope::Scope,
     ) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
@@ -344,8 +436,14 @@ impl Engine {
                     .into(),
             ));
         }
+        // The MANIFEST editor writes the whole document, so on a read-only
+        // domain it is refused like every other write; the switch-off goes
+        // through the domain policies, which is what the sentence says.
+        self.refuse_read_only_domain(domain, scope).await?;
+        self.refuse_read_only_switch_on(domain, markdown, scope)
+            .await?;
 
-        let rel = match self.content_source(domain)? {
+        let (rel, created) = match self.content_source(domain)? {
             ContentSource::File { root } => {
                 let path = root.join("MANIFEST.md");
                 // The same compare-then-write section `save_engram` holds, for
@@ -353,14 +451,12 @@ impl Engine {
                 // their token fresh. See `Engine::write_lock`.
                 let lock = self.write_lock(&path);
                 let _guard = lock.lock().await;
+                // A MANIFEST that is not there reads as the empty text, so
+                // the token a client was handed for it is the checksum of
+                // nothing, and a save carrying it creates the file.
                 let current = match std::fs::read_to_string(&path) {
-                    Ok(source) => source,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        return Err(EngineError::NotFound(format!(
-                            "domain '{domain}' has no MANIFEST.md at {}",
-                            path.display()
-                        )));
-                    }
+                    Ok(source) => Some(source),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
                     Err(source) => {
                         return Err(EngineError::Io {
                             path: path.display().to_string(),
@@ -368,7 +464,7 @@ impl Engine {
                         });
                     }
                 };
-                let found = sha256_hex(current.as_bytes());
+                let found = sha256_hex(current.as_deref().unwrap_or("").as_bytes());
                 if found != expected_checksum {
                     return Err(EngineError::Conflict(stale_edit_message(
                         expected_checksum,
@@ -382,30 +478,62 @@ impl Engine {
                     .await?;
                 self.reindex_file(&*store, domain_id, &root, "MANIFEST.md")
                     .await?;
-                "MANIFEST.md".to_string()
+                ("MANIFEST.md".to_string(), current.is_none())
             }
             ContentSource::Virtual => {
+                // One store guard from the lookup to the write, so two creates
+                // in this process cannot both find the row absent.
                 let store = self.store.lock().await;
-                let desc = store
-                    .find_engram(domain, "manifest")
-                    .await?
-                    .ok_or_else(|| {
-                        EngineError::NotFound(format!(
-                            "domain '{domain}' has no MANIFEST engram yet"
-                        ))
-                    })?;
-                let stamp = virtual_stamp(markdown);
-                self.index_markdown(
-                    &*store,
-                    desc.domain_id,
-                    &desc.path,
-                    markdown,
-                    stamp,
-                    Some(expected_checksum),
-                    true,
-                )
-                .await?;
-                desc.path
+                match store.find_engram(domain, "manifest").await? {
+                    Some(desc) => {
+                        let stamp = virtual_stamp(markdown);
+                        self.index_markdown(
+                            &*store,
+                            desc.domain_id,
+                            &desc.path,
+                            markdown,
+                            stamp,
+                            Some(expected_checksum),
+                            true,
+                        )
+                        .await?;
+                        (desc.path, false)
+                    }
+                    None => {
+                        let domain_id = store
+                            .upsert_domain(domain, None, DomainKind::Virtual)
+                            .await?;
+                        // A row at the path under another permalink is a
+                        // MANIFEST all the same: comparing against its text
+                        // keeps a create from overwriting it unguarded.
+                        let current = store
+                            .engram_content(domain_id, "MANIFEST.md")
+                            .await?
+                            .unwrap_or_default();
+                        let found = sha256_hex(current.as_bytes());
+                        if found != expected_checksum {
+                            return Err(EngineError::Conflict(stale_edit_message(
+                                expected_checksum,
+                                &found,
+                            )));
+                        }
+                        let stamp = virtual_stamp(markdown);
+                        // No expected checksum: there is no row for the
+                        // store's compare and swap to compare against, and the
+                        // guard above already did the comparison.
+                        self.index_markdown(
+                            &*store,
+                            domain_id,
+                            "MANIFEST.md",
+                            markdown,
+                            stamp,
+                            None,
+                            true,
+                        )
+                        .await?;
+                        ("MANIFEST.md".to_string(), true)
+                    }
+                }
             }
         };
 
@@ -429,7 +557,11 @@ impl Engine {
             domain: domain.to_string(),
             permalink,
             path: rel,
-            kind: ChangeKind::Modified,
+            kind: if created {
+                ChangeKind::Added
+            } else {
+                ChangeKind::Modified
+            },
             from: None,
             checksum: Some(sha256_hex(markdown.as_bytes())),
             actor: None,
@@ -470,6 +602,10 @@ impl Engine {
     /// Answers `{ domain, markdown, draft }`: the MANIFEST as it now reads for
     /// this caller, and whether that is their draft rather than the domain's.
     ///
+    /// The open tier passes where `edit_engram` writes (see
+    /// `Engine::require_policy_writer`); REST asks for an account first, so it
+    /// never reaches that branch.
+    ///
     /// [`DomainRight::Own`]: crate::scope::DomainRight::Own
     pub async fn set_manifest_policies(
         &self,
@@ -477,89 +613,14 @@ impl Engine {
         changes: &[(String, String)],
         scope: &crate::scope::Scope,
     ) -> Result<Value> {
-        if self.read_only {
-            return Err(EngineError::ReadOnly);
-        }
-        if changes.is_empty() {
-            return Err(EngineError::Invalid(
-                "no policy named: send an object of at least one MANIFEST policy key to its value"
-                    .to_string(),
-            ));
-        }
-        let registry = crystalline_core::policy_registry();
-        for (key, value) in changes {
-            let Some(spec) = registry.iter().find(|spec| spec.key == key) else {
-                let known: Vec<&str> = registry.iter().map(|spec| spec.key).collect();
-                return Err(EngineError::Invalid(format!(
-                    "`{key}` is not a MANIFEST policy; the policy keys are {}",
-                    known.join(", ")
-                )));
-            };
-            if spec.kind == crystalline_core::PolicyKind::Text {
-                return Err(EngineError::Invalid(format!(
-                    "`{key}` changes through a rename, which also moves this machine's name and rewrites links: use Rename domain on the domain page or `crystalline domain rename {domain} <new>`"
-                )));
-            }
-            if !spec.accepts(value) {
-                return Err(EngineError::Invalid(format!(
-                    "`{key}: {value}` is not a value `{key}` takes; write one of {}",
-                    spec.values.join(", ")
-                )));
-            }
-            if spec.changed_by == crystalline_core::PolicyRole::Owner {
-                self.require_domain_owner_refusing(
-                    domain,
-                    scope,
-                    EngineError::Forbidden(format!(
-                        "only the owner of '{domain}' or an instance admin may change `{key}`"
-                    )),
-                )
-                .await?;
-            }
-        }
-        let view = DomainView::for_write(self, domain, scope).await?;
-        let overlay = view.actor().map(str::to_string);
-        let actor = self.actor_for(None, overlay.as_deref());
-        let (desc, source) = view.resolve("manifest").await?;
-        let edits: Vec<(String, String)> = changes.to_vec();
-        self.apply_source_edit(
-            &desc,
-            &source,
-            &view,
-            None,
-            &actor,
-            None,
-            scope,
-            move |current| {
-                let mut out = current.to_string();
-                for (key, value) in &edits {
-                    out = set_frontmatter_field(&out, key, value);
-                }
-                Ok(out)
-            },
-        )
-        .await?;
-        self.refresh_routing_cache().await;
-        let markdown = match overlay.as_deref() {
-            None => self.manifest_markdown(domain).await?,
-            Some(who) => {
-                let store = self.store.lock().await;
-                store
-                    .overlay_entry(desc.domain_id, who, &desc.path)
-                    .await?
-                    .map(|row| row.content)
-                    .ok_or_else(|| {
-                        EngineError::Internal(
-                            "the MANIFEST draft was written and cannot be read back".to_string(),
-                        )
-                    })?
-            }
-        };
-        Ok(json!({
-            "domain": domain,
-            "markdown": markdown,
-            "draft": overlay.is_some(),
-        }))
+        let edits: Vec<PolicyEdit> = changes
+            .iter()
+            .map(|(key, value)| PolicyEdit::Set {
+                key: key.clone(),
+                value: value.clone(),
+            })
+            .collect();
+        self.edit_manifest_policies(domain, &edits, scope).await
     }
 
     /// Routing bullets for one virtual domain, read from its `MANIFEST.md`
@@ -594,8 +655,8 @@ impl Engine {
     /// disk keeps navigating statically after a mutation or a sync.
     ///
     /// Silently does nothing for a virtual domain (no files to navigate), for a
-    /// read-only engine (the curating side owns the index files) and while the
-    /// `index.files` setting is off. The pass itself is idempotent: a
+    /// read-only engine (the curating side owns the index files), for a
+    /// read-only domain and while the `index.files` setting is off. The pass itself is idempotent: a
     /// regeneration that renders the same bytes writes nothing, so an unchanged
     /// index file keeps its mtime and the watcher stays quiet. Failures are
     /// logged, never propagated: a generated navigation file is a convenience,
@@ -608,6 +669,13 @@ impl Engine {
         let ContentSource::File { root } = self.read_source(domain) else {
             return;
         };
+        // Nothing is written into a read-only domain, and a listing
+        // regenerated after a pull would be an unshared change that can never
+        // be shared. A file domain, so this is a MANIFEST read and never the
+        // store lock.
+        if self.domain_is_read_only(domain).await {
+            return;
+        }
         let name = domain.to_string();
         // A full walk plus one read per engram is blocking IO, so it runs on the
         // blocking pool rather than on a runtime worker.
@@ -684,8 +752,36 @@ impl Engine {
     /// `None` branch below. So the re-read stays for as long as `domain add`
     /// is a mutation path that does not refresh `self.config`, and
     /// [`Engine::registered_domain_entries`] is the same rule for the listing.
+    ///
+    /// On a machine with connected servers the block also lists every
+    /// mounted domain, after every local one and in mount-table order, and
+    /// leaves out each local domain a mount hides (decision D25). With
+    /// nothing mounted it is the same bytes as on a machine with no source.
     pub fn routing_text(&self) -> String {
-        crystalline_core::render_instructions(&self.routing_output(&HashSet::new()))
+        let mut output = self.routing_output(&self.shadowed_domains());
+        self.append_mounts(&mut output);
+        crystalline_core::render_instructions(&output)
+    }
+
+    /// Every mounted domain as a routing row, after the rows already in
+    /// `output` and in mount-table order. Nothing when nothing is mounted.
+    fn append_mounts(&self, output: &mut crystalline_core::PromptOutput) {
+        if let Some(sources) = self.sources() {
+            output
+                .domains
+                .extend(
+                    sources
+                        .table()
+                        .mounts
+                        .iter()
+                        .map(|m| crystalline_core::PromptDomain {
+                            name: m.local.clone(),
+                            bullets: m.bullets.clone(),
+                            preferred: false,
+                            read_only: m.domain_read_only,
+                        }),
+                );
+        }
     }
 
     /// [`Engine::routing_text`] with the domain lines replaced by the count
@@ -766,8 +862,32 @@ impl Engine {
                 .collect()
         };
         let mut output = crystalline_core::generate_prompt_unscoped(&global, &virtual_bullets);
+        // A file domain's lock came off its MANIFEST in core; a virtual
+        // one's is in the cache the same refresh fills for its bullets. The
+        // scoped blocks then mark per caller (`mark_unwritable_rows`).
+        let locked = self.virtual_read_only.read().unwrap().clone();
+        for domain in &mut output.domains {
+            if locked.contains(&domain.name) {
+                domain.read_only = true;
+            }
+        }
         output.read_only = self.read_only();
         output
+    }
+
+    /// Mark every local routing row `scope` cannot write in as read-only:
+    /// the lock, a viewer's role, a domain off the caller's write list (spec
+    /// A-5, B-6), from the same `write_block` the listing asks. Mounted rows
+    /// are appended after this and keep what their server said (Task 19).
+    async fn mark_unwritable_rows(
+        &self,
+        output: &mut crystalline_core::PromptOutput,
+        scope: &crate::scope::Scope,
+    ) -> Result<()> {
+        for domain in &mut output.domains {
+            domain.read_only = self.write_block(scope, &domain.name).await?.is_some();
+        }
+        Ok(())
     }
 
     /// [`Engine::routing_text`] for a caller who may not see every domain: the
@@ -788,11 +908,44 @@ impl Engine {
     /// era's own instructions channel (`server/discover`) does carry a request
     /// context, and the `onboarding` prompt carries one too, so both are
     /// scoped through here.
+    ///
+    /// Each domain this caller cannot write is marked (read-only).
     pub async fn routing_text_scoped(&self, scope: &crate::scope::Scope) -> Result<String> {
         let hidden = self.hidden_for(scope).await?;
-        Ok(crystalline_core::render_instructions(
-            &self.routing_output(&hidden),
-        ))
+        let mut output = self.routing_output(&hidden);
+        self.mark_unwritable_rows(&mut output, scope).await?;
+        Ok(crystalline_core::render_instructions(&output))
+    }
+
+    /// [`Engine::routing_text_scoped`] for this machine's owner: the same
+    /// block with every mounted domain appended, as [`Engine::routing_text`]
+    /// appends them (decision D25). Only an owner session asks for it (a
+    /// stdio MCP session); an HTTP session never sees a mounted domain, so
+    /// the caller decides by the transport, never by the scope (decision
+    /// D8). With nothing mounted it is the same bytes as the scoped block.
+    pub async fn routing_text_scoped_with_mounts(
+        &self,
+        scope: &crate::scope::Scope,
+    ) -> Result<String> {
+        let hidden = self.hidden_for(scope).await?;
+        let mut output = self.routing_output(&hidden);
+        self.mark_unwritable_rows(&mut output, scope).await?;
+        self.append_mounts(&mut output);
+        Ok(crystalline_core::render_instructions(&output))
+    }
+
+    /// The routing model `scope` may see, for a client that renders the block
+    /// itself: a connected Crystalline's session-start hook, which has no
+    /// MANIFEST on disk to read. The same model [`Engine::routing_text_scoped`]
+    /// renders, minus the rendering.
+    pub async fn routing_model_scoped(
+        &self,
+        scope: &crate::scope::Scope,
+    ) -> Result<crystalline_core::PromptOutput> {
+        let hidden = self.hidden_for(scope).await?;
+        let mut output = self.routing_output(&hidden);
+        self.mark_unwritable_rows(&mut output, scope).await?;
+        Ok(output)
     }
 
     // --- browse --------------------------------------------------------------
@@ -892,13 +1045,77 @@ impl Engine {
             })
             .collect();
 
-        Ok(json!({
+        let mut out = json!({
             "domain": p.domain,
             "path": raw,
             "folders": level.folders,
             "engrams": entries,
             "truncated": truncated,
             "total": level.total,
-        }))
+        });
+        // `read_only: true` when this caller cannot write in the domain (spec
+        // A-5), the same answer the listing's row gives; left out otherwise.
+        if self.write_block(scope, &p.domain).await?.is_some() {
+            out["read_only"] = json!(true);
+        }
+        Ok(out)
+    }
+}
+
+/// What a listing may say of a source's address: the address without any
+/// userinfo, query or fragment, and the remote domain's page on it. A
+/// `sources.json` that was edited by hand can carry credentials or a scheme
+/// that is not http or https; those never reach an answer, so an address
+/// that cannot be made safe comes back empty with no page.
+fn public_source_address(raw: &str, remote: &str) -> (String, Option<String>) {
+    let Ok(mut parsed) = url::Url::parse(raw) else {
+        return (String::new(), None);
+    };
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return (String::new(), None);
+    }
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    let base = parsed.as_str().trim_end_matches('/').to_string();
+    let page = crate::web_url::domain_url(&base, remote);
+    (base, Some(page))
+}
+
+#[cfg(test)]
+mod public_address_tests {
+    use super::public_source_address;
+
+    #[test]
+    fn credentials_never_reach_a_listing() {
+        let (url, page) = public_source_address("https://user:pass@kb.acme.com/", "jordi");
+        assert_eq!(url, "https://kb.acme.com");
+        assert_eq!(page.as_deref(), Some("https://kb.acme.com/d/jordi"));
+        let (url, page) = public_source_address("https://tok@kb.acme.com", "j");
+        assert!(!url.contains("tok") && !page.unwrap().contains("tok"));
+    }
+
+    #[test]
+    fn a_query_or_fragment_is_dropped_and_a_slash_trimmed() {
+        let (url, page) = public_source_address("http://kb.local:8080/x//?a=b#c", "j");
+        assert_eq!(url, "http://kb.local:8080/x");
+        assert_eq!(page.as_deref(), Some("http://kb.local:8080/x/d/j"));
+    }
+
+    #[test]
+    fn another_scheme_or_garbage_has_no_address_and_no_page() {
+        assert_eq!(
+            public_source_address("javascript:alert(1)", "j"),
+            (String::new(), None)
+        );
+        assert_eq!(
+            public_source_address("ftp://u:p@h/", "j"),
+            (String::new(), None)
+        );
+        assert_eq!(
+            public_source_address("not a url", "j"),
+            (String::new(), None)
+        );
     }
 }

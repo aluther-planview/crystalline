@@ -12,6 +12,8 @@ use crystalline_service::Scope;
 use crystalline_service::params::{ListDomainsParams, ReadParams, SearchParams, ValidateParams};
 use tokio::sync::Mutex;
 
+const OFF_RECORD: &str = "---\ntype: engram\ntitle: Gamma\npermalink: gamma\ntags:\n  - eng\nstatus: weird\n---\n\n# Gamma\n\nNo date.\n";
+const OVERRIDES: &str = "verify:\n  rules:\n    T001: warning\n    T002: off\n";
 const ALPHA: &str = "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Alpha\n\nA rule about alpha.\n";
 const BETA: &str = "---\ntype: engram\ntitle: Beta\npermalink: beta\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-01-02\n---\n\n# Beta\n\nThe beta rule.\n";
 const MANIFEST: &str = "---\ntype: manifest\ntitle: eng\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# eng\n\n## Scope\n\n- Everything about eng\n\n## When to Use\n\n- Route here for eng questions\n";
@@ -985,6 +987,64 @@ async fn a_grandfathered_name_is_re_added_without_error() {
     assert_eq!(report["adopted"], true, "{report}");
 }
 
+/// A name registered at another folder is refused before anything touches the
+/// disk: neither an explicit folder nor the default `<domains_root>/<name>`
+/// is created.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_add_creates_no_folder() {
+    let (tmp, engine) = engine().await;
+
+    let elsewhere = tmp.path().join("elsewhere");
+    let err = engine
+        .domain_add_local(Some("eng"), Some(elsewhere.to_str().unwrap()))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("already registered at a different folder"),
+        "{err}"
+    );
+    assert!(!elsewhere.exists(), "the refused folder was never created");
+
+    let err = engine
+        .domain_add_local(Some("eng"), None)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("already registered at a different folder"),
+        "{err}"
+    );
+    assert!(
+        !tmp.path().join("domains-root").join("eng").exists(),
+        "the default folder was never created either"
+    );
+}
+
+/// A name another process registered in the file after this engine read its
+/// snapshot is refused under the file guard, never overwritten.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_virtual_add_re_checks_the_file_under_its_guard() {
+    let (tmp, engine) = engine().await;
+    let config_path = tmp.path().join("config.yaml");
+    let dir = tmp.path().join("notes");
+    std::fs::create_dir_all(&dir).unwrap();
+    // On disk only: the engine's in-memory configuration does not hold it.
+    let mut file: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
+    file.domains
+        .insert("notes".to_string(), DomainEntry::file(dir.clone()));
+    crystalline_core::config::save_yaml(&config_path, &file).unwrap();
+
+    let err = engine.domain_add_virtual("notes").await.unwrap_err();
+    assert!(err.to_string().contains("is a file domain"), "{err}");
+    let after: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
+    assert!(
+        !after.domains["notes"].is_virtual(),
+        "the file entry still stands: {:?}",
+        after.domains["notes"]
+    );
+}
+
 /// validate_engrams reads the domain's `.crystalline.yaml` through the same
 /// loader `crystalline verify` does, so a typo there is reported the same way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1017,4 +1077,182 @@ async fn validate_reports_a_verify_config_typo_as_m108() {
     assert_eq!(m108.len(), 1, "{report}");
     assert_eq!(m108[0]["path"], ".crystalline.yaml");
     assert!(m108[0]["message"].as_str().unwrap().contains("'of'"));
+}
+
+/// validate_engrams applies the domain's overrides the way `crystalline
+/// verify` does: `off` removes a rule's findings, a severity word re-ranks
+/// them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn validate_honours_the_domains_rule_overrides() {
+    let (tmp, engine) = engine().await;
+    std::fs::write(tmp.path().join("eng/gamma.md"), OFF_RECORD).unwrap();
+    std::fs::write(tmp.path().join("eng/.crystalline.yaml"), OVERRIDES).unwrap();
+    engine.sync(None).await.unwrap();
+
+    let report = engine
+        .validate_engrams(
+            &ValidateParams {
+                domain: "eng".to_string(),
+                identifier: None,
+                engram_type: None,
+                drift: false,
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    let issues = report["issues"].as_array().unwrap();
+    let t001: Vec<_> = issues.iter().filter(|i| i["kind"] == "T001").collect();
+    assert!(!t001.is_empty(), "{report}");
+    assert!(t001.iter().all(|i| i["severity"] == "warning"), "{report}");
+    assert!(issues.iter().all(|i| i["kind"] != "T002"), "{report}");
+}
+
+/// A non-word override value beside a valid one: the bad entry is one M108
+/// finding naming its rule, and the valid entry still applies. One bad line
+/// never takes the rest of the file with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn validate_keeps_a_valid_override_beside_a_non_word_one() {
+    let (tmp, engine) = engine().await;
+    std::fs::write(tmp.path().join("eng/gamma.md"), OFF_RECORD).unwrap();
+    std::fs::write(
+        tmp.path().join("eng/.crystalline.yaml"),
+        "verify:\n  rules:\n    T001: warning\n    E007: 1\n",
+    )
+    .unwrap();
+    engine.sync(None).await.unwrap();
+
+    let report = engine
+        .validate_engrams(
+            &ValidateParams {
+                domain: "eng".to_string(),
+                identifier: None,
+                engram_type: None,
+                drift: false,
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    let issues = report["issues"].as_array().unwrap();
+    let m108: Vec<_> = issues.iter().filter(|i| i["kind"] == "M108").collect();
+    assert_eq!(m108.len(), 1, "{report}");
+    assert!(
+        m108[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("E007: the value must be a word"),
+        "{report}"
+    );
+    let t001: Vec<_> = issues.iter().filter(|i| i["kind"] == "T001").collect();
+    assert!(!t001.is_empty(), "{report}");
+    assert!(
+        t001.iter().all(|i| i["severity"] == "warning"),
+        "the valid override beside the bad one still applies: {report}"
+    );
+}
+
+/// M108 is a rule like any other: the file's own override re-ranks it or
+/// turns it off, on the engine route as in `crystalline verify`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn validate_applies_the_override_of_m108_itself() {
+    let (tmp, engine) = engine().await;
+    let validate = || async {
+        engine
+            .validate_engrams(
+                &ValidateParams {
+                    domain: "eng".to_string(),
+                    identifier: None,
+                    engram_type: None,
+                    drift: false,
+                },
+                &Scope::Unrestricted,
+            )
+            .await
+            .unwrap()
+    };
+    let m108 = |report: &serde_json::Value| -> Vec<serde_json::Value> {
+        report["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|i| i["kind"] == "M108")
+            .cloned()
+            .collect()
+    };
+
+    std::fs::write(
+        tmp.path().join("eng/.crystalline.yaml"),
+        "verify:\n  rules:\n    E007: of\n    M108: error\n",
+    )
+    .unwrap();
+    let report = validate().await;
+    let found = m108(&report);
+    assert_eq!(found.len(), 1, "{report}");
+    assert_eq!(
+        found[0]["severity"], "error",
+        "re-ranked by its own override: {report}"
+    );
+
+    std::fs::write(
+        tmp.path().join("eng/.crystalline.yaml"),
+        "verify:\n  rules:\n    E007: of\n    M108: off\n",
+    )
+    .unwrap();
+    let report = validate().await;
+    assert!(
+        m108(&report).is_empty(),
+        "turned off by its own override: {report}"
+    );
+}
+
+/// validate_engrams reports E011 for a custom field the metadata index cannot
+/// hold, and a domain override turns it off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn validate_warns_about_frontmatter_the_index_cannot_hold() {
+    let (tmp, engine) = engine().await;
+    let long = format!(
+        "---\ntype: engram\ntitle: Gamma\npermalink: gamma\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-01-01\nnote: {}\n---\n\n# Gamma\n\nBody.\n",
+        "v".repeat(1100)
+    );
+    std::fs::write(tmp.path().join("eng/gamma.md"), long).unwrap();
+    engine.sync(None).await.unwrap();
+    let params = ValidateParams {
+        domain: "eng".to_string(),
+        identifier: None,
+        engram_type: None,
+        drift: false,
+    };
+
+    let report = engine
+        .validate_engrams(&params, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    let e011: Vec<_> = report["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["kind"] == "E011")
+        .collect();
+    assert_eq!(e011.len(), 1, "{report}");
+    assert_eq!(e011[0]["severity"], "warning");
+    assert!(e011[0]["message"].as_str().unwrap().contains("`note`"));
+
+    std::fs::write(
+        tmp.path().join("eng/.crystalline.yaml"),
+        "verify:\n  rules:\n    E011: off\n",
+    )
+    .unwrap();
+    let report = engine
+        .validate_engrams(&params, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert!(
+        report["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|i| i["kind"] != "E011"),
+        "{report}"
+    );
 }

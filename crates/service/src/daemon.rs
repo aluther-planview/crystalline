@@ -250,6 +250,21 @@ impl Shared {
     }
 }
 
+/// See `run_serve`'s `from_task`. Answers the daemon log to write to.
+fn prepare_task_start() -> Option<std::fs::File> {
+    #[cfg(windows)]
+    // SAFETY: detaches this process from the console it was given; nothing
+    // here holds a handle to that console.
+    unsafe {
+        windows_sys::Win32::System::Console::FreeConsole();
+    }
+    if let Ok(dir) = config::state_dir() {
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::env::set_current_dir(&dir);
+    }
+    crate::instance::daemon_log_file()
+}
+
 /// Run the daemon: `crystalline serve [--daemon] [--http <addr>] [--read-only]
 /// [--take-over]`. The HTTP endpoint is on at [`DEFAULT_HTTP_ADDR`] unless it was
 /// turned off, so `--http` moves it or closes it rather than opening it; see
@@ -259,7 +274,8 @@ impl Shared {
 /// [`IDLE_EXIT_GRACE`] past its last socket session, the Claude Desktop
 /// extension's shape; see `spawn_daemon`. `breakaway_refused` says the
 /// spawner could not start this daemon outside its own job; see
-/// [`crate::runs_in`].
+/// [`crate::runs_in`]. `from_task` says Task Scheduler started it (the
+/// hidden `serve --from-task`); it implies `daemon_flag`.
 // The daemon's startup switches are flat on purpose, one clap flag each.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_serve(
@@ -273,22 +289,45 @@ pub async fn run_serve(
     take_over: bool,
     exit_when_idle: bool,
     breakaway_refused: bool,
+    from_task: bool,
 ) -> anyhow::Result<()> {
+    // A daemon Task Scheduler started: its working directory is System32,
+    // nobody reads its stderr and, as a console program, it was given a
+    // console window. So it drops the window, works in the state folder like
+    // a spawned daemon and logs to daemon.log.
+    let daemon_flag = daemon_flag || from_task;
+    let log_file = if from_task {
+        prepare_task_start()
+    } else {
+        None
+    };
     // RUST_LOG filters the daemon's log (the tracing `EnvFilter` syntax),
     // `info` when it is unset or does not parse.
-    let _ = tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .try_init();
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let _ = match log_file {
+        Some(file) => tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file))
+            .with_env_filter(filter)
+            .try_init(),
+        None => tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_env_filter(filter)
+            .try_init(),
+    };
 
     // The single load chokepoint: parse the environment overlay, resolve the
     // config path (flag, then CRYSTALLINE_CONFIG, then the default) and layer
     // the overlay over the file. A bad known variable aborts startup here with
     // a message naming it.
     let loaded = overlay::load(config_path.as_deref())?;
+    // The operator's own setup token, checked before anything binds so a
+    // token under the floor stops the start with a sentence naming the
+    // variable. Never printed or logged.
+    let configured_setup =
+        configured_setup_token(|k| std::env::var(k).ok(), |p| std::fs::read_to_string(p))
+            .map_err(anyhow::Error::msg)?;
     let read_only = read_only || loaded.effective.read_only();
     let db_path = resolve_db(db.as_deref())?;
     let http_addr = resolve_http(http_flag.as_deref(), &loaded.effective);
@@ -465,6 +504,16 @@ pub async fn run_serve(
     // every other domain is served.
     engine.finish_leftover_rename().await;
 
+    // This machine's sources (`crystalline connect`): the mount table its
+    // owner's calls route through and the local copies it hides. Installed
+    // only now, once the rename above is done, because that recovery reads
+    // names the table could hide. Built from the caches alone, so a server
+    // that is down never holds the start up. An explicit --db or --config
+    // serves this machine's own index only.
+    if crate::client::use_daemon(db.as_deref(), config_path.as_deref()) {
+        crate::route::install_sources(&engine);
+    }
+
     // Prime the routing cache once as the HTTP baseline: every HTTP session
     // shares this engine and reads its cache at initialize, and each socket
     // connection refreshes it again in `handle_conn` before serving.
@@ -506,6 +555,25 @@ pub async fn run_serve(
         drop(sessions_rx);
     }
 
+    // Windows ends a windowless, consoleless process with the user's
+    // session and tells it nothing. A hidden window gets the session end and
+    // starts the same graceful stop `ctl shutdown` does. Every detached
+    // daemon on Windows has one, however it started, because a spawned one
+    // is ended at sign-out in the same silent way as a task-started one; a
+    // foreground `serve` keeps its console and Ctrl+C.
+    #[cfg(windows)]
+    let _session_end = if daemon_flag {
+        let stop = shared.clone();
+        crate::session_end_windows::SessionEndWindow::start(
+            &crate::session_end_windows::window_title(std::process::id()),
+            Box::new(move |reason| stop.trigger_shutdown(reason)),
+            crate::session_end::stopped_receiver(),
+            crate::session_end::ENDSESSION_WAIT,
+        )
+    } else {
+        None
+    };
+
     // The one-time first-run setup token, drawn once per serve process and only
     // when it could still be spent. Two things have to be true: the bind is one
     // somebody else can reach (on loopback the wizard is authorized by the peer
@@ -521,8 +589,14 @@ pub async fn run_serve(
     // [`setup_token_for`] and the print just below - the token is said once and
     // never written anywhere again.
     let accounts_db = crystalline_core::config::web_auth_db_path().ok();
+    // The first admin from the environment (A9), made before the token is
+    // asked about so an instance that just got its admin draws none. The store
+    // it opens is dropped inside, so `setup_token_for`'s own open is the only
+    // handle left. A refused configuration fails the start here, with a
+    // sentence that never carries the password.
+    let created_admin = crate::first_admin::seed_from_environment(accounts_db.as_deref()).await?;
     let setup_token = match http_addr.as_deref() {
-        Some(addr) => setup_token_for(addr, accounts_db.as_deref()).await,
+        Some(addr) => setup_token_for(addr, accounts_db.as_deref(), configured_setup).await,
         None => None,
     };
 
@@ -543,11 +617,20 @@ pub async fn run_serve(
             if let Some(line) = oauth_without_a_consent_page(&loaded.effective) {
                 eprintln!("crystalline warning: {line}");
             }
-            if let Some(token) = &setup_token {
-                for line in setup_token_lines(&setup_address(&loaded.effective, addr), token) {
-                    eprintln!("{line}");
+            if let Some(drawn) = &setup_token {
+                let at = setup_address(&loaded.effective, addr);
+                match drawn.shown() {
+                    Some(shown) => {
+                        for line in setup_token_lines(&at, shown) {
+                            eprintln!("{line}");
+                        }
+                    }
+                    None => eprintln!("{}", configured_setup_line(&at, drawn.var())),
                 }
             }
+        }
+        if let Some(line) = &created_admin {
+            eprintln!("{line}");
         }
         if read_only {
             eprintln!("crystalline serving read-only: content-mutating tools are disabled");
@@ -557,13 +640,25 @@ pub async fn run_serve(
                 "no domains registered yet - agents can create one with add_domain, or run: crystalline domain add <name> <path>"
             );
         }
-    } else if let (Some(addr), Some(token)) = (&http_addr, &setup_token) {
-        // Daemonized, so there is no terminal reading the banner: the same two
-        // lines go to the daemon log instead, once. Without them a backgrounded
-        // non-loopback serve would offer a first-run wizard nobody can get
-        // through and no way to find out why.
-        for line in setup_token_lines(&setup_address(&loaded.effective, addr), token) {
+    } else {
+        if let Some(line) = &created_admin {
             tracing::info!("{line}");
+        }
+        if let (Some(addr), Some(drawn)) = (&http_addr, &setup_token) {
+            // Daemonized, so there is no terminal reading the banner: the same two
+            // lines go to the daemon log instead, once. Without them a backgrounded
+            // non-loopback serve would offer a first-run wizard nobody can get
+            // through and no way to find out why. A token the operator set is
+            // named by its variable only.
+            let at = setup_address(&loaded.effective, addr);
+            match drawn.shown() {
+                Some(shown) => {
+                    for line in setup_token_lines(&at, shown) {
+                        tracing::info!("{line}");
+                    }
+                }
+                None => tracing::info!("{}", configured_setup_line(&at, drawn.var())),
+            }
         }
     }
 
@@ -678,6 +773,19 @@ pub async fn run_serve(
         });
     }
 
+    // The source poller: each connected server's routing model and
+    // maintenance status, asked through their etags every SOURCE_POLL, and a
+    // cheap look at sources.json and config.yaml every SOURCE_LOOK. A no-op
+    // on a machine with no sources. Its own task, so the start never waits
+    // on a server.
+    {
+        let e = engine.clone();
+        let rx = shared.watch();
+        tokio::spawn(async move {
+            run_source_poller(e, SOURCE_POLL, SOURCE_LOOK, rx).await;
+        });
+    }
+
     // The embed self-heal tick: re-fires the event-driven embed worker on a low
     // cadence whenever a backlog is left outstanding, so a transient provider
     // failure that consumed the worker's signal does not strand the backlog
@@ -715,7 +823,7 @@ pub async fn run_serve(
         // end on it so the drain `run_http` waits for is never held open by
         // a browser; see `rest::RestState::with_shutdown`.
         let streams_rx = shared.watch();
-        let token = setup_token.clone();
+        let token = setup_token.as_ref().map(|t| t.value().to_string());
         tokio::spawn(async move {
             // Three failure classes, three sentences, because the remedy
             // differs: the endpoint never came up at all, the address was
@@ -793,7 +901,27 @@ pub async fn run_serve(
     let store = engine.store();
     let _held = store.lock().await;
 
+    // With the store held: a sign-in refresh a source call started is
+    // waited for, with what is left of the deadline, so a token pair a
+    // server rotated is saved. The refresh touches no store.
+    departure.settle_sign_ins().await;
+
     departure.finish((!daemon_flag).then_some("crystalline stopped"))
+}
+
+/// What a departure keeps back for the steps after the sign-in settle (the
+/// removal and the exit), and so the least the watchdog never sees spent.
+const SETTLE_MARGIN: Duration = Duration::from_secs(2);
+
+/// How long a departure that began `elapsed` ago, with `deadline` in all,
+/// waits for a sign-in refresh: what is left of the deadline minus
+/// [`SETTLE_MARGIN`], and never more than half the deadline, so the wait can
+/// never be what the watchdog ends.
+fn settle_budget(deadline: Duration, elapsed: Duration) -> Duration {
+    deadline
+        .saturating_sub(elapsed)
+        .saturating_sub(SETTLE_MARGIN)
+        .min(deadline / 2)
 }
 
 /// How long a stopping daemon has from the moment it decides to stop to the
@@ -828,6 +956,9 @@ pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(10);
 /// stuck runtime cannot starve, does the same after [`SHUTDOWN_DEADLINE`] when
 /// a step never finishes, and names that step in the log.
 pub(crate) struct Departure {
+    /// When the departure began, and how long the watchdog gives it.
+    began: Instant,
+    deadline: Duration,
     /// The step in progress, for the watchdog's line.
     step: Arc<std::sync::Mutex<&'static str>>,
     /// The ownership, shared with the watchdog so whichever of the two ends
@@ -842,6 +973,8 @@ impl Departure {
     /// so first.
     pub(crate) fn begin(ownership: crate::instance::Ownership, deadline: Duration) -> Departure {
         let departure = Departure {
+            began: Instant::now(),
+            deadline,
             step: Arc::new(std::sync::Mutex::new("starting")),
             ownership: Arc::new(std::sync::Mutex::new(Some(ownership))),
         };
@@ -882,6 +1015,16 @@ impl Departure {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = name;
     }
 
+    /// Wait for every sign-in refresh this process started, with what is
+    /// left of the deadline ([`settle_budget`]), so a token pair a server
+    /// rotated is saved before the exit. Called after the store is held, so
+    /// a refresh that never ends costs this wait and never the store step.
+    pub(crate) async fn settle_sign_ins(&self) {
+        self.step("saving a refreshed sign-in");
+        let budget = settle_budget(self.deadline, self.began.elapsed());
+        crystalline_remote::settle_refreshes(budget).await;
+    }
+
     /// Remove the record, the socket and the lock file, print `farewell` to
     /// stderr when there is one, and exit with status 0.
     pub(crate) fn finish(self, farewell: Option<&str>) -> ! {
@@ -894,6 +1037,9 @@ impl Departure {
         if let Some(line) = farewell {
             eprintln!("{line}");
         }
+        // A window procedure holding WM_ENDSESSION may now let Windows end
+        // the session: nothing of the index is in use any more.
+        crate::session_end::notify_stopped();
         exit_now();
     }
 }
@@ -1378,16 +1524,111 @@ async fn run_http(
 /// 32 hex characters is 128 bits from the same OS CSPRNG the session tokens
 /// are drawn from - a one-shot secret a human retypes off a terminal, not a
 /// stored credential.
-async fn setup_token_for(addr: &str, accounts: Option<&Path>) -> Option<String> {
+///
+/// A token the operator set ([`configured_setup_token`]) is handed out under
+/// the same two conditions in place of a minted one.
+async fn setup_token_for(
+    addr: &str,
+    accounts: Option<&Path>,
+    configured: Option<SetupToken>,
+) -> Option<SetupToken> {
     if bind_is_loopback(addr) {
         return None;
     }
     if an_account_already_exists(accounts).await {
         return None;
     }
+    if let Some(configured) = configured {
+        return Some(configured);
+    }
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).expect("the OS CSPRNG is available");
-    Some(crystalline_index::hex_lower(&bytes))
+    Some(SetupToken::Minted(crystalline_index::hex_lower(&bytes)))
+}
+
+/// The variable an operator sets the first-run setup token with, plain or as
+/// `CRYSTALLINE_SETUP_TOKEN_FILE` for a Docker secret.
+const SETUP_TOKEN_ENV: &str = "CRYSTALLINE_SETUP_TOKEN";
+
+/// The shortest setup token an operator may set: the 128 bits a minted one
+/// carries, written as hex.
+const MIN_SETUP_TOKEN_CHARS: usize = 32;
+
+/// A first-run setup token: one this process minted, which it prints once,
+/// or one the operator set, which it never prints or logs.
+#[derive(Clone, PartialEq, Eq)]
+enum SetupToken {
+    Minted(String),
+    Configured { value: String, var: String },
+}
+
+/// Never prints the value, whichever kind it is.
+impl std::fmt::Debug for SetupToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SetupToken::Minted(_) => f.write_str("SetupToken::Minted(<redacted>)"),
+            SetupToken::Configured { var, .. } => {
+                write!(f, "SetupToken::Configured({var}, <redacted>)")
+            }
+        }
+    }
+}
+
+impl SetupToken {
+    /// What the setup route compares against.
+    fn value(&self) -> &str {
+        match self {
+            SetupToken::Minted(value) | SetupToken::Configured { value, .. } => value,
+        }
+    }
+
+    /// The value to print at startup: a minted token only.
+    fn shown(&self) -> Option<&str> {
+        match self {
+            SetupToken::Minted(value) => Some(value),
+            SetupToken::Configured { .. } => None,
+        }
+    }
+
+    /// The variable a configured token came from.
+    fn var(&self) -> &str {
+        match self {
+            SetupToken::Minted(_) => "",
+            SetupToken::Configured { var, .. } => var,
+        }
+    }
+}
+
+/// The setup token the operator set with [`SETUP_TOKEN_ENV`] or its file
+/// form, read with the shared secret rules. `Ok(None)` when neither is set.
+/// A token under [`MIN_SETUP_TOKEN_CHARS`] characters is refused naming the
+/// variable and the minimum, never the value; so is one of only whitespace,
+/// which would pass the floor and then never match a request.
+fn configured_setup_token(
+    var: impl Fn(&str) -> Option<String>,
+    read: impl Fn(&Path) -> std::io::Result<String>,
+) -> Result<Option<SetupToken>, String> {
+    let Some(source) = crystalline_core::secret_env::secret_source(SETUP_TOKEN_ENV, &var)? else {
+        return Ok(None);
+    };
+    let var = source.var().to_string();
+    let value = source.resolve(&read)?;
+    if value.trim().is_empty() {
+        return Err(format!("{var} is empty; set a real token"));
+    }
+    if value.chars().count() < MIN_SETUP_TOKEN_CHARS {
+        return Err(format!(
+            "{var} is shorter than {MIN_SETUP_TOKEN_CHARS} characters; set one with at least {MIN_SETUP_TOKEN_CHARS}"
+        ));
+    }
+    Ok(Some(SetupToken::Configured { value, var }))
+}
+
+/// The line a serve process says when the operator set the setup token: the
+/// address and the variable, never the value. Built here, like
+/// [`setup_token_lines`], so no output call spells the secret.
+fn configured_setup_line(at: &str, var: &str) -> String {
+    format!("first-run setup (create the first admin at {at}) takes the setup token from {var}")
 }
 
 /// Whether this instance already has an account, asked of the accounts database
@@ -1757,6 +1998,68 @@ pub fn http_router_with_shutdown(
     )
 }
 
+/// The whole router behind its base path: a request that carries the prefix
+/// of `service.public_url` (`/crystalline`, `/crystalline/` or
+/// `/crystalline/...`) is routed without it, and every other request is
+/// routed unchanged. So `proxy_pass http://daemon:7411/;` (the proxy strips)
+/// and `proxy_pass http://daemon:7411;` (it passes the prefix through) both
+/// work, and the bare prefix answers like the prefix with a slash, with no
+/// redirect a client would refuse to follow.
+///
+/// A service around the router rather than `Router::layer`: middleware added
+/// with `layer` runs after routing, and a rewritten path would never be
+/// routed again. Returned as a router (one fallback service) so every caller
+/// keeps serving a router. At the root nothing is wrapped, so the router is
+/// the 0.23.0 one.
+fn under_base_path(router: axum::Router, base: crystalline_core::base::BasePath) -> axum::Router {
+    if base.is_root() {
+        return router;
+    }
+    axum::Router::new().fallback_service(StripBasePath {
+        base,
+        inner: router,
+    })
+}
+
+/// See [`under_base_path`].
+#[derive(Clone)]
+struct StripBasePath {
+    base: crystalline_core::base::BasePath,
+    inner: axum::Router,
+}
+
+impl tower_service::Service<axum::extract::Request> for StripBasePath {
+    type Response = axum::response::Response;
+    type Error = std::convert::Infallible;
+    type Future = <axum::Router as tower_service::Service<axum::extract::Request>>::Future;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        tower_service::Service::<axum::extract::Request>::poll_ready(&mut self.inner, cx)
+    }
+
+    fn call(&mut self, mut request: axum::extract::Request) -> Self::Future {
+        if let Some(rest) = self.base.strip(request.uri().path()) {
+            let target = match request.uri().query() {
+                Some(query) => format!("{rest}?{query}"),
+                None => rest.to_string(),
+            };
+            // A path the router already parsed, minus a prefix of
+            // `[a-z0-9._-]` segments, is always a valid path and query.
+            if let Ok(path_and_query) = target.parse::<axum::http::uri::PathAndQuery>() {
+                let mut parts = request.uri().clone().into_parts();
+                parts.path_and_query = Some(path_and_query);
+                if let Ok(uri) = axum::http::Uri::from_parts(parts) {
+                    *request.uri_mut() = uri;
+                }
+            }
+        }
+        self.inner.call(request)
+    }
+}
+
 /// The body both router builders above share; `shutdown` is `None` for a
 /// router with no daemon behind it.
 fn http_router_inner(
@@ -1785,6 +2088,7 @@ fn http_router_inner(
         let config = engine.config();
         let api = config.api_enabled();
         let mcp_auth = config.auth_mcp().then(|| auth.clone());
+        let base_path = crate::settings::base_path(&config);
         let (router, service) = http_base(
             engine,
             http_sessions,
@@ -1795,7 +2099,7 @@ fn http_router_inner(
             mcp_auth,
             shutdown,
         )?;
-        Ok(router.fallback_service(service))
+        Ok(under_base_path(router.fallback_service(service), base_path))
     }
 }
 
@@ -1822,6 +2126,13 @@ pub fn http_router_with_assets<E: rust_embed::RustEmbed + 'static>(
     // Read here with the other two, and for the same reason: the `auth.*` keys
     // are startup-effective, so a running daemon serves the tier it started in.
     let mcp_auth = config.auth_mcp().then(|| auth.clone());
+    let base_path = crate::settings::base_path(&config);
+    if ui
+        && let Some(index) = E::get("index.html")
+        && let Some(warning) = crate::ui::untagged_bundle_warning(&index.data, &base_path)
+    {
+        tracing::warn!("{warning}");
+    }
     let (router, service) = http_base(
         engine,
         http_sessions,
@@ -1833,7 +2144,7 @@ pub fn http_router_with_assets<E: rust_embed::RustEmbed + 'static>(
         shutdown,
     )?;
     if !ui {
-        return Ok(router.fallback_service(service));
+        return Ok(under_base_path(router.fallback_service(service), base_path));
     }
     // The UI is mounted whether or not a bundle was embedded: with an empty
     // embed every navigation gets the 503 not-built page rather than falling
@@ -1849,20 +2160,24 @@ pub fn http_router_with_assets<E: rust_embed::RustEmbed + 'static>(
     // these paths is byte for byte the response the same request got before the
     // UI existed - a `get(...).fallback_service(...)` pair would decorate every
     // MCP answer at `/` with `Allow: GET,HEAD`.
-    Ok(router
-        .route(
-            "/",
-            axum::routing::any_service(service.clone())
-                .layer(axum::middleware::from_fn(serve_index::<E>)),
-        )
-        .route(
-            "/assets/{*path}",
-            axum::routing::any_service(service.clone())
-                .layer(axum::middleware::from_fn(serve_asset::<E>)),
-        )
-        .fallback_service(
-            axum::routing::any_service(service).layer(axum::middleware::from_fn(dispatch_ui::<E>)),
-        ))
+    Ok(under_base_path(
+        router
+            .route(
+                "/",
+                axum::routing::any_service(service.clone()).layer(
+                    axum::middleware::from_fn_with_state(base_path.clone(), serve_index::<E>),
+                ),
+            )
+            .route(
+                "/assets/{*path}",
+                axum::routing::any_service(service.clone())
+                    .layer(axum::middleware::from_fn(serve_asset::<E>)),
+            )
+            .fallback_service(axum::routing::any_service(service).layer(
+                axum::middleware::from_fn_with_state(base_path.clone(), dispatch_ui::<E>),
+            )),
+        base_path,
+    ))
 }
 
 /// Whether the UI may answer this request at all, which is the guard in front
@@ -1941,6 +2256,7 @@ fn http_base(
     use rmcp::transport::streamable_http_server::tower::StreamableHttpService;
 
     let config = engine.config();
+    let base_path = crate::settings::base_path(&config);
     // `auth.oauth`'s endpoints are REST routes under `/api/v1`; with the API
     // off there is nowhere for them to live, so the refusal happens here
     // rather than waiting for `RestState::new` below, which never runs when
@@ -2005,6 +2321,16 @@ fn http_base(
     // daemon started with. Installed here for the same reason: one function
     // both router builders funnel through.
     engine.set_web_origin(Arc::new(origin_rule.clone()));
+
+    // The control protocol for a connected Crystalline. Built from the same
+    // store and origin rule as the gate, and always given the store: this
+    // route needs a token even where `auth.mcp` leaves the MCP transport open.
+    let ctl = crate::remote_ctl::CtlState {
+        engine: engine.clone(),
+        auth: auth.clone(),
+        oauth: oauth.then(|| origin_rule.clone()),
+        origin_rule: origin_rule.clone(),
+    };
 
     // The session manager drives per-request stream priming (e.g. the
     // tools/list response); its own `session_config.sse_retry` default must be
@@ -2072,7 +2398,17 @@ fn http_base(
     // here". See `rest::oauth`.
     let mut router = axum::Router::new()
         .route("/health", axum::routing::get(health))
-        .merge(crate::rest::well_known_routes(oauth.then_some(origin_rule)));
+        .merge(crate::rest::well_known_routes(
+            oauth.then_some(origin_rule),
+            &base_path,
+        ))
+        // One exact path on the outer router, beside the `/api/v1` nest below.
+        // The nest mounts the JSON API under a catch-all for the prefix, and
+        // an exact path wins over a catch-all, so the API keeps every other
+        // path under `/api/v1`, never sees this one, and its session guard
+        // and CSRF check do not run here: this route has its own bearer
+        // check. Mounted whether or not the API is served.
+        .merge(crate::remote_ctl::route(ctl));
     if let Some(rest) = rest {
         router = router.nest("/api/v1", rest);
     }
@@ -2091,13 +2427,14 @@ fn http_base(
 /// narrower Accept rule applies to the app's other routes alone.
 #[cfg(feature = "fluid-ui")]
 async fn serve_index<E: rust_embed::RustEmbed>(
+    axum::extract::State(base): axum::extract::State<crystalline_core::base::BasePath>,
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     if !is_ui_fetch(&request) {
         return next.run(request).await;
     }
-    crate::ui::index_response::<E>()
+    crate::ui::index_response::<E>(&base)
 }
 
 /// `/assets/{*path}`: one content-hashed chunk, held for a year, and a plain
@@ -2124,6 +2461,7 @@ async fn serve_asset<E: rust_embed::RustEmbed>(
 /// plumbing of its own to do it.
 #[cfg(feature = "fluid-ui")]
 async fn dispatch_ui<E: rust_embed::RustEmbed>(
+    axum::extract::State(base): axum::extract::State<crystalline_core::base::BasePath>,
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
@@ -2149,7 +2487,7 @@ async fn dispatch_ui<E: rust_embed::RustEmbed>(
         }
     }
     if crate::ui::wants_spa(request.method(), accept_of(&request)) {
-        return crate::ui::index_response::<E>();
+        return crate::ui::index_response::<E>(&base);
     }
     next.run(request).await
 }
@@ -2353,6 +2691,80 @@ const POLLER_HEARTBEAT: Duration = Duration::from_secs(5);
 /// bookkeeping, jitter and per-domain pulling live in
 /// [`Engine::origin_poll_tick`], which this loop never reimplements; it only
 /// wakes it on a modest cadence and exits promptly on shutdown.
+/// How often the daemon asks its sources for their routing model and
+/// maintenance status.
+pub(crate) const SOURCE_POLL: Duration = Duration::from_secs(180);
+
+/// How often the daemon looks at `sources.json` and its own domains for a
+/// change made behind its back: a `connect` that could not tell it, or a
+/// hand edit of either file. Reads two small files; asks no server.
+pub(crate) const SOURCE_LOOK: Duration = Duration::from_secs(5);
+
+/// How long one poll waits for each source.
+const SOURCE_POLL_DEADLINE: Duration = crystalline_remote::ONE_DOMAIN_LIMIT;
+
+/// The source poller. The first poll runs right after the start, in the
+/// background; a source that failed is asked again at the next poll, and
+/// its first answer clears its failure, so nothing ever needs a restart.
+/// One poll or look runs at a time (a tick that comes due meanwhile waits),
+/// and a shutdown ends the poller at once, even in the middle of one.
+pub async fn run_source_poller(
+    engine: Arc<Engine>,
+    poll: Duration,
+    look: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    enum Due {
+        Poll,
+        Look,
+    }
+    let mut polls = tokio::time::interval(poll);
+    let mut looks = tokio::time::interval(look);
+    polls.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    looks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        let due = tokio::select! {
+            _ = wait_true(&mut shutdown) => break,
+            _ = looks.tick() => Due::Look,
+            _ = polls.tick() => Due::Poll,
+        };
+        let Some(sources) = engine.sources() else {
+            continue;
+        };
+        let work = async {
+            match due {
+                Due::Look => {
+                    // Before the empty check: the first `connect` on a
+                    // machine with no sources is one of the changes this
+                    // looks for.
+                    let reloaded = sources.reload_if_changed();
+                    if sources.is_empty() {
+                        return;
+                    }
+                    crate::route::sync_local(&engine, &sources).await;
+                    // A source just connected is asked at once, not at the
+                    // next poll.
+                    if reloaded.is_some() {
+                        sources.refresh(SOURCE_POLL_DEADLINE).await;
+                    }
+                }
+                Due::Poll => {
+                    if sources.is_empty() {
+                        return;
+                    }
+                    crate::route::sync_local(&engine, &sources).await;
+                    sources.refresh(SOURCE_POLL_DEADLINE).await;
+                    sources.refresh_hook_status(SOURCE_POLL_DEADLINE).await;
+                }
+            }
+        };
+        tokio::select! {
+            _ = wait_true(&mut shutdown) => break,
+            _ = work => {}
+        }
+    }
+}
+
 async fn run_origin_poller(engine: Arc<Engine>, mut shutdown: watch::Receiver<bool>) {
     let mut ticker = tokio::time::interval(POLLER_HEARTBEAT);
     loop {
@@ -2877,7 +3289,7 @@ fn is_hidden(name: &str) -> bool {
 /// is what makes the UI zero-config. `serve --http off` wins over everything, and
 /// `service.http: false` (or `CRYSTALLINE_SERVICE_HTTP=false`) is the config-file
 /// opt-out; every other spelling names an address or asks for the default one.
-fn resolve_http(flag: Option<&str>, config: &GlobalConfig) -> Option<String> {
+pub(crate) fn resolve_http(flag: Option<&str>, config: &GlobalConfig) -> Option<String> {
     if let Some(f) = flag {
         let f = f.trim();
         return match f {
@@ -3139,6 +3551,69 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bare `/crystalline` prefix is stripped. MCP is the router's
+    /// fallback, so a test that only checks that `/crystalline` reaches MCP
+    /// passes with or without the strip. A fallback that answers the path it
+    /// saw tells the two apart: the bare prefix arrives as `/`, a look-alike
+    /// unchanged.
+    #[tokio::test]
+    async fn the_bare_prefix_reaches_the_fallback_as_the_root() {
+        use tower_service::Service;
+        let router = axum::Router::new()
+            .route("/health", axum::routing::get(|| async { "health" }))
+            .fallback(|uri: axum::http::Uri| async move { uri.path().to_string() });
+        let wrapped = under_base_path(
+            router,
+            crystalline_core::base::BasePath::parse("/crystalline").unwrap(),
+        );
+        for (sent, seen) in [
+            ("/crystalline", "/"),
+            ("/crystalline/", "/"),
+            ("/crystalline/health", "health"),
+            ("/crystallinex", "/crystallinex"),
+        ] {
+            let response = wrapped
+                .clone()
+                .call(
+                    axum::http::Request::get(sent)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert_eq!(std::str::from_utf8(&body).unwrap(), seen, "{sent}");
+        }
+    }
+
+    /// The sign-in settle never spends what the watchdog keeps for the end
+    /// of a departure: at most half the deadline, and always the margin
+    /// short of what is left, down to nothing once the store took it all.
+    #[test]
+    fn the_sign_in_settle_never_reaches_the_watchdog() {
+        let deadline = SHUTDOWN_DEADLINE;
+        assert_eq!(settle_budget(deadline, Duration::ZERO), deadline / 2);
+        assert_eq!(
+            settle_budget(deadline, Duration::from_secs(7)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            settle_budget(deadline, Duration::from_secs(9)),
+            Duration::ZERO
+        );
+        assert_eq!(settle_budget(deadline, deadline * 2), Duration::ZERO);
+        for ms in (0..10_000).step_by(250) {
+            let elapsed = Duration::from_millis(ms);
+            let end = elapsed + settle_budget(deadline, elapsed);
+            assert!(
+                end + SETTLE_MARGIN <= deadline || settle_budget(deadline, elapsed).is_zero(),
+                "{elapsed:?}"
+            );
+        }
+    }
 
     /// Both handshake tokens parse to their gate, the verified one wins when
     /// both arrive, and a bare line or an unknown option serves everything.
@@ -4377,6 +4852,149 @@ mod tests {
         );
     }
 
+    /// The value `setup_token_for` hands the HTTP surface, with no operator
+    /// token set: the minted one.
+    async fn minted(addr: &str, accounts: Option<&Path>) -> Option<String> {
+        setup_token_for(addr, accounts, None)
+            .await
+            .map(|t| t.value().to_string())
+    }
+
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k| map.get(k).cloned()
+    }
+
+    fn no_files(_: &Path) -> std::io::Result<String> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no such file",
+        ))
+    }
+
+    const LONG: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn the_setup_token_is_read_plain_and_from_a_file() {
+        assert_eq!(configured_setup_token(env(&[]), no_files).unwrap(), None);
+        let plain = configured_setup_token(env(&[("CRYSTALLINE_SETUP_TOKEN", LONG)]), no_files)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (plain.value(), plain.var()),
+            (LONG, "CRYSTALLINE_SETUP_TOKEN")
+        );
+        let file = configured_setup_token(
+            env(&[("CRYSTALLINE_SETUP_TOKEN_FILE", "/run/secrets/setup")]),
+            |p: &Path| {
+                assert_eq!(p, Path::new("/run/secrets/setup"));
+                Ok(format!("{LONG}\r\n"))
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            (file.value(), file.var()),
+            (LONG, "CRYSTALLINE_SETUP_TOKEN_FILE")
+        );
+        let both = configured_setup_token(
+            env(&[
+                ("CRYSTALLINE_SETUP_TOKEN", LONG),
+                ("CRYSTALLINE_SETUP_TOKEN_FILE", "/run/secrets/setup"),
+            ]),
+            no_files,
+        )
+        .unwrap_err();
+        assert_eq!(
+            both,
+            "CRYSTALLINE_SETUP_TOKEN and CRYSTALLINE_SETUP_TOKEN_FILE are both set; keep one"
+        );
+    }
+
+    #[test]
+    fn a_setup_token_under_thirty_two_characters_is_refused_naming_the_variable() {
+        let short = &LONG[..31];
+        let err = configured_setup_token(env(&[("CRYSTALLINE_SETUP_TOKEN", short)]), no_files)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            "CRYSTALLINE_SETUP_TOKEN is shorter than 32 characters; set one with at least 32"
+        );
+        assert!(!err.contains(short), "the value is never repeated: {err}");
+        let err = configured_setup_token(
+            env(&[("CRYSTALLINE_SETUP_TOKEN_FILE", "/s")]),
+            |_: &Path| Ok("short\n".to_string()),
+        )
+        .unwrap_err();
+        assert!(
+            err.starts_with("CRYSTALLINE_SETUP_TOKEN_FILE is shorter than 32"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_whitespace_only_setup_token_is_refused_naming_the_variable() {
+        let blank = " ".repeat(40);
+        let err = configured_setup_token(env(&[("CRYSTALLINE_SETUP_TOKEN", &blank)]), no_files)
+            .unwrap_err();
+        assert_eq!(err, "CRYSTALLINE_SETUP_TOKEN is empty; set a real token");
+        let err = configured_setup_token(
+            env(&[("CRYSTALLINE_SETUP_TOKEN_FILE", "/s")]),
+            |_: &Path| Ok(format!("{blank}\n")),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "CRYSTALLINE_SETUP_TOKEN_FILE is empty; set a real token"
+        );
+    }
+
+    /// A set token is used where a minted one would be, and only there: a
+    /// loopback bind needs none, an instance with an account has no setup
+    /// left. It is never printed, so it is not a minted one.
+    #[tokio::test]
+    async fn a_configured_setup_token_is_used_instead_of_a_minted_one() {
+        let configured =
+            || configured_setup_token(env(&[("CRYSTALLINE_SETUP_TOKEN", LONG)]), no_files).unwrap();
+        let (dir, accounts) = accounts_db(false).await;
+        let token = setup_token_for("0.0.0.0:7411", Some(&accounts), configured())
+            .await
+            .unwrap();
+        assert_eq!(token.value(), LONG);
+        assert_eq!(token.shown(), None, "a set token is never printed");
+        assert!(
+            setup_token_for("127.0.0.1:7411", Some(&accounts), configured())
+                .await
+                .is_none()
+        );
+        drop(dir);
+        let (dir, accounts) = accounts_db(true).await;
+        assert!(
+            setup_token_for("0.0.0.0:7411", Some(&accounts), configured())
+                .await
+                .is_none(),
+            "it stops working once the first admin exists"
+        );
+        drop(dir);
+        let minted = setup_token_for("0.0.0.0:7411", None, None).await.unwrap();
+        assert_eq!(
+            minted.shown(),
+            Some(minted.value()),
+            "a minted token is printed once"
+        );
+    }
+
+    #[test]
+    fn the_configured_setup_line_names_the_variable_only() {
+        assert_eq!(
+            configured_setup_line("http://0.0.0.0:7411", "CRYSTALLINE_SETUP_TOKEN_FILE"),
+            "first-run setup (create the first admin at http://0.0.0.0:7411) takes the setup token from CRYSTALLINE_SETUP_TOKEN_FILE"
+        );
+    }
+
     /// A reachable bind on an instance with no account yet is the case the
     /// whole feature exists for: the token is minted, and the accounts database
     /// that does not exist yet is the normal first-run state rather than a
@@ -4398,14 +5016,14 @@ mod tests {
             "[2001:db8::1]:7411",
             "fluid.example:7411",
         ] {
-            let token = setup_token_for(addr, Some(&accounts))
+            let token = minted(addr, Some(&accounts))
                 .await
                 .unwrap_or_else(|| panic!("{addr} is reachable from elsewhere and needs a token"));
             assert_is_a_setup_token(&token);
         }
         assert_ne!(
-            setup_token_for("0.0.0.0:7411", Some(&accounts)).await,
-            setup_token_for("0.0.0.0:7411", Some(&accounts)).await,
+            minted("0.0.0.0:7411", Some(&accounts)).await,
+            minted("0.0.0.0:7411", Some(&accounts)).await,
             "drawn fresh every time, so one serve process's token is its own"
         );
         drop(dir);
@@ -4425,7 +5043,7 @@ mod tests {
             "fluid.example:7411",
         ] {
             assert_eq!(
-                setup_token_for(addr, Some(&accounts)).await,
+                minted(addr, Some(&accounts)).await,
                 None,
                 "{addr} serves an instance whose first-run setup is closed for good"
             );
@@ -4448,7 +5066,7 @@ mod tests {
                 "localhost:7411",
             ] {
                 assert_eq!(
-                    setup_token_for(addr, Some(&accounts)).await,
+                    minted(addr, Some(&accounts)).await,
                     None,
                     "{addr} can only be reached from this machine"
                 );
@@ -4478,13 +5096,13 @@ mod tests {
             crate::rest::AuthStore::open(&accounts).await.is_err(),
             "a directory at the database path is a database that cannot be opened"
         );
-        let token = setup_token_for("0.0.0.0:7411", Some(&accounts))
+        let token = minted("0.0.0.0:7411", Some(&accounts))
             .await
             .expect("a database that cannot be read must not withhold the first-run secret");
         assert_is_a_setup_token(&token);
         // The same fail-open answer with no path to ask at all, which is what a
         // machine with no resolvable state directory hands in.
-        let token = setup_token_for("0.0.0.0:7411", None)
+        let token = minted("0.0.0.0:7411", None)
             .await
             .expect("no accounts path to ask is not an answer of 'an account exists'");
         assert_is_a_setup_token(&token);

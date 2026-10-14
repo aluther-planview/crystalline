@@ -15,10 +15,12 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
 use serde_json::{Value, json};
+
+use crate::daemon_env::DaemonEnv;
 
 /// The exact reminder text `hook.rs` prints, duplicated here because the
 /// `crystalline` binary has no library target for a test to import it from;
@@ -40,7 +42,8 @@ fn isolate(cmd: &mut Command, home: &Path) {
     cmd.env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join("config"))
         .env("XDG_STATE_HOME", home.join("state"))
-        .env("XDG_CACHE_HOME", home.join("cache"));
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .env("CRYSTALLINE_TEST_DAEMON_TASK", "missing");
 }
 
 /// A minimal config file registering one domain, enough to make the hook's
@@ -1292,57 +1295,10 @@ fn write_daemon_config(path: &Path, domain_dir: &Path, endpoint: Option<&str>) {
     std::fs::write(path, yaml).unwrap();
 }
 
-/// An isolated, short-path environment holding one daemon.
-///
-/// The base is `/tmp` rather than a `tempfile` directory for the reason
-/// `crates/cli/tests/daemon/service.rs` gives: the daemon's unix socket path has to
-/// stay inside the platform's 104-byte limit.
-struct DaemonEnv {
-    dir: PathBuf,
-    serve: Option<std::process::Child>,
-}
-
 impl DaemonEnv {
-    fn new(tag: &str) -> DaemonEnv {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = PathBuf::from("/tmp").join(format!("cqp-{tag}-{nanos}"));
-        std::fs::create_dir_all(dir.join("config")).unwrap();
-        std::fs::create_dir_all(dir.join("state")).unwrap();
-        std::fs::create_dir_all(dir.join("cache")).unwrap();
-        DaemonEnv { dir, serve: None }
-    }
-
-    fn config_path(&self) -> PathBuf {
-        self.dir.join("config/crystalline/config.yaml")
-    }
     fn domain_dir(&self) -> PathBuf {
         self.dir.join("kb-vents")
     }
-    fn state_dir(&self) -> PathBuf {
-        self.dir.join("state/crystalline")
-    }
-    fn info_path(&self) -> PathBuf {
-        self.state_dir().join("service.json")
-    }
-    fn lock_path(&self) -> PathBuf {
-        self.state_dir().join("service.lock")
-    }
-
-    /// Isolate a child into this test's directories, with the HTTP endpoint
-    /// off (a real port is the one thing a temp directory cannot isolate) and
-    /// the real keychain refused.
-    fn apply(&self, cmd: &mut std::process::Command) {
-        cmd.env("HOME", &self.dir)
-            .env("XDG_CONFIG_HOME", self.dir.join("config"))
-            .env("XDG_STATE_HOME", self.dir.join("state"))
-            .env("XDG_CACHE_HOME", self.dir.join("cache"))
-            .env("CRYSTALLINE_SERVICE_HTTP", "false")
-            .env("CRYSTALLINE_TEST_NO_KEYCHAIN", "1");
-    }
-
     /// The domain on disk: a MANIFEST and the one engram the prompts recall.
     fn write_domain(&self) {
         let dir = self.domain_dir();
@@ -1359,60 +1315,6 @@ impl DaemonEnv {
             ),
         )
         .unwrap();
-    }
-
-    /// Start the daemon against this environment's config and wait until it
-    /// answers.
-    fn serve(&mut self) {
-        let mut cmd = crate::common::crystalline_std();
-        self.apply(&mut cmd);
-        let child = cmd
-            .args(["serve", "--config"])
-            .arg(self.config_path())
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
-        self.serve = Some(child);
-        let start = Instant::now();
-        while !self.run(&["ctl", "status", "--json"]).0 {
-            assert!(
-                start.elapsed() < Duration::from_secs(30),
-                "the daemon did not become ready"
-            );
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        // What every assertion below rests on: there is a real daemon here,
-        // this one, and not a command that answered by opening the index
-        // itself. The hook only ever speaks to a daemon that published this
-        // record.
-        let text =
-            std::fs::read_to_string(self.info_path()).expect("the daemon published a record");
-        let record: Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(record["started_by"], json!("serve"), "{record}");
-        assert!(
-            record["pid"].as_u64().is_some_and(|pid| pid > 0),
-            "{record}"
-        );
-    }
-
-    /// Run a one-shot command, returning (success, stdout).
-    fn run(&self, args: &[&str]) -> (bool, String) {
-        let mut cmd = crate::common::crystalline_std();
-        self.apply(&mut cmd);
-        let out = cmd.args(args).output().unwrap();
-        (
-            out.status.success(),
-            String::from_utf8_lossy_owned(out.stdout),
-        )
-    }
-
-    /// The daemon's status report.
-    fn status(&self) -> Value {
-        let (ok, out) = self.run(&["ctl", "status", "--json"]);
-        assert!(ok, "ctl status failed: {out}");
-        serde_json::from_str(&out).unwrap_or_else(|e| panic!("status json: {e}: {out}"))
     }
 
     /// One search through the daemon, the same default mode the agent's own
@@ -1539,39 +1441,6 @@ impl DaemonEnv {
                     .collect()
             })
             .unwrap_or_default()
-    }
-
-    /// Stop the daemon and wait until the lock is free, so the temp directory
-    /// goes away without a live writer in it.
-    fn shutdown(&mut self) {
-        let _ = self.run(&["ctl", "shutdown"]);
-        let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(8) {
-            if !self.lock_path().exists() && !self.info_path().exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        if let Some(mut child) = self.serve.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
-
-impl Drop for DaemonEnv {
-    fn drop(&mut self) {
-        self.shutdown();
-        if let Ok(text) = std::fs::read_to_string(self.info_path())
-            && let Ok(v) = serde_json::from_str::<Value>(&text)
-            && let Some(pid) = v.get("pid").and_then(Value::as_u64)
-        {
-            let _ = std::process::Command::new("kill")
-                .arg("-9")
-                .arg(pid.to_string())
-                .status();
-        }
-        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -1749,6 +1618,63 @@ fn the_prompt_hook_names_an_engram_once_per_session_and_again_after_a_compaction
     drop(stub);
 }
 
+/// Review M7: the recall's "nothing registered" bail lets a machine with a
+/// connected server through. Here this machine's own configuration (the one
+/// the hook reads) registers no domain at all, and a server is connected; the
+/// daemon serves the vents domain from its explicit --config. The block can
+/// only appear when the connected server keeps the hook from bailing.
+#[test]
+fn the_prompt_hook_asks_the_daemon_when_only_a_server_is_connected() {
+    let (endpoint, _stub) = spawn_embeddings_stub();
+    let mut env = DaemonEnv::new("recallsrc");
+    env.write_domain();
+    write_daemon_config(&env.config_path(), &env.domain_dir(), Some(&endpoint));
+    env.serve();
+    env.wait_embedded();
+    let search = env.search(PLAIN_PROMPT);
+    assert_eq!(search["mode"], json!("hybrid"), "{search}");
+
+    let no_domains = env.dir.join("no-domains.yaml");
+    std::fs::write(&no_domains, "domains: {}\nrecall:\n  min_score: 0.5\n").unwrap();
+    let ask = |session: &str| {
+        let mut cmd = crate::common::crystalline_std();
+        env.apply(&mut cmd);
+        cmd.env("CRYSTALLINE_CONFIG", &no_domains);
+        let mut child = cmd
+            .args(["hook", "prompt", "--harness", "claude-code"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(prompt_payload(session, PLAIN_PROMPT).as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+
+    // Nothing registered and nothing connected: the bail, silent.
+    assert_silent(&ask("recall-no-source"), "no domain and no server");
+
+    let blackhole = crate::source_hooks::Blackhole::start();
+    crate::source_hooks::seed_source(
+        &env.state_dir().join("remote"),
+        &blackhole.origin,
+        &[("open", &["Route here for open"])],
+        &[("open", "open")],
+    );
+    let block = expect_block(&ask("recall-with-source"), "a server is connected");
+    assert!(block.contains(VENT_ADDRESS), "{block:?}");
+    assert_eq!(
+        blackhole.offered(),
+        0,
+        "the hook never asks the server itself"
+    );
+}
+
 /// The one line a speaking prompt hook prints, parsed, with the event name
 /// checked and the block handed back.
 fn expect_block(out: &std::process::Output, case: &str) -> String {
@@ -1779,4 +1705,117 @@ fn expect_block(out: &std::process::Output, case: &str) -> String {
         .as_str()
         .unwrap_or_else(|| panic!("{case}: no additionalContext: {payload}"))
         .to_string()
+}
+
+/// A machine whose only domain is read-only has nowhere to capture into, so
+/// the capture nudge stays silent; the same machine with the flag off nudges.
+#[test]
+fn a_machine_whose_only_domain_is_read_only_is_silent() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let config = work.path().join("config.yaml");
+    let dir = work.path().join("archive");
+    std::fs::create_dir_all(&dir).unwrap();
+    let manifest = dir.join("MANIFEST.md");
+    let writable =
+        "---\ntype: manifest\ntitle: archive\npermalink: manifest\n---\n\n## Scope\n\n- x\n";
+    std::fs::write(
+        &manifest,
+        writable.replacen("\n---\n", "\nread_only: on\n---\n", 1),
+    )
+    .unwrap();
+    std::fs::write(
+        &config,
+        format!("domains:\n  archive:\n    path: {}\n", dir.display()),
+    )
+    .unwrap();
+    let transcript = substantial_transcript(work.path());
+
+    let run = |session: &str| {
+        let mut cmd = bin();
+        isolate(&mut cmd, &home);
+        cmd.env("CRYSTALLINE_CONFIG", &config)
+            .args(["hook", "stop"])
+            .write_stdin(stop_payload(session, Some(&transcript)))
+            .output()
+            .unwrap()
+    };
+    let out = run("session-locked");
+    assert!(out.status.success());
+    assert!(
+        out.stdout.is_empty(),
+        "{:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    std::fs::write(&manifest, writable).unwrap();
+    let out = run("session-open");
+    assert!(out.status.success());
+    assert!(!out.stdout.is_empty(), "a writable domain earns the nudge");
+}
+
+/// The two ride-alongs look only at the domains a session could write to: a
+/// read-only team domain that is pending and holds unshared work is neither
+/// named as a focus domain nor counted in the sharing ask, while the writable
+/// one beside it keeps both asks alive.
+#[test]
+fn the_ride_alongs_leave_a_read_only_domain_out() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let config = work.path().join("config.yaml");
+    let engram = "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n  - t\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\nBody.\n";
+    let eng = write_team_domain(work.path(), &home, "eng", &[("alpha.md", engram)]);
+    let archive = write_team_domain(
+        work.path(),
+        &home,
+        "archive",
+        &[("alpha.md", engram), ("beta.md", engram)],
+    );
+    let manifest = "---\ntype: manifest\ntitle: archive\npermalink: manifest\nread_only: on\n---\n\n## Scope\n\n- x\n";
+    std::fs::write(archive.join("MANIFEST.md"), manifest).unwrap();
+    std::fs::write(
+        &config,
+        format!(
+            "domains:\n  eng:\n    path: {}\n    origin:\n      repo: acme/kb\n  archive:\n    path: {}\n    origin:\n      repo: acme/kb\n",
+            eng.display(),
+            archive.display()
+        ),
+    )
+    .unwrap();
+    let transcript = substantial_transcript(work.path());
+    write_maintenance(
+        &home,
+        serde_json::json!({
+            "v": 1,
+            "pending_domains": ["archive"],
+            "pending_since": stamp(2),
+            // A stale weekly clock keeps the ask due without the locked
+            // domain's pending mark.
+            "last_run_at": stamp(30),
+            "last_nudge_at": null,
+            "first_seen": stamp(60),
+        }),
+    );
+
+    let mut cmd = bin();
+    isolate(&mut cmd, &home);
+    let out = cmd
+        .env("CRYSTALLINE_CONFIG", &config)
+        .args(["hook", "stop"])
+        .write_stdin(stop_payload("session-ride-locked", Some(&transcript)))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let decision: serde_json::Value =
+        serde_json::from_str(String::from_utf8(out.stdout).unwrap().trim()).unwrap();
+    let reason = decision["reason"].as_str().unwrap();
+    assert!(reason.contains(EVOLVE_NUDGE_REASON), "{reason}");
+    assert!(
+        !reason.contains("Focus domains"),
+        "the locked domain is not a focus: {reason}"
+    );
+    assert!(
+        reason.contains("Also: 1 change in the team domain eng is not yet shared."),
+        "only the writable domain's work is counted: {reason}"
+    );
 }

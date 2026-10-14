@@ -55,6 +55,32 @@ impl Engine {
         folder: Option<&str>,
         progress: Option<OriginProgress>,
     ) -> Result<Value> {
+        self.origin_add_with_progress_as(
+            repo,
+            domain,
+            path,
+            branch,
+            folder,
+            progress,
+            &crate::scope::Scope::Unrestricted,
+        )
+        .await
+    }
+
+    /// [`Engine::origin_add_with_progress`] for `scope`, which decides only
+    /// how the report's note names a connected server: by name for the
+    /// machine owner, not at all for anyone else.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn origin_add_with_progress_as(
+        &self,
+        repo: &str,
+        domain: Option<&str>,
+        path: Option<&str>,
+        branch: Option<&str>,
+        folder: Option<&str>,
+        progress: Option<OriginProgress>,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
         let progress_at = |step: u64, msg: &str| {
             if let Some(p) = &progress {
                 p(step, 4, msg);
@@ -147,6 +173,13 @@ impl Engine {
                 (choice.name, choice.origin, declared_by_manifest)
             }
         };
+        // A name a connected server already gave out is the mount's; a new
+        // local domain under it is the latecomer and gets the local suffix
+        // (decision D13), before the name is checked and the default folder
+        // derived from it. A registration of that name here keeps its name,
+        // so adopting it in place works as before.
+        let wanted = domain_name;
+        let domain_name = self.beside_mounts(&wanted);
         // A name nothing holds is a new registration: check it before the
         // default folder is derived from it. A derived name passes by
         // construction (`origin::default_domain_name`, and
@@ -292,6 +325,8 @@ impl Engine {
             *file_guard = file;
             *self.config.write().unwrap() = effective;
         }
+        // Its origin may make it a copy of a mounted domain, hidden from now on.
+        self.sync_sources_local();
 
         // Tell a running daemon's watcher to start watching the new root; it
         // also runs its own catch-up sync and embed once the watch is armed.
@@ -331,6 +366,7 @@ impl Engine {
             "local_changes": report.local_changes,
         });
         self.append_name_fields(&mut result, &domain_name).await?;
+        self.note_beside_mounts(&mut result, &wanted, &domain_name, scope);
         Ok(result)
     }
 
@@ -877,13 +913,18 @@ impl Engine {
         let connection = self.origin_status_connection().await?;
 
         let actor = crate::scope::overlay_actor(scope);
-        // Whose changes a `diff` answers: the acting identity, the way every
-        // other surface of this feature resolves one.
-        let diff_actor = diff.then(|| match scope {
+        // Who is asking, as a share would act: whose changes a `diff`
+        // answers, and whose recorded refusal the status shows.
+        let share_actor = match scope {
             crate::scope::Scope::Unrestricted => ShareActor::Owner,
             crate::scope::Scope::User { account, .. } => ShareActor::Account(account.clone()),
             crate::scope::Scope::Anonymous => ShareActor::HttpAgent,
-        });
+        };
+        // A refusal is recorded per login, so the status reads it under the
+        // login this caller's shares go out on. Resolved once, outside every
+        // domain's lock; unresolvable reads as "shown none".
+        let viewer = self.share_login_for(&share_actor);
+        let diff_actor = diff.then_some(share_actor);
         let mut domains = Vec::new();
         let mut errors = Vec::new();
         for (name, entry) in targets {
@@ -967,6 +1008,7 @@ impl Engine {
                     diff_block.as_ref(),
                     &view,
                     converged.as_ref(),
+                    viewer.as_ref().map(Option::as_deref),
                 )
                 .await
             {
@@ -1006,6 +1048,7 @@ impl Engine {
     /// list up anywhere else, so a status that degrades to local state still
     /// names what is unshared rather than dropping the one answer it can still
     /// give from the working tree alone.
+    #[allow(clippy::too_many_arguments)]
     async fn origin_status_one(
         &self,
         name: &str,
@@ -1014,6 +1057,7 @@ impl Engine {
         diff: Option<&Value>,
         drafts: &crate::review::DraftView,
         converged: Option<&Value>,
+        viewer: Option<Option<&str>>,
     ) -> Result<Value> {
         let lock = self.origin_lock(name);
         let _guard = lock.lock().await;
@@ -1101,6 +1145,7 @@ impl Engine {
                 &report,
                 None,
                 change_detail(),
+                origin::viewer_refusal(&report, viewer, sharing),
             ))),
             Err(e) if probe.is_some() && origin::is_probe_transport_error(&e) => {
                 // AuthExpired is one of the transport errors this arm catches
@@ -1115,6 +1160,7 @@ impl Engine {
                     &report,
                     Some(e.to_string()),
                     change_detail(),
+                    origin::viewer_refusal(&report, viewer, sharing),
                 )))
             }
             Err(e) => Err(e.into()),
@@ -1170,9 +1216,11 @@ impl Engine {
             }
             return;
         }
-        // The poller is the machine itself rather than a caller, so nothing is
-        // subtracted: it polls every origin this daemon hosts.
-        let Ok(targets) = self.origin_targets(None, &HashSet::new()) else {
+        // The poller is the machine itself rather than a caller, so no privacy
+        // is subtracted: it polls every origin this daemon hosts, except a
+        // local copy a connected server hides, whose files stay as they are
+        // until it comes back on disconnect (spec A3).
+        let Ok(targets) = self.origin_targets(None, &self.shadowed_domains()) else {
             return;
         };
         let github_poll_secs = self
@@ -1369,7 +1417,7 @@ impl Engine {
     /// `drafting` is `None` and the folder on disk is the answer it always was.
     ///
     /// The single seam review mode adds to sharing, so the share and the preview
-    /// behind its confirmation question cannot describe two different things.
+    /// Fluid's share dialog shows cannot describe two different things.
     /// Two steps, in this order:
     ///
     /// 1. a pull of the REAL folder, which is the pull `ops::propose` would run
@@ -1461,6 +1509,21 @@ impl Engine {
         })
     }
 
+    /// [`Engine::origin_share_with`] without `as_proposal`: the share goes
+    /// the way the domain and this machine's recorded refusal decide.
+    pub async fn origin_share(
+        &self,
+        domain: &str,
+        title: Option<&str>,
+        description: Option<&str>,
+        proposal: Option<u64>,
+        files: Option<&[String]>,
+        actor: ShareActor,
+    ) -> Result<Value> {
+        self.origin_share_with(domain, title, description, proposal, files, None, actor)
+            .await
+    }
+
     /// Proposes one domain's local changes as a pull request against its
     /// origin, under its origin lock.
     ///
@@ -1495,13 +1558,20 @@ impl Engine {
     /// this share creates or rewrites, in both modes
     /// (`crystalline_remote::state::Proposal::author_login`), so a chain whose
     /// layers belong to different people can say so.
-    pub async fn origin_share(
+    ///
+    /// `as_proposal` is how a share on a `sharing: direct` domain goes:
+    /// `Some(true)` opens a proposal, `Some(false)` tries the direct commit
+    /// only, `None` lets the refusal recorded for the acting login decide (see
+    /// `crystalline_remote::ops::ShareOptions::as_proposal`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn origin_share_with(
         &self,
         domain: &str,
         title: Option<&str>,
         description: Option<&str>,
         proposal: Option<u64>,
         files: Option<&[String]>,
+        as_proposal: Option<bool>,
         actor: ShareActor,
     ) -> Result<Value> {
         let stacks_allowed = {
@@ -1514,6 +1584,8 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        self.refuse_read_only_domain(domain, &crate::scope::Scope::Unrestricted)
+            .await?;
         let lock = self.origin_lock_registered(domain)?;
         let _guard = lock.lock().await;
         let (spec, root, state_dir) = self.origin_spec_for_domain(domain)?;
@@ -1564,6 +1636,7 @@ impl Engine {
             domain,
             &state_dir,
             ops::ShareOptions {
+                as_proposal,
                 title,
                 description,
                 proposal,
@@ -1655,7 +1728,7 @@ impl Engine {
                     "conflicts": conflicts,
                 }))
             }
-            Err(e) => Err(enrich_write_error(e, acting.as_deref(), &spec.repo).into()),
+            Err(e) => Err(share_write_error(e, acting.as_deref(), &spec.repo).into()),
         }
     }
 
@@ -1784,6 +1857,25 @@ impl Engine {
         actor: ShareActor,
         credential: PreviewCredential,
     ) -> Result<Value> {
+        self.origin_share_preview_with(domain, title, proposal, files, None, actor, credential)
+            .await
+    }
+
+    /// [`Engine::origin_share_preview`] with `as_proposal`, the share's own
+    /// choice of route on a `sharing: direct` domain (see
+    /// [`Engine::origin_share_with`]), so the plan is the one that share
+    /// would follow.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn origin_share_preview_with(
+        &self,
+        domain: &str,
+        title: Option<&str>,
+        proposal: Option<u64>,
+        files: Option<&[String]>,
+        as_proposal: Option<bool>,
+        actor: ShareActor,
+        credential: PreviewCredential,
+    ) -> Result<Value> {
         let stacks_allowed = {
             let config = self.config.read().unwrap();
             if !config.github_enabled() {
@@ -1794,6 +1886,8 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        self.refuse_read_only_domain(domain, &crate::scope::Scope::Unrestricted)
+            .await?;
         let lock = self.origin_lock_registered(domain)?;
         let _guard = lock.lock().await;
         let (spec, root, state_dir) = self.origin_spec_for_domain(domain)?;
@@ -1851,6 +1945,7 @@ impl Engine {
             domain,
             &state_dir,
             ops::ShareOptions {
+                as_proposal,
                 title,
                 description: None,
                 proposal,
@@ -1873,70 +1968,10 @@ impl Engine {
         // it rather than with a column answering a question nobody asked.
         let provenance = drafting.is_none().then_some(root.as_path());
         let mut plan = origin::share_plan_json(&plan, provenance);
-        // The repository beside the branch, so a confirmation question can say
+        // The repository beside the branch, so Fluid's share dialog can say
         // where a commit goes without a second lookup.
         plan["repo"] = json!(spec.repo);
         Ok(plan)
-    }
-
-    /// Previews which proposal a withdrawal would take out, without touching
-    /// the forge at all.
-    ///
-    /// A pure local read: the offline status path ([`ops::status`] with no
-    /// probe) reports this domain's open and declined proposals off origin
-    /// state, and [`origin::withdraw_plan_json`] resolves the target out of
-    /// that exactly as [`ops::withdraw`] would, refusing with the same
-    /// teaching errors when no single target can be named. Nothing is written
-    /// and no provider call is made, which is what lets an eliciting client
-    /// ask its user before a pull request is closed.
-    ///
-    /// It still carries the withdrawal's own gates, all of them and in the
-    /// same order - collaboration off, read-only, an unregistered domain, and
-    /// a provider this instance cannot build - rather than only the read's, so
-    /// a user is never asked to confirm a withdrawal this instance would
-    /// refuse to perform. The provider is resolved and dropped: an instance
-    /// with no credential on file has to fail in round one, where the failure
-    /// is still the answer to the call, rather than after the user has said
-    /// yes to a question.
-    ///
-    /// The provider it resolves and drops is the withdrawal's own, `actor`
-    /// included, so an instance that shares personally refuses here - before
-    /// the question - when the acting identity has no connection of its own.
-    pub async fn origin_withdraw_preview(
-        &self,
-        domain: &str,
-        proposal: Option<u64>,
-        revert: bool,
-        actor: ShareActor,
-    ) -> Result<Value> {
-        let stacks_allowed = {
-            let config = self.config.read().unwrap();
-            if !config.github_enabled() {
-                return Err(RemoteError::NotEnabled.into());
-            }
-            config.github_stacks()
-        };
-        if self.read_only {
-            return Err(EngineError::ReadOnly);
-        }
-        let lock = self.origin_lock_registered(domain)?;
-        let _guard = lock.lock().await;
-        let (spec, root, state_dir) = self.origin_spec_for_domain(domain)?;
-        // The withdrawal's own identity gate, in round one: on a reviewing
-        // domain a revert puts one actor's overlay back, and nobody in
-        // particular has none to put back.
-        self.overlay_share_identity(domain, &actor)?;
-        self.refresh_share_credential(&actor).await?;
-        let (_provider, _login) = self.resolve_share_provider(&actor)?;
-        // Probe-free, so no forge call of any kind: the settlement permission
-        // is withheld for the same reason the provider was dropped.
-        let report = ops::status(&spec, &root, &state_dir, None, false).await?;
-        Ok(origin::withdraw_plan_json(
-            &report,
-            proposal,
-            revert,
-            stacks_allowed,
-        )?)
     }
 
     /// Withdraws a share proposal for one domain: closes its pull request on
@@ -1966,6 +2001,8 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        self.refuse_read_only_domain(domain, &crate::scope::Scope::Unrestricted)
+            .await?;
         let lock = self.origin_lock_registered(domain)?;
         let _guard = lock.lock().await;
         let (spec, root, state_dir) = self.origin_spec_for_domain(domain)?;
@@ -2693,6 +2730,12 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        // Taking the team's side is what a pull does, so it stays allowed on a
+        // read-only domain; keeping your own text or a merge would change it.
+        if keep != Some("theirs") {
+            self.refuse_read_only_domain(domain, &crate::scope::Scope::Unrestricted)
+                .await?;
+        }
         // An attachment is not an engram and this verb settles engrams. The
         // path would be normalized to `<path>.md` on the next line and then
         // miss everything, so the refusal comes first and says what to do
@@ -2715,6 +2758,25 @@ impl Engine {
         // asked about the same one or a missing suffix would turn a resolution
         // into a refusal.
         let path = &normalize_md(path);
+        // Keeping your own MANIFEST text or a merge may switch read_only on,
+        // which is the owner's (decision D10). The machine owner may; this
+        // verb carries no scope for anybody else, so for them an off-to-on
+        // result is refused and the owner switches it in the domain policies
+        // once the conflict is settled. Taking the team's side is a pull and
+        // is never checked.
+        if is_manifest_path(path) && keep != Some("theirs") && !matches!(&actor, ShareActor::Owner)
+        {
+            let after = match content {
+                Some(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+                None => std::fs::read_to_string(root.join(path)).unwrap_or_default(),
+            };
+            if self.switches_read_only_on(domain, &after).await {
+                return Err(EngineError::Forbidden(
+                    "resolving a conflict does not switch read_only on; the owner switches it in the domain policies"
+                        .to_string(),
+                ));
+            }
+        }
         if let Some(who) = self.overlay_share_identity(domain, &actor)? {
             let held = {
                 let store = self.store.lock().await;
@@ -2927,11 +2989,16 @@ impl Engine {
     /// exactly the `UnknownDomain` [`Engine::origin_spec_for_domain`] would
     /// raise a line later, so a registered name behaves identically and an
     /// unregistered one answers the same, only without leaving an entry behind.
+    ///
+    /// A local copy a connected server hides answers as unregistered here
+    /// too, so no share, withdraw, discard or resolve acts on it from any
+    /// surface while it is hidden (decision D19).
     pub(super) fn origin_lock_registered(
         &self,
         domain: &str,
     ) -> Result<Arc<tokio::sync::Mutex<()>>> {
         self.domain_entry(domain)?;
+        self.refuse_shadowed(domain)?;
         Ok(self.origin_lock(domain))
     }
 
@@ -3184,6 +3251,19 @@ impl Engine {
             Arc::new(GitHubProvider::new(api_url, Some(token.access_token))),
             login,
         ))
+    }
+
+    /// The login a share by `actor` would go out on, the one
+    /// [`Engine::resolve_share_provider`] hands the share, without building a
+    /// client: `Some(None)` for a credential that names nobody, and `None`
+    /// when no credential resolves for `actor` (not connected, no personal
+    /// token, no agent identity), which a status reads as "nobody's refusal".
+    fn share_login_for(&self, actor: &ShareActor) -> Option<Option<String>> {
+        if self.origin_provider_override.is_some() {
+            return Some(self.origin_provider_override_login.clone());
+        }
+        let (_, token) = self.resolve_share_credential(actor).ok()?;
+        Some(token.user_display().map(str::to_string))
     }
 
     /// The credential half of [`Engine::resolve_share_provider`]: the api url

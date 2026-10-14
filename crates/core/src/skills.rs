@@ -117,6 +117,21 @@ pub fn skill(name: &str) -> Option<&'static SkillAsset> {
 mod tests {
     use super::*;
 
+    /// The collaboration skill says what to offer after a refused direct
+    /// share, and what to tell the user once shares fall back on their own.
+    #[test]
+    fn the_collaboration_skill_teaches_the_proposal_fallback() {
+        let body = skill("crystalline-collaboration").unwrap().content;
+        assert!(
+            body.contains("When a direct share answers branch_protected, offer the user to share the same changes as a proposal with `as_proposal: true`."),
+            "{body}"
+        );
+        assert!(
+            body.contains("After that, shares fall back to a proposal on their own; when a receipt carries `fell_back`, tell the user the share opened a proposal instead of a commit."),
+            "{body}"
+        );
+    }
+
     #[test]
     fn every_skill_names_the_version_that_first_shipped_it() {
         for s in SKILL_ASSETS {
@@ -361,5 +376,31 @@ mod tests {
             assert!(s.contains(needle), "{why}: missing {needle:?}");
         }
         assert_eq!(skill("crystalline-provisioning").unwrap().since, "0.22.1");
+    }
+
+    /// Each skill names the call that shows and changes how a domain
+    /// behaves.
+    #[test]
+    fn the_skills_teach_configure_with_a_domain() {
+        let sentence = "To see or change how a domain behaves (its sharing, generated indexes, MANIFEST sections or rule overrides), call configure with the domain.";
+        for name in [
+            "crystalline-intelligence",
+            "crystalline-provisioning",
+            "crystalline-collaboration",
+        ] {
+            let body = skill(name).unwrap().content;
+            assert!(body.contains(sentence), "{name}");
+        }
+    }
+
+    /// The two skills an agent writes with tell it what a domain row's
+    /// `read_only` means and where to write instead (spec A-5, B-6).
+    #[test]
+    fn the_skills_teach_that_a_read_only_domain_takes_no_writes() {
+        let sentence = "A domain whose routing line says (read-only), or whose row carries `read_only: true` (a domain row's `read_only`), is not a place for you to write: it is locked, your role only reads it, or it is not on your account's write list. Search and read it, and write where the routing block allows.";
+        for name in ["crystalline-intelligence", "crystalline-capture"] {
+            let body = skill(name).unwrap().content;
+            assert!(body.contains(sentence), "{name}");
+        }
     }
 }

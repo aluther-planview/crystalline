@@ -10,6 +10,7 @@ use crystalline_index::TursoStore;
 use crystalline_service::DomainAccess;
 use crystalline_service::Engine;
 use crystalline_service::Scope;
+use crystalline_service::engine::EngineError;
 use crystalline_service::params::{
     DeleteParams, EditParams, ReadParams, RetireParams, SaveParams, SearchParams, SplitParams,
 };
@@ -128,16 +129,12 @@ async fn a_zero_edit_save_is_byte_identical() {
 
 /// **The permalink-collision message is an interface, not just prose.**
 ///
-/// `write_engram`'s MCP handler (`crates/service/src/mcp.rs`, the
-/// `COLLISION_MARKER` interception) recognizes this one failure by the marker
-/// `already exists in domain` in the error's display, and reads the colliding
-/// permalink back out of `permalink '<permalink>'` to word the
-/// overwrite-or-cancel question an eliciting 2026-07-28 peer is offered.
-/// Rewording the message would disarm that round silently - the write would
-/// simply go back to erroring - so both halves are pinned here, where a
-/// rewording breaks loudly beside the sentence being reworded.
+/// Every surface hands this error to the caller as it is, and an agent reads
+/// the colliding permalink and the `overwrite` hint out of it to decide what
+/// to do next, so its wording is pinned here, where a rewording breaks loudly
+/// beside the sentence being reworded.
 #[tokio::test]
-async fn a_permalink_collision_carries_the_marker_the_mcp_layer_intercepts() {
+async fn a_permalink_collision_names_the_permalink_and_the_overwrite_hint() {
     let (_tmp, engine) = engine_fixture().await;
 
     // `alpha.md` is in the fixture, so a second Alpha collides with it.
@@ -161,15 +158,15 @@ async fn a_permalink_collision_carries_the_marker_the_mcp_layer_intercepts() {
     let message = err.to_string();
     assert!(
         message.contains("already exists in domain"),
-        "the marker mcp.rs intercepts on: {message}"
+        "the collision is named as one: {message}"
     );
     assert!(
         message.contains("permalink 'alpha'"),
-        "the permalink, quoted where mcp.rs reads it out: {message}"
+        "the permalink, quoted: {message}"
     );
     assert!(
         message.contains("pass overwrite=true to replace"),
-        "and the hint every non-eliciting peer still gets: {message}"
+        "and the hint every peer gets: {message}"
     );
 }
 
@@ -1202,7 +1199,12 @@ async fn manifest_save_is_guarded_verbatim_and_refreshes_routing() {
 
     // Stale token: refused, file untouched.
     let err = engine
-        .save_manifest("eng", &current.replace("eng questions", "nothing"), "beef")
+        .save_manifest(
+            "eng",
+            &current.replace("eng questions", "nothing"),
+            "beef",
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap_err();
     assert!(err.to_string().contains("stale edit"), "{err}");
@@ -1213,7 +1215,7 @@ async fn manifest_save_is_guarded_verbatim_and_refreshes_routing() {
         "Route here for everything eng",
     );
     engine
-        .save_manifest("eng", &edited, &checksum)
+        .save_manifest("eng", &edited, &checksum, &Scope::Unrestricted)
         .await
         .unwrap();
     assert_eq!(
@@ -1237,7 +1239,7 @@ async fn manifest_save_is_guarded_verbatim_and_refreshes_routing() {
     };
     assert!(
         engine
-            .save_manifest("eng", "no frontmatter", &checksum2)
+            .save_manifest("eng", "no frontmatter", &checksum2, &Scope::Unrestricted)
             .await
             .is_err()
     );
@@ -1277,7 +1279,12 @@ async fn manifest_save_is_guarded_verbatim_and_refreshes_routing() {
         "Route here for updated scratch topics",
     );
     engine
-        .save_manifest("scratch", &edited_scratch, &scratch_checksum)
+        .save_manifest(
+            "scratch",
+            &edited_scratch,
+            &scratch_checksum,
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
 
@@ -1290,6 +1297,50 @@ async fn manifest_save_is_guarded_verbatim_and_refreshes_routing() {
         !after_routing.contains("Route here for scratch questions"),
         "the stale bullet is gone:\n{after_routing}"
     );
+}
+
+/// A file domain whose MANIFEST.md is gone reads as missing, not as an
+/// error: empty markdown, `missing: true`, and the empty text's checksum as
+/// the token. A save carrying that token creates the file; any other token
+/// is a stale edit, and a second create with the same token is one too.
+#[tokio::test]
+async fn a_missing_file_manifest_reads_as_missing_and_its_first_save_creates_it() {
+    let (tmp, engine) = engine_fixture().await;
+    let path = tmp.path().join("eng/MANIFEST.md");
+    let original = std::fs::read_to_string(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+
+    let source = engine.manifest_source("eng").await.unwrap();
+    assert!(source.missing, "a gone MANIFEST is missing");
+    assert_eq!(source.markdown, "");
+    // The old read still answers NotFound for the callers that rely on it.
+    assert!(matches!(
+        engine.manifest_markdown("eng").await,
+        Err(crystalline_service::EngineError::NotFound(_))
+    ));
+
+    let empty = crate::support::sha256_hex(b"");
+    let stale = engine
+        .save_manifest("eng", &original, "beef", &Scope::Unrestricted)
+        .await
+        .unwrap_err();
+    assert!(stale.to_string().contains("stale edit"), "{stale}");
+    assert!(!path.exists(), "a refused save writes nothing");
+
+    engine
+        .save_manifest("eng", &original, &empty, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    let after = engine.manifest_source("eng").await.unwrap();
+    assert!(!after.missing);
+    assert_eq!(after.markdown, original);
+
+    let again = engine
+        .save_manifest("eng", &original, &empty, &Scope::Unrestricted)
+        .await
+        .unwrap_err();
+    assert!(again.to_string().contains("stale edit"), "{again}");
 }
 
 /// The collab layer's thin read: exact bytes, identity, checksum - no
@@ -2888,5 +2939,47 @@ async fn a_failing_virtual_reparse_does_not_stop_the_sync() {
     assert!(
         store.find_engram("eng", "beta").await.unwrap().is_some(),
         "the file domain was synced"
+    );
+}
+
+/// The MANIFEST editor's verb is refused on a read-only domain, the
+/// switch-off included (decision D4: the policies card is the way back), and
+/// its switch-on runs the owner check, which the machine owner passes.
+#[tokio::test]
+async fn save_manifest_refuses_a_read_only_domain_and_checks_the_switch_on() {
+    let (tmp, engine) = engine_fixture().await;
+    let path = tmp.path().join("eng/MANIFEST.md");
+    let current = std::fs::read_to_string(&path).unwrap();
+    let on = current.replacen("\n---\n", "\nread_only: on\n---\n", 1);
+    engine
+        .save_manifest(
+            "eng",
+            &on,
+            &crate::support::sha256_hex(current.as_bytes()),
+            &Scope::Unrestricted,
+        )
+        .await
+        .expect("the machine owner switches it on");
+    assert!(engine.domain_is_read_only("eng").await);
+
+    let back = on.replace("read_only: on", "read_only: off");
+    let err = engine
+        .save_manifest(
+            "eng",
+            &back,
+            &crate::support::sha256_hex(on.as_bytes()),
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::DomainReadOnly(_)), "{err}");
+    assert_eq!(
+        err.to_string(),
+        "'eng' is read-only; its owner switches read_only off in the domain policies"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        on,
+        "nothing was written"
     );
 }

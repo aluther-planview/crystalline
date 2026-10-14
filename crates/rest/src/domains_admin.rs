@@ -224,14 +224,20 @@ pub async fn create(
             require_absent(&body.repo, "repo", "local")?;
             require_absent(&body.branch, "branch", "local")?;
             require_absent(&body.path, "path", "local")?;
-            state.engine.domain_add_local(Some(name), None).await
+            state
+                .engine
+                .domain_add_local_as(Some(name), None, &identity.scope())
+                .await
         }
         "virtual" => {
             let name = body.name.as_deref().unwrap_or_default().trim();
             require_absent(&body.repo, "repo", "virtual")?;
             require_absent(&body.branch, "branch", "virtual")?;
             require_absent(&body.path, "path", "virtual")?;
-            state.engine.domain_add_virtual(name).await
+            state
+                .engine
+                .domain_add_virtual_as(name, &identity.scope())
+                .await
         }
         "github" => {
             let repo = body
@@ -263,7 +269,7 @@ pub async fn create(
             }
             state
                 .engine
-                .origin_add(
+                .origin_add_with_progress_as(
                     repo,
                     name,
                     body.path.as_deref(),
@@ -271,6 +277,8 @@ pub async fn create(
                     // Never from this surface: a team domain lands under the
                     // domains root like a local one, for the same reason.
                     None,
+                    None,
+                    &identity.scope(),
                 )
                 .await
         }
@@ -794,7 +802,14 @@ fn single_domain(
                            it where it is present and nothing where it is \
                            not. `sharing` names the domain's policy and \
                            `direct_shares` the commits this machine put \
-                           straight on the branch.\n\nFour keys say where the domain's \
+                           straight on the branch. `direct_refused` is null, \
+                           or names the `branch`, the forge's `message`, \
+                           `refused_at` and the `line` to show when the \
+                           branch refused a direct commit made under the \
+                           GitHub login this session's shares go out on; \
+                           another login's refusal never shows, nor any on \
+                           a domain that opens proposals. Show that line as \
+                           given.\n\nFour keys say where the domain's \
                            chain of stacked proposals stands. `stack_number` \
                            is the chain's number on the forge, null when \
                            nothing is stacked. `stack_wedged` lists the \
@@ -1352,7 +1367,11 @@ pub async fn sync_now(
                    files. The plan also carries `sharing` (`proposal` or \
                    `direct`, the domain's MANIFEST policy) and `repo`, so a \
                    client knows what kind of domain it is looking at before \
-                   the action is read. A generated folder listing (`index.md`) is a change \
+                   the action is read. On a direct domain the plan may \
+                   also carry `note`, one or two sentences to show as given \
+                   that say how the share will go: it opens a proposal if \
+                   the branch refuses it again, or it opens a proposal \
+                   because your proposal is still open. A generated folder listing (`index.md`) is a change \
                    like any other here, because a share really carries it, but \
                    it is derived rather than written and is left out of the \
                    domain's `local_changes` count: a renderer counts these \
@@ -1540,6 +1559,12 @@ pub struct ShareBody {
     #[serde(default)]
     #[schema(example = json!(["notes/a.md"]))]
     pub files: Option<Vec<String>>,
+    /// On a domain that shares directly: `true` opens a proposal for this
+    /// share, `false` tries the direct commit only and never falls back.
+    /// Absent lets the engine decide from the refusal it recorded.
+    #[serde(default)]
+    #[schema(example = true)]
+    pub as_proposal: Option<bool>,
 }
 
 /// `POST /domains/{domain}/sync/share` - propose this domain's local changes
@@ -1576,8 +1601,20 @@ pub struct ShareBody {
                    answers `proposal_open` while any proposal is still open, \
                    `branch_protected` when the branch's rules refuse a direct \
                    commit and `branch_moved` when the branch moved twice \
-                   while the share was prepared, each with guidance. A \
-                   `proposal` in the body on a direct domain is a 422. \
+                   while the share was prepared, each with guidance. \
+                   `as_proposal: true` opens a proposal on a direct domain \
+                   instead. A `branch_protected` answer carries `fallback: \
+                   \"proposal\"` unless only another login's proposal is \
+                   open, which no share may go into; after one, a refused \
+                   share opens the \
+                   proposal itself and answers `proposed` with `fell_back: \
+                   true` and a `note`, and a commit that lands again carries \
+                   a `note` too. The refusal is kept per GitHub login the \
+                   share goes out on. While that login has a proposal \
+                   open, a share with `proposal` naming it amends it, and \
+                   one with `as_proposal: true` or after a refusal stacks \
+                   on it or amends it. A `proposal` that names no open \
+                   proposal of that login on a direct domain is a 422. \
                    Refused on a read-only instance.",
     params(("domain" = String, Path, description = "The registered team domain.")),
     request_body = ShareBody,
@@ -1715,12 +1752,13 @@ pub async fn share_now(
     Ok(Json(
         state
             .engine
-            .origin_share(
+            .origin_share_with(
                 &domain,
                 body.title.as_deref(),
                 body.description.as_deref(),
                 body.proposal,
                 body.files.as_deref(),
+                body.as_proposal,
                 ShareActor::Account(caller.name().to_string()),
             )
             .await?,
@@ -2744,6 +2782,9 @@ pub async fn set_visibility(
             .engine
             .require_domain(&domain, &identity.scope())
             .await?;
+        // Privatizing changes who may reach the domain, which is managing it:
+        // an admin whose write list leaves it out is refused, by name.
+        crate::refuse_off_write_list(&state, &identity, &domain, None).await?;
         state
             .auth
             .set_domain_visibility(&domain, true, caller.name())
@@ -2769,6 +2810,7 @@ pub async fn set_visibility(
             ApiError::internal(format!("this domain's membership is unreadable: {e:#}"))
         })?;
     if right < DomainRight::Own {
+        crate::refuse_off_write_list(&state, &identity, &domain, Some(DomainRight::Own)).await?;
         return Err(ApiError::forbidden(format!(
             "your membership on this domain is {}, and only its owner or an \
              instance admin may share it with everyone again",

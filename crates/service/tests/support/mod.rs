@@ -1,7 +1,7 @@
 //! A minimal in-memory forge implementing `crystalline_remote::Provider`, for
 //! the engine-level origin tests in `tests/origins/origin.rs`.
 //!
-//! Lifted from `crystalline_remote`'s own `tests/mock/mod.rs` (a test-only
+//! Lifted from `crystalline_remote`'s own `tests/it/mock/mod.rs` (a test-only
 //! module of that crate, not reachable from here) and trimmed to what the
 //! origin engine methods exercise: a single branch's commit history, tarball
 //! download for `subscribe`, a diff-based compare for `pull`, a conditional
@@ -68,6 +68,7 @@ pub const MOUNTED_OPERATIONS: &[&str] = &[
     "GET /api/v1/oauth/authorizations/{id}",
     "POST /api/v1/oauth/authorizations/{id}",
     "POST /api/v1/oauth/token",
+    "POST /api/v1/oauth/revoke",
     "GET /api/v1/me/identity-links",
     "DELETE /api/v1/me/identity-links/{issuer}",
     "GET /api/v1/domains",
@@ -418,6 +419,12 @@ impl MockProvider {
             .insert(name.to_string(), message.to_string());
     }
 
+    /// Lifts [`MockProvider::protect_branch`]: `update_branch` on `name` takes
+    /// commits again.
+    pub fn unprotect_branch(&self, name: &str) {
+        self.inner.lock().unwrap().protected.remove(name);
+    }
+
     /// The message `create_commit` was given for `commit`.
     pub fn commit_message(&self, commit: &str) -> Option<String> {
         self.inner
@@ -647,7 +654,7 @@ impl MockProvider {
     /// and head, and no chain validation at all. The forge's own rules - a
     /// member's base ref must be the layer below's head ref, a closed top
     /// blocks an extend, a stacked proposal cannot be retargeted - are
-    /// modelled and exercised end to end in `crates/remote/tests/mock`, where
+    /// modelled and exercised end to end in `crates/remote/tests/it/mock`, where
     /// the stacked lifecycle lives. What these tests need from a forge is that
     /// a stacked share reaches the wire and comes back with populated chain
     /// values, and that is what this covers.

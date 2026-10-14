@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Deserialize a field that may be missing, `null` or a real value, mapping
 /// both an absent key and an explicit `null` to `T::default()`. Paired with
@@ -27,8 +27,36 @@ where
     Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
+/// `configure`'s `set`: a missing or null object is empty, and a number or a
+/// boolean value is read as its string form, so `{"token_budget": 4000}`
+/// means `{"token_budget": "4000"}`. The schema still advertises string
+/// values. A list or an object is refused with a sentence that says what to
+/// write.
+fn scalar_strings<'de, D>(deserializer: D) -> Result<BTreeMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<BTreeMap<String, serde_json::Value>>::deserialize(deserializer)?;
+    raw.unwrap_or_default()
+        .into_iter()
+        .map(|(key, value)| {
+            let text = match value {
+                serde_json::Value::String(text) => text,
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                _ => {
+                    return Err(serde::de::Error::custom(
+                        "set values are strings: write \"4000\"",
+                    ));
+                }
+            };
+            Ok((key, text))
+        })
+        .collect()
+}
+
 /// Parameters for `write_engram`.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WriteParams {
     /// The target domain. Required; there is no default domain for writes.
     pub domain: String,
@@ -93,7 +121,7 @@ pub struct WriteParams {
 }
 
 /// Parameters for `read_engram`.
-#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct ReadParams {
     /// A bare permalink, title or `crystalline://` URL. Without the scheme
     /// the identifier is domain-relative: never prefix it with a domain name.
@@ -119,7 +147,7 @@ pub struct ReadParams {
 }
 
 /// Parameters for `edit_engram`.
-#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct EditParams {
     /// A bare permalink, title or `crystalline://` URL. Without the scheme
     /// the identifier is domain-relative: never prefix it with a domain name.
@@ -260,7 +288,7 @@ pub struct RetireParams {
 
 /// Parameters for `split_engram`, the atomic move of part of an engram into a
 /// new one.
-#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct SplitParams {
     /// The source engram's domain. The new engram lands in the same domain.
     pub domain: String,
@@ -294,7 +322,7 @@ pub struct SplitParams {
 }
 
 /// Parameters for `move_engram`.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct MoveParams {
     /// A bare permalink, title or `crystalline://` URL. Without the scheme
     /// the identifier is domain-relative: never prefix it with a domain name.
@@ -331,7 +359,7 @@ pub struct MoveParams {
 }
 
 /// Parameters for `delete_engram`.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DeleteParams {
     /// A bare permalink, title or `crystalline://` URL. Without the scheme
     /// the identifier is domain-relative: never prefix it with a domain name.
@@ -348,7 +376,7 @@ pub struct DeleteParams {
 }
 
 /// Parameters for `search_engrams`.
-#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct SearchParams {
     /// The free-text query. Omit for a filter-only search.
     #[serde(default)]
@@ -367,8 +395,15 @@ pub struct SearchParams {
     /// matches exactly.
     #[serde(default)]
     pub status: Option<String>,
-    /// Frontmatter filters, `{ key: value }` or `{ key: { $gt: n } }`. The
-    /// filterable keys are the promoted ones (type, status, title, permalink,
+    /// Frontmatter filters, `{ key: value }` or `{ key: { $op: arg } }` with
+    /// $eq, $in, $gt, $gte, $lt, $lte, $between `[lo, hi]`, $contains or
+    /// $contains_any. $contains matches one element of a list exactly:
+    /// `{ sources: { $contains: "https://example.com/a" } }`. $contains_any
+    /// matches any of several:
+    /// `{ sources: { $contains_any: ["https://example.com/a", "https://example.com/b"] } }`.
+    /// A single value counts as a one-element list. $contains_any takes at
+    /// most 100 distinct values. The filterable keys are the promoted ones
+    /// (type, status, title, permalink,
     /// recorded_at, valid_from, valid_to, tags, plus timestamp for the write
     /// instant), every custom frontmatter key an engram carries (salience among
     /// them) and source_date, last_verified, stale_after, temporal_confidence,
@@ -398,7 +433,7 @@ pub struct SearchParams {
 }
 
 /// Parameters for `build_context`.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ContextParams {
     /// A `crystalline://domain/permalink` anchor. A `/*` suffix globs a prefix.
     pub anchor: String,
@@ -417,7 +452,7 @@ pub struct ContextParams {
 }
 
 /// Parameters for `recent_activity`.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RecentParams {
     /// Restrict to these domains. Defaults to every registered domain.
     #[serde(default, deserialize_with = "null_as_default")]
@@ -431,7 +466,7 @@ pub struct RecentParams {
 }
 
 /// Parameters for `list_domains`.
-#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct ListDomainsParams {
     /// Include each domain's MANIFEST `When to Use` routing bullets.
     #[serde(default)]
@@ -439,7 +474,7 @@ pub struct ListDomainsParams {
 }
 
 /// Parameters for `browse_domain`.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct BrowseParams {
     /// The domain to browse.
     pub domain: String,
@@ -455,7 +490,7 @@ pub struct BrowseParams {
 }
 
 /// Parameters for `validate_engrams`.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ValidateParams {
     /// The domain whose engrams to validate against its schema engrams.
     pub domain: String,
@@ -472,7 +507,7 @@ pub struct ValidateParams {
 }
 
 /// Parameters for `infer_schema`.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct InferParams {
     /// The domain to infer a schema from.
     pub domain: String,
@@ -485,7 +520,7 @@ pub struct InferParams {
 }
 
 /// Parameters for `vocabulary`.
-#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct VocabularyParams {
     /// Restrict to one domain. Omit for a vocabulary across every domain.
     #[serde(default)]
@@ -493,7 +528,7 @@ pub struct VocabularyParams {
 }
 
 /// Parameters for `evolve_engrams`.
-#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct EvolveParams {
     /// Restrict the sweep to these domains. Omit to sweep every registered
     /// domain.
@@ -538,14 +573,25 @@ pub struct EvolveParams {
 /// snapshot reports that the feature is off and how to turn it on, leaving
 /// the stored credential unread. `token` or `connect` handle a GitHub
 /// connect action on their own and ignore `set`/`unset` in the same call;
-/// give them on a separate call from a settings change.
-#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+/// give them on a separate call from a settings change. With `domain`, every
+/// key in `set` and `unset` is that domain's; instance settings go in a call
+/// without it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct ConfigureParams {
+    /// A domain to see and change instead of the instance. configure then
+    /// answers how that domain behaves: its MANIFEST policy keys (sharing,
+    /// generated_indexes, domain_name, read_only), what each MANIFEST section does and
+    /// its .crystalline.yaml rule overrides. set and unset then address that
+    /// domain: a policy key, rules.<rule id> (a verify rule's severity) or
+    /// token_budget. Omit it for the instance settings.
+    #[serde(default)]
+    pub domain: Option<String>,
     /// Settings to change, key to value, for example { "github.enabled":
-    /// "true" }. Applied in ascending key order; the first invalid key or
+    /// "true" }. Values are strings; a number or a boolean is read as its
+    /// string form. Applied in ascending key order; the first invalid key or
     /// value stops the rest and reports what was already applied. Omit or
     /// pass an empty object to leave settings unchanged.
-    #[serde(default, deserialize_with = "null_as_default")]
+    #[serde(default, deserialize_with = "scalar_strings")]
     pub set: BTreeMap<String, String>,
     /// Setting keys to reset to their default, applied after `set`. Omit or
     /// pass an empty array to leave settings unchanged.
@@ -566,8 +612,8 @@ pub struct ConfigureParams {
     #[serde(default)]
     pub token: Option<String>,
     /// A GitHub Enterprise Server host for this connect only, for example
-    /// github.example.com. Durable GitHub Enterprise Server setup is `set
-    /// github.api_url`.
+    /// github.example.com. It is never saved; a lasting GitHub Enterprise
+    /// Server setup is the operator's, with the crystalline CLI.
     #[serde(default)]
     pub host: Option<String>,
     /// With connect: github, abandon a pending sign-in and start a fresh
@@ -580,7 +626,7 @@ pub struct ConfigureParams {
 /// it a GitHub team domain, `virtual: true` a database-backed domain, and
 /// otherwise it is a local folder domain. `repo` and `virtual` are mutually
 /// exclusive.
-#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct AddDomainParams {
     /// The domain name. Optional for a team domain (defaults to the
     /// repository's own name) and for a local domain given a `folder` (defaults
@@ -616,7 +662,7 @@ pub struct AddDomainParams {
 }
 
 /// Parameters for `remove_domain`.
-#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct RemoveDomainParams {
     /// The registered domain to unregister.
     pub domain: String,
@@ -637,7 +683,7 @@ pub struct RemoveDomainParams {
 }
 
 /// Parameters for `share_changes`.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ShareChangesParams {
     /// The domain whose new knowledge to share.
     pub domain: String,
@@ -655,10 +701,18 @@ pub struct ShareChangesParams {
     /// unshared change. Folder indexes of the affected folders ride along.
     #[serde(default)]
     pub files: Option<Vec<String>>,
+    /// On a domain whose MANIFEST says sharing: direct: true shares the same
+    /// changes as a proposal instead of a commit on the branch, false tries
+    /// the direct commit only and never falls back. Omit it to let the share
+    /// decide: after the branch refused your direct commit once, a share
+    /// tries the commit again and opens a proposal when it is refused. A
+    /// domain that opens proposals ignores it.
+    #[serde(default)]
+    pub as_proposal: Option<bool>,
 }
 
 /// Parameters for `discard_changes`.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DiscardChangesParams {
     /// The team domain the changes belong to.
     pub domain: String,
@@ -673,7 +727,7 @@ pub struct DiscardChangesParams {
 }
 
 /// Parameters for `update_domain`.
-#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct UpdateDomainParams {
     /// The domain to bring up to date. Omit to update every shared domain.
     #[serde(default)]
@@ -681,7 +735,7 @@ pub struct UpdateDomainParams {
 }
 
 /// Parameters for `origin_status`.
-#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct OriginStatusParams {
     /// Restrict the review to this domain. Omit to review every shared
     /// domain.
@@ -702,17 +756,15 @@ pub struct OriginStatusParams {
 }
 
 /// Parameters for `resolve_conflict`.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ResolveConflictParams {
     /// The domain the conflict belongs to.
     pub domain: String,
     /// The domain-relative path of the flagged engram.
     pub path: String,
     /// One of mine (keep your version), theirs (take the team's version) or
-    /// merged (use `content`). On a 2026-07-28 peer that declared an
-    /// elicitation capability it may be omitted: the call then answers with a
-    /// mine-or-theirs question previewing both sides. merged cannot be chosen
-    /// through the question - call again with resolution merged and content.
+    /// merged (use `content`). Pass it on every call: a call without it is
+    /// refused with text that names the three values.
     #[serde(default)]
     pub resolution: Option<String>,
     /// The merged markdown content. Required when `resolution` is merged.
@@ -721,7 +773,7 @@ pub struct ResolveConflictParams {
 }
 
 /// Parameters for `withdraw_proposal`.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WithdrawProposalParams {
     /// The team domain the proposal belongs to.
     pub domain: String,
@@ -737,7 +789,7 @@ pub struct WithdrawProposalParams {
 }
 
 /// Parameters for `skills`.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SkillsParams {
     /// The skill to read in full. Omit for the index of every shipped skill
     /// with its description.
@@ -746,7 +798,7 @@ pub struct SkillsParams {
 }
 
 /// Parameters for `provision`.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ProvisionParams {
     /// What to do: "status" reports decisions, shipped artifacts and installed
     /// state; "allow" or "deny" records the user's decision for `domain` and
@@ -855,6 +907,7 @@ domain_args!(OriginStatusParams { opt domain });
 domain_args!(ResolveConflictParams { one domain });
 domain_args!(WithdrawProposalParams { one domain });
 domain_args!(ProvisionParams { opt domain });
+domain_args!(ConfigureParams { opt domain });
 
 // Every text a tool parameter carries may arrive with CRLF line endings, and is
 // taken as the LF text it means: what Crystalline stores is LF only, and a
@@ -1011,5 +1064,31 @@ mod tests {
         context.localize_domains(&eng);
         assert_eq!(context.anchor, "crystalline://eng-knowledge/ops/*");
         assert_eq!(context.domains, vec!["eng-knowledge"]);
+    }
+
+    /// The router forwards a call by serializing the params the MCP handler
+    /// parsed; what it sends has to parse back to the same call.
+    #[test]
+    fn forwarded_params_serialize_back_to_what_they_parsed() {
+        let raw = serde_json::json!({
+            "identifier": "crystalline://jordi-acme/runbooks/deploy",
+            "domain": "jordi-acme",
+            "operation": "append",
+            "content": "- [fact] x",
+        });
+        let parsed: EditParams = serde_json::from_value(raw.clone()).unwrap();
+        let again: EditParams =
+            serde_json::from_value(serde_json::to_value(&parsed).unwrap()).unwrap();
+        assert_eq!(again.identifier, parsed.identifier);
+        assert_eq!(again.domain, "jordi-acme");
+        assert_eq!(again.content.as_deref(), Some("- [fact] x"));
+        let search: SearchParams =
+            serde_json::from_value(serde_json::json!({ "query": "q", "type": "decision" }))
+                .unwrap();
+        let back = serde_json::to_value(&search).unwrap();
+        assert_eq!(
+            back["type"], "decision",
+            "renamed fields keep their wire name"
+        );
     }
 }

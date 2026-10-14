@@ -183,6 +183,8 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        self.refuse_read_only_domain(domain, &crate::scope::Scope::Unrestricted)
+            .await?;
         validate_attachment_path(path)?;
         if bytes.len() as u64 > crystalline_core::MAX_ATTACHMENT_BYTES {
             return Err(EngineError::Invalid(over_cap_error(
@@ -259,6 +261,8 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        self.refuse_read_only_domain(domain, &crate::scope::Scope::Unrestricted)
+            .await?;
         validate_attachment_path(path)?;
         let (domain_id, source) = self.domain_source(domain).await?;
         let mut file_removed = false;
@@ -317,6 +321,8 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        self.refuse_read_only_domain(view.domain(), &crate::scope::Scope::Unrestricted)
+            .await?;
         validate_attachment_path(path)?;
         if bytes.len() as u64 > crystalline_core::MAX_ATTACHMENT_BYTES {
             return Err(EngineError::Invalid(over_cap_error(
@@ -353,6 +359,7 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        self.refuse_read_only_domain(domain, scope).await?;
         self.attachment_write_joined(domain, path, bytes, scope, None)
             .await
     }
@@ -418,6 +425,8 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        self.refuse_read_only_domain(view.domain(), &crate::scope::Scope::Unrestricted)
+            .await?;
         validate_attachment_path(path)?;
         if let Some(actor) = view.actor() {
             view.tombstone_file(path).await?;
@@ -442,6 +451,7 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        self.refuse_read_only_domain(domain, scope).await?;
         self.attachment_delete_joined(domain, path, scope, None)
             .await
     }
@@ -676,10 +686,9 @@ impl Engine {
     /// from the database, which is where its whole engram actually is.
     ///
     /// That is one file read per engram in the domain, on a cross-domain move
-    /// that carries attachments and on the confirmation preview of a delete
-    /// whose engram references one ([`Engine::sole_referent_attachments`]). It
-    /// is the price of counting claims at all, both verbs are rare, and an
-    /// engram that references no attachment pays none of it.
+    /// that carries attachments. It is the price of counting claims at all,
+    /// the move is rare, and an engram that references no attachment pays none
+    /// of it.
     ///
     /// `None` when the text is genuinely absent (a row the index still lists
     /// for a file that is gone): text that is not there references nothing. A
@@ -1445,9 +1454,10 @@ impl Engine {
             .unwrap_or(0);
         if left < crystalline_index::MIN_CONTENT_LINES {
             return Err(EngineError::Invalid(format!(
-                "that selection would leave '{permalink}' with {left} content line(s), under the \
+                "that selection would leave '{permalink}' with {}, under the \
                  {} verify rule Q001 requires; move less, or retire the whole engram instead of \
                  splitting it",
+                crystalline_core::text::plural(left, "content line", "content lines"),
                 crystalline_index::MIN_CONTENT_LINES
             )));
         }

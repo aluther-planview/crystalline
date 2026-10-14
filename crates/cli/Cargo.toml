@@ -63,10 +63,12 @@ fluid-ui = ["crystalline-service/fluid-ui"]
 crystalline-service = { workspace = true }
 crystalline-index = { workspace = true }
 crystalline-core = { workspace = true }
-# Only `connect github` (inherently local: signing in is machine identity, not
-# content) uses this crate directly. Every other origin verb routes through
-# crystalline-service's socket-first client entry points, never linking this
-# crate for its in-process fallback.
+# `connect github` and the connected-server verbs (`connect <url>`,
+# `disconnect`, a local rename of a mounted domain, the source rows of
+# `status` and `doctor`) use this crate directly: signing in and the list of
+# sources are this machine's own, not content. Every origin verb routes
+# through crystalline-service's socket-first client entry points, never
+# linking this crate for its in-process fallback.
 crystalline-remote = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
@@ -78,6 +80,9 @@ similar = { workspace = true }
 chrono = { workspace = true }
 walkdir = { workspace = true }
 dunce = { workspace = true }
+# `doctor --merge-desktop-state` exports a private index from a copy in a
+# temporary folder, so the original is never opened.
+tempfile = { workspace = true }
 # Logs go to stderr only (stdout carries the routing block, hook output and
 # data a caller parses), filtered by RUST_LOG with a default of warn; a
 # lifecycle hook logs only when RUST_LOG is set, so a hook with nothing to
@@ -86,7 +91,13 @@ dunce = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+# A pasted token is read without echo at a terminal.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
+# The in-process Crystalline server the source tests connect to.
+axum = { workspace = true }
 assert_cmd = { workspace = true }
 predicates = "3.1.4"
 tempfile = { workspace = true }
@@ -105,5 +116,7 @@ fs4 = { workspace = true }
 
 # The job test in tests/daemon/service_windows.rs puts its own process in a
 # job that forbids breakaway, to see the daemon's refusal path end to end.
+# The session-end test there finds the daemon's hidden window and sends it
+# WM_ENDSESSION.
 [target.'cfg(windows)'.dev-dependencies]
-windows-sys = { workspace = true, features = ["Win32_Security", "Win32_System_JobObjects"] }
+windows-sys = { workspace = true, features = ["Win32_Security", "Win32_System_JobObjects", "Win32_UI_WindowsAndMessaging"] }

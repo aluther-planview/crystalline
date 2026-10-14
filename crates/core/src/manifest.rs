@@ -70,6 +70,19 @@ pub fn can_declare_name(source: &str) -> bool {
         .is_none_or(|parts| crate::frontmatter::key_blocks(parts.yaml).is_some())
 }
 
+/// The MANIFEST frontmatter key a domain declares itself read-only under. A
+/// switch, like [`SHARING_KEY`]: while it says `on`, every change to the
+/// domain through Crystalline is refused, whoever asks, and the only change
+/// accepted is its owner switching it back to `off`. Pulls from the team
+/// still apply, since the team repository stays the authority.
+pub const READ_ONLY_KEY: &str = "read_only";
+
+/// The `read_only` value that leaves the domain open: the default.
+const READ_ONLY_OFF: &str = "off";
+
+/// The `read_only` value that refuses every change.
+const READ_ONLY_ON: &str = "on";
+
 /// The starter MANIFEST engram for a new domain: valid frontmatter and the two
 /// required routing sections (`Scope`, `When to Use`) plus a `Notes for Agents`
 /// section, all as prompts to fill in. `today` is a pre-formatted `%Y-%m-%d`
@@ -122,6 +135,11 @@ pub struct Manifest {
     /// through [`Manifest::sharing`] for the policy in force and through
     /// [`Manifest::declared_sharing`] only to report on the text.
     sharing: Option<String>,
+    /// The [`READ_ONLY_KEY`] frontmatter value as written, or `None` when the
+    /// key is absent. Private for the reason `sharing` is: go through
+    /// [`Manifest::read_only`] for the switch in force and through
+    /// [`Manifest::declared_read_only`] only to report on the text.
+    read_only: Option<String>,
     /// The [`DOMAIN_NAME_KEY`] frontmatter value as written, rendered to
     /// text, or `None` when the key is absent. Private for the reason
     /// `generated_indexes` is: go through [`Manifest::domain_name`] for the
@@ -158,6 +176,7 @@ impl Manifest {
             .get(GENERATED_INDEXES_KEY)
             .map(scalar_text);
         let sharing = engram.frontmatter.extra.get(SHARING_KEY).map(scalar_text);
+        let read_only = engram.frontmatter.extra.get(READ_ONLY_KEY).map(scalar_text);
         let domain_name_extra = engram.frontmatter.extra.get(DOMAIN_NAME_KEY);
         let declared_domain_name = domain_name_extra.map(scalar_text);
         let domain_name_is_string = matches!(domain_name_extra, Some(YamlValue::String(_)));
@@ -201,6 +220,7 @@ impl Manifest {
             sections,
             generated_indexes,
             sharing,
+            read_only,
             declared_domain_name,
             domain_name,
             domain_name_is_string,
@@ -416,6 +436,26 @@ impl Manifest {
         }
     }
 
+    /// The `read_only` declaration exactly as the frontmatter writes it, or
+    /// `None` when the key is absent. For reporting only, never for deciding
+    /// behaviour: [`Manifest::read_only`] is what decides.
+    pub fn declared_read_only(&self) -> Option<&str> {
+        self.read_only.as_deref()
+    }
+
+    /// Whether this domain refuses every change through Crystalline.
+    ///
+    /// [`ReadOnly::On`] only when the frontmatter says `on` in exactly that
+    /// spelling. An absent key is `off`, and so is a value nobody recognizes:
+    /// the registry's rule for every key, reported by verify rule `M009`
+    /// instead of being obeyed.
+    pub fn read_only(&self) -> ReadOnly {
+        match self.read_only.as_deref() {
+            Some(READ_ONLY_ON) => ReadOnly::On,
+            _ => ReadOnly::Off,
+        }
+    }
+
     /// The `domain_name` declaration exactly as the frontmatter writes it,
     /// rendered to text whatever YAML shape it took, or `None` when the key
     /// is absent. For reporting only - a verify finding naming what a reader
@@ -456,6 +496,7 @@ impl Manifest {
                 self.declared_domain_name(),
                 self.domain_name().unwrap_or(""),
             )),
+            READ_ONLY_KEY => Some((self.declared_read_only(), self.read_only().as_str())),
             _ => None,
         }
     }
@@ -516,8 +557,12 @@ impl GeneratedIndexes {
 /// declares nothing, and it is today's behaviour byte for byte.
 /// [`Sharing::Direct`] is the deliberate choice of a team that wants no
 /// review step in front of its knowledge repository: a share then commits the
-/// selected files onto the branch in one commit, refuses while any proposal
-/// is still open, and answers a protected branch with the way out.
+/// selected files onto the branch in one commit and answers a protected
+/// branch with the way out. A direct share is refused while one of your own
+/// proposals is open, except one that names it (it amends it) and one made
+/// with `as_proposal` true or after the branch refused a share (it stacks on
+/// your open proposal or amends it). "Your own" means the GitHub login the
+/// share goes out on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Sharing {
     /// A share opens (or stacks, amends, updates) a proposal for review.
@@ -544,6 +589,42 @@ impl Sharing {
             SHARING_DIRECT => Some(Sharing::Direct),
             _ => None,
         }
+    }
+}
+
+/// Whether a domain refuses every change made through Crystalline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReadOnly {
+    /// The domain takes changes. The default, including for every MANIFEST
+    /// that declares nothing.
+    #[default]
+    Off,
+    /// Every write into the domain is refused, whoever asks.
+    On,
+}
+
+impl ReadOnly {
+    /// The value's spelling in the MANIFEST frontmatter.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReadOnly::Off => READ_ONLY_OFF,
+            ReadOnly::On => READ_ONLY_ON,
+        }
+    }
+
+    /// Parse a declared value, `None` when it spells neither. Exact and case
+    /// sensitive, like every other declaration a MANIFEST carries.
+    pub fn parse(value: &str) -> Option<ReadOnly> {
+        match value {
+            READ_ONLY_OFF => Some(ReadOnly::Off),
+            READ_ONLY_ON => Some(ReadOnly::On),
+            _ => None,
+        }
+    }
+
+    /// Whether this is [`ReadOnly::On`].
+    pub fn is_on(self) -> bool {
+        self == ReadOnly::On
     }
 }
 
@@ -580,6 +661,25 @@ pub fn sharing_at(root: &Path) -> Sharing {
         return Sharing::Proposal;
     };
     Manifest::from_engram(&engram, &source).sharing()
+}
+
+/// The [`ReadOnly`] switch a MANIFEST source declares. [`ReadOnly::Off`]
+/// whenever the source does not parse or declares nothing.
+pub fn read_only_of_source(markdown: &str) -> ReadOnly {
+    match parse_engram(markdown) {
+        Ok(engram) => Manifest::from_engram(&engram, markdown).read_only(),
+        Err(_) => ReadOnly::Off,
+    }
+}
+
+/// The [`ReadOnly`] switch the domain rooted at `root` declares in its
+/// `MANIFEST.md`. [`ReadOnly::Off`] whenever the MANIFEST is missing,
+/// unreadable, unparseable or declares nothing - the shape of [`sharing_at`].
+pub fn read_only_at(root: &Path) -> ReadOnly {
+    match std::fs::read_to_string(root.join("MANIFEST.md")) {
+        Ok(source) => read_only_of_source(&source),
+        Err(_) => ReadOnly::Off,
+    }
 }
 
 /// This domain's declared canonical [`Manifest::domain_name`], parsed from a
@@ -649,7 +749,7 @@ impl PolicyKind {
 /// One MANIFEST configuration key, as the domain policies card and the doctor
 /// read it. Every policy key has exactly one entry here, and the standing
 /// rule is that a key joins this registry and the card in the same change:
-/// the guard test in crates/core/tests/manifest.rs fails on a `pub const
+/// the guard test in crates/core/tests/it/manifest.rs fails on a `pub const
 /// *_KEY` this list does not name, and the card draws its rows from this
 /// list, so a key never has to be drawn by hand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -715,6 +815,14 @@ pub fn policy_registry() -> &'static [PolicyKey] {
             meaning: "The name this domain is known by everywhere; links from other domains use it.",
             changed_by: PolicyRole::Owner,
         },
+        PolicyKey {
+            key: READ_ONLY_KEY,
+            kind: PolicyKind::Choice,
+            values: &[READ_ONLY_OFF, READ_ONLY_ON],
+            default: READ_ONLY_OFF,
+            meaning: "Whether every change to this domain through Crystalline is refused; pulls from the team still apply.",
+            changed_by: PolicyRole::Owner,
+        },
     ]
 }
 
@@ -723,7 +831,7 @@ pub fn policy_registry() -> &'static [PolicyKey] {
 ///
 /// Beside the parser rather than in the web app, for the reason the policy
 /// registry is: an example shown to a person is a promise about what the
-/// parser accepts, and the guard test in crates/core/tests/manifest.rs parses
+/// parser accepts, and the guard test in crates/core/tests/it/manifest.rs parses
 /// every one of these back into the declaration it advertises, so a change to
 /// the grammar that forgets the example fails a test instead of shipping a
 /// wrong screenshot.
@@ -735,6 +843,8 @@ pub struct StarterStanza {
     pub meaning: &'static str,
     /// Markdown a person can save as it stands.
     pub example: &'static str,
+    /// Whether verify requires the section (`M003`): `Scope` and `When to Use`.
+    pub required: bool,
 }
 
 /// Every MANIFEST section a domain page offers to start, in display order.
@@ -744,21 +854,25 @@ pub fn starter_stanzas() -> &'static [StarterStanza] {
             section: "When to Use",
             meaning: "Agents pick this domain by these bullets. Without one, nothing routes here.",
             example: "## When to Use\n\n- Route here for questions about how our deployment pipeline works",
+            required: true,
         },
         StarterStanza {
             section: "Scope",
             meaning: "What belongs in this domain and what does not. Read for routing only when When to Use is empty.",
             example: "## Scope\n\n- Infrastructure and deployment, not application code",
+            required: true,
         },
         StarterStanza {
             section: "Provisioning",
             meaning: "Folders this domain installs into an AI harness: skills, commands, agents or MCP configs.",
             example: "## Provisioning\n\n- skills: skills",
+            required: false,
         },
         StarterStanza {
             section: "Tag Aliases",
             meaning: "Spellings that fold into one canonical tag, so a search for either finds both.",
             example: "## Tag Aliases\n\n- k8s -> kubernetes",
+            required: false,
         },
     ]
 }

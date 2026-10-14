@@ -88,11 +88,71 @@ export interface DomainSummary {
    * listing that predates the field.
    */
   renaming: boolean;
+  /**
+   * Whether this session cannot write into this domain right now, for any
+   * reason: the domain is locked, the role only reads, or the account's
+   * write list leaves it out. The row's `read_only`, which the server sends
+   * only when it is true; false for a listing that predates it. It hides
+   * write controls and says nothing about why: the lock a domain wears is
+   * its `read_only` policy row (see `useDomainWritable`), never this.
+   */
+  writeBlocked: boolean;
+}
+
+/** A domain this machine offers from a connected server: listed, not served. */
+export interface MountedDomain {
+  /** Its name on this machine. */
+  name: string;
+  /** The connected server's short name. */
+  source: string;
+  /** The server's address. */
+  sourceUrl: string;
+  /** Its name on the server. */
+  remoteName: string;
+  /** Its page on the server's own Fluid, or null when the listing did not say. */
+  webUrl: string | null;
+}
+
+/** Whether a link is plain http or https, the only kind this screen opens. */
+function isWebLink(value: string): boolean {
+  try {
+    const { protocol, username, password } = new URL(value);
+    return (
+      (protocol === "https:" || protocol === "http:") &&
+      username === "" &&
+      password === ""
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** Read one mounted domain, or null when it has no name or no source. */
+function readMounted(value: unknown): MountedDomain | null {
+  const record = asObject(value);
+  const name = record?.name;
+  const source = record?.source;
+  if (typeof name !== "string" || name === "" || typeof source !== "string") {
+    return null;
+  }
+  return {
+    name,
+    source,
+    sourceUrl: typeof record?.source_url === "string" ? record.source_url : "",
+    remoteName:
+      typeof record?.remote_name === "string" ? record.remote_name : name,
+    webUrl:
+      typeof record?.web_url === "string" && isWebLink(record.web_url)
+        ? record.web_url
+        : null,
+  };
 }
 
 /** Everything `GET /domains` says. */
 export interface DomainListing {
   domains: DomainSummary[];
+  /** The domains from connected servers, for an admin; empty otherwise. */
+  mounted: MountedDomain[];
   /** The behavior rules that govern every domain on this instance. */
   behavior: string[];
 }
@@ -124,6 +184,7 @@ function readDomain(value: unknown): DomainSummary | null {
         : null,
     shadowed: record?.shadowed === true,
     renaming: record?.renaming === true,
+    writeBlocked: record?.read_only === true,
   };
 }
 
@@ -135,6 +196,9 @@ export function readListing(payload: unknown): DomainListing {
     domains: domains
       .map(readDomain)
       .filter((domain): domain is DomainSummary => domain !== null),
+    mounted: (Array.isArray(record?.mounted) ? record.mounted : [])
+      .map(readMounted)
+      .filter((m): m is MountedDomain => m !== null),
     behavior: asStrings(record?.behavior),
   };
 }

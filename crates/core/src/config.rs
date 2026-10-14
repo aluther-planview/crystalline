@@ -98,6 +98,11 @@ pub struct GlobalConfig {
     /// defaults, so every existing config keeps working untouched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recall: Option<RecallConfig>,
+    /// Settings for the servers this machine offers domains from
+    /// (`crystalline connect`). Absent means the defaults, so every existing
+    /// config keeps working untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteConfig>,
     /// Write-provenance settings. Absent means the actor recorded on a write
     /// is derived from the connected client, so every existing config keeps
     /// working untouched.
@@ -310,6 +315,16 @@ impl GlobalConfig {
             .as_ref()
             .and_then(|r| r.min_score)
             .unwrap_or(DEFAULT_RECALL_MIN_SCORE)
+    }
+
+    /// How long a call over all domains waits for each connected server, from
+    /// `remote.deadline_ms`, clamped to 100 to 60000. Absent means 3000.
+    pub fn remote_deadline_ms(&self) -> u64 {
+        self.remote
+            .as_ref()
+            .and_then(|r| r.deadline_ms)
+            .unwrap_or(DEFAULT_REMOTE_DEADLINE_MS)
+            .clamp(100, 60_000)
     }
 
     /// The configured actor recorded as `generated.by` on every write, from
@@ -905,6 +920,20 @@ pub const DEFAULT_RECALL_LIMIT: u64 = 3;
 /// `research/2026-09-22-granite-thresholds.md`.
 pub const DEFAULT_RECALL_MIN_SCORE: f64 = 0.69;
 
+/// The `remote` block: how the local daemon treats its connected servers.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteConfig {
+    /// How long a call over all domains waits for each server, in
+    /// milliseconds, 100 to 60000. Absent means 3000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_ms: Option<u64>,
+}
+
+/// `remote.deadline_ms`'s default: three seconds per server for a call over
+/// all domains, after which the server's domains are left out of that answer
+/// and named.
+pub const DEFAULT_REMOTE_DEADLINE_MS: u64 = 3000;
+
 /// The `identity` block: who Crystalline records as the writer of an engram.
 /// Reads like a settings-page section - see the `configure` tool, which
 /// exposes exactly these keys.
@@ -1223,7 +1252,13 @@ pub struct DomainConfig {
 }
 
 /// Verify overrides for a domain.
+///
+/// Read through [`RawVerifyConfig`], so one rule override whose value is not
+/// a word (`E007: 1`, `E001: false`) is kept aside in `not_words` and
+/// reported per rule, instead of failing the whole file and taking every
+/// other override with it.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(from = "RawVerifyConfig")]
 pub struct VerifyConfig {
     /// Rule id to severity overrides.
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
@@ -1237,6 +1272,56 @@ pub struct VerifyConfig {
     /// Required file entries.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_files: Vec<RequiredFile>,
+    /// The rules whose override value is not a word at all, in file order.
+    /// They take no effect and are reported as `M108`; never written back.
+    #[serde(skip)]
+    pub not_words: Vec<String>,
+}
+
+/// What `.crystalline.yaml`'s `verify` block deserializes as before it
+/// becomes a [`VerifyConfig`]: a rule value may be anything, and only a word
+/// becomes an override.
+#[derive(Deserialize)]
+struct RawVerifyConfig {
+    #[serde(default)]
+    rules: IndexMap<String, RuleValue>,
+    #[serde(default)]
+    token_budget: Option<usize>,
+    #[serde(default)]
+    token_budgets: IndexMap<String, usize>,
+    #[serde(default)]
+    required_files: Vec<RequiredFile>,
+}
+
+/// One rule override's value: a word, or anything else (a number, a boolean,
+/// a list), which is kept only as the fact that it was not a word.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RuleValue {
+    Word(String),
+    NotAWord(serde::de::IgnoredAny),
+}
+
+impl From<RawVerifyConfig> for VerifyConfig {
+    fn from(raw: RawVerifyConfig) -> VerifyConfig {
+        let mut rules = IndexMap::new();
+        let mut not_words = Vec::new();
+        for (rule, value) in raw.rules {
+            match value {
+                RuleValue::Word(word) => {
+                    rules.insert(rule, word);
+                }
+                RuleValue::NotAWord(_) => not_words.push(rule),
+            }
+        }
+        VerifyConfig {
+            rules,
+            token_budget: raw.token_budget,
+            token_budgets: raw.token_budgets,
+            required_files: raw.required_files,
+            not_words,
+        }
+    }
 }
 
 /// A required file entry within a domain's verify config.
@@ -1408,8 +1493,76 @@ fn base() -> Result<impl BaseStrategy, ConfigError> {
     etcetera::choose_base_strategy().map_err(|e| ConfigError::Home(e.to_string()))
 }
 
+/// Whether `path` lies in an app package's private store,
+/// `...\Packages\<family>\LocalCache\Roaming`. Split on both separators, so
+/// a Windows path reads the same on any machine a test runs on, and compared
+/// without regard to ASCII case, as Windows compares paths.
+pub fn names_package_local_cache(path: &Path) -> bool {
+    let text = path.to_string_lossy().to_ascii_lowercase();
+    let parts: Vec<&str> = text.split(['/', '\\']).filter(|p| !p.is_empty()).collect();
+    parts
+        .windows(4)
+        .any(|w| w[0] == "packages" && w[2] == "localcache" && w[3] == "roaming")
+}
+
+/// The roaming root on Windows: `APPDATA` as it is, unless it names an app
+/// package's private store, which is where Claude Desktop's package may
+/// point it. Then, and when it is unset or empty, the known folder
+/// (`known`), so the state folder and the pipe name derived from it match
+/// the ones every process outside the package uses. `None` when neither
+/// answers, and the caller falls back to etcetera.
+pub fn roaming_root(
+    appdata: Option<&std::ffi::OsStr>,
+    known: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    match appdata.filter(|value| !value.is_empty()) {
+        Some(value) if !names_package_local_cache(Path::new(value)) => Some(PathBuf::from(value)),
+        _ => known(),
+    }
+}
+
+/// `FOLDERID_RoamingAppData` from the shell, the call etcetera makes when
+/// `APPDATA` is unset.
+#[cfg(windows)]
+fn known_roaming_folder() -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Foundation::S_OK;
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{
+        FOLDERID_RoamingAppData, KF_FLAG_DONT_VERIFY, SHGetKnownFolderPath,
+    };
+    let mut raw: windows_sys::core::PWSTR = std::ptr::null_mut();
+    // SAFETY: a known folder id, no token (the current user) and an out
+    // pointer the call fills with a string it allocates.
+    let rc = unsafe {
+        SHGetKnownFolderPath(
+            &FOLDERID_RoamingAppData,
+            KF_FLAG_DONT_VERIFY as u32,
+            std::ptr::null_mut(),
+            &mut raw,
+        )
+    };
+    let path = (rc == S_OK && !raw.is_null()).then(|| {
+        let mut len = 0usize;
+        // SAFETY: the call returned a NUL-terminated wide string.
+        while unsafe { *raw.add(len) } != 0 {
+            len += 1;
+        }
+        // SAFETY: `len` wide chars before the NUL, all initialized.
+        let wide = unsafe { std::slice::from_raw_parts(raw, len) };
+        PathBuf::from(std::ffi::OsString::from_wide(wide))
+    });
+    // SAFETY: frees what the call allocated; a null pointer is a no-op.
+    unsafe { CoTaskMemFree(raw.cast()) };
+    path
+}
+
 /// The application config directory, for example `~/.config/crystalline`.
 pub fn config_dir() -> Result<PathBuf, ConfigError> {
+    #[cfg(windows)]
+    if let Some(root) = roaming_root(std::env::var_os("APPDATA").as_deref(), known_roaming_folder) {
+        return Ok(root.join(APP));
+    }
     Ok(base()?.config_dir().join(APP))
 }
 
@@ -1419,7 +1572,13 @@ pub fn global_config_path() -> Result<PathBuf, ConfigError> {
 }
 
 /// The application state directory, for example `~/.local/state/crystalline`.
+/// Windows has no state directory, so it is the roaming folder, like the
+/// config directory.
 pub fn state_dir() -> Result<PathBuf, ConfigError> {
+    #[cfg(windows)]
+    if let Some(root) = roaming_root(std::env::var_os("APPDATA").as_deref(), known_roaming_folder) {
+        return Ok(root.join(APP));
+    }
     let b = base()?;
     let root = b.state_dir().unwrap_or_else(|| b.data_dir());
     Ok(root.join(APP))
@@ -2184,5 +2343,69 @@ mod tests {
             Some("platform")
         );
         assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn a_plain_appdata_is_taken_as_it_is() {
+        let known = || -> Option<PathBuf> { panic!("the known folder is not asked") };
+        assert_eq!(
+            roaming_root(
+                Some(std::ffi::OsStr::new(r"C:\Users\ada\AppData\Roaming")),
+                known
+            ),
+            Some(PathBuf::from(r"C:\Users\ada\AppData\Roaming"))
+        );
+        assert_eq!(
+            roaming_root(Some(std::ffi::OsStr::new("/tmp/cq-x/roaming")), || None),
+            Some(PathBuf::from("/tmp/cq-x/roaming")),
+            "a test home's APPDATA is kept"
+        );
+    }
+
+    #[test]
+    fn an_appdata_inside_a_package_local_cache_resolves_from_the_known_folder() {
+        let real = PathBuf::from(r"C:\Users\ada\AppData\Roaming");
+        for private in [
+            r"C:\Users\ada\AppData\Local\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming",
+            r"c:\users\ada\appdata\local\packages\claude_pzs8sxrjxfjjc\localcache\roaming\",
+            "/c/Users/ada/AppData/Local/Packages/X/LocalCache/Roaming",
+        ] {
+            assert_eq!(
+                roaming_root(Some(std::ffi::OsStr::new(private)), || Some(real.clone())),
+                Some(real.clone()),
+                "{private}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_appdata_asks_the_known_folder_and_nothing_at_all_is_none() {
+        let real = PathBuf::from(r"C:\Users\ada\AppData\Roaming");
+        assert_eq!(
+            roaming_root(None, || Some(real.clone())),
+            Some(real.clone())
+        );
+        assert_eq!(
+            roaming_root(Some(std::ffi::OsStr::new("")), || Some(real.clone())),
+            Some(real)
+        );
+        assert_eq!(roaming_root(None, || None), None);
+    }
+
+    #[test]
+    fn only_the_whole_packages_localcache_roaming_shape_is_a_private_store() {
+        assert!(names_package_local_cache(std::path::Path::new(
+            r"D:\u\AppData\Local\Packages\Claude_x\LocalCache\Roaming"
+        )));
+        assert!(!names_package_local_cache(std::path::Path::new(
+            r"D:\u\AppData\Local\Packages\Claude_x\LocalState"
+        )));
+        assert!(
+            !names_package_local_cache(std::path::Path::new(r"D:\Packages\LocalCache\Roaming")),
+            "the package folder name is required"
+        );
+        assert!(!names_package_local_cache(std::path::Path::new(
+            r"D:\u\AppData\Roaming"
+        )));
     }
 }

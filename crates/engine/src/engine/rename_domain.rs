@@ -132,6 +132,12 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        self.refuse_hidden_admin(old, scope).await?;
+        // A full rename writes the domain's MANIFEST; a `--local` one changes
+        // only this machine's name and writes nothing into the domain.
+        if !local_only {
+            self.refuse_read_only_domain(old, scope).await?;
+        }
         // A rename moves this machine's state folders and writes its
         // configuration under a journal in the state directory: only the
         // process that holds that directory runs one, so no two processes
@@ -287,6 +293,19 @@ impl Engine {
                      first"
                 )
             }));
+        }
+        // A name a connected server holds (mounted, or kept for a domain it
+        // does not offer right now) is that source's (decision D13): the
+        // renamed domain would be hidden under it at once. One check for both
+        // modes. A caller who is not the owner is not told which server.
+        if let Some(source) = self.mount_holder(new) {
+            return Err(EngineError::Conflict(
+                if matches!(scope, crate::scope::Scope::Unrestricted) {
+                    format!("'{new}' is a domain from {source} on this machine; pick another name")
+                } else {
+                    format!("'{new}' cannot be used as a name here")
+                },
+            ));
         }
         let reviewing_draft = if local_only {
             false
@@ -1238,7 +1257,9 @@ impl Engine {
             if hidden.contains(name) {
                 continue;
             }
-            if self.write_right(scope, name).await? >= crate::scope::DomainRight::Write {
+            if self.write_right(scope, name).await? >= crate::scope::DomainRight::Write
+                && !self.domain_is_read_only(name).await
+            {
                 writable.push(name.clone());
             }
         }
@@ -1409,6 +1430,9 @@ impl Engine {
         // After both configurations hold the new name: a lookup that took the
         // stale mark persist set would have built from the old snapshot.
         self.mark_names_stale();
+        // The mount table reads this machine's names: a domain that moved
+        // off or onto a name a source gave out is shown or hidden at once.
+        self.sync_sources_local();
         if let Some(tx) = &self.watch_tx
             && !entry.is_virtual()
             && let Some(root) = entry.file_path()

@@ -755,6 +755,12 @@ export type ManifestResponse = {
      */
     markdown: string;
     /**
+     * True when the domain has no MANIFEST yet. `markdown` is then empty,
+     * `checksum` is the checksum of the empty text, and a `PUT` carrying it
+     * as `If-Match` creates the MANIFEST.
+     */
+    missing: boolean;
+    /**
      * The features read out of the markdown.
      */
     sections: ManifestSections;
@@ -1479,6 +1485,25 @@ export type ReviewBody = {
 export type ReviewModeArg = 'overlay' | 'direct';
 
 /**
+ * The form of `POST /oauth/revoke` (RFC 7009 section 2.1).
+ */
+export type RevokeForm = {
+    /**
+     * The registration the token was issued to.
+     */
+    client_id?: string | null;
+    /**
+     * The access token (`coa_`) or refresh token (`cor_`) to revoke. Either
+     * ends the whole grant.
+     */
+    token?: string | null;
+    /**
+     * `access_token` or `refresh_token`. A hint only: the prefix decides.
+     */
+    token_type_hint?: string | null;
+};
+
+/**
  * What a user may do. Ordered least to most privileged; the REST layer maps
  * each endpoint to the minimum role it accepts.
  */
@@ -1543,6 +1568,12 @@ export type SetupBody = {
  * The proposal's title and description, optionally the open proposal to amend instead of stacking a new layer, and optionally the files to carry. All optional: with none of them, the share carries every unshared change under a title the engine generates from the changes themselves, and targets the layer it picks itself.
  */
 export type ShareBody = {
+    /**
+     * On a domain that shares directly: `true` opens a proposal for this
+     * share, `false` tries the direct commit only and never falls back.
+     * Absent lets the engine decide from the refusal it recorded.
+     */
+    as_proposal?: boolean | null;
     /**
      * A longer description of what changed and why.
      */
@@ -2092,7 +2123,8 @@ export type OidcLoginData = {
         link?: boolean;
         /**
          * Where to send the browser once the sign-in completes: a path on this
-         * instance, which the callback 302s to instead of `/`.
+         * instance, which the callback 302s to instead of the root of the base
+         * path.
          *
          * The OAuth consent page is what this exists for. A client sends a
          * browser to `/authorize?request=<id>`, Fluid finds nobody signed in and
@@ -2101,8 +2133,8 @@ export type OidcLoginData = {
          * only reachable by its id, so landing anywhere else loses it.
          *
          * Anything [`safe_return_path`] does not accept is dropped rather than
-         * refused, and the sign-in lands on `/`: the person did sign in, and only
-         * the destination was unusable.
+         * refused, and the sign-in lands on the root of the base path (`/` at the
+         * root): the person did sign in, and only the destination was unusable.
          */
         return_to?: string;
     };
@@ -2367,6 +2399,8 @@ export type ListDomainsResponses = {
      * A domain that reviews changes before they land carries `review: "overlay"` and, for a caller with an account, `my_drafts`: how many draft changes of theirs are waiting to be shared. Both are absent on a domain that takes changes directly, and `my_drafts` is absent rather than zero when there is no account to count for - a client reads presence, since null and 0 are different facts.
      *
      * Every domain also carries `canonical_name` (the name its content carries), `aliases` (its former local names, still accepted as input), `name_origin` (`explicit` or `derived`, `null` for a legacy entry nothing has inferred yet), `shadowed` (whether another domain's local name already holds this one's canonical name - a bool, never naming the other domain) and `renaming` (whether a rename has this domain paused right now; always present, so every row keeps the same columns).
+     *
+     * For an instance admin, `mounted` lists the domains this machine offers from connected servers (`crystalline connect`): each one's local `name`, its `source`, the server's `source_url`, its `remote_name` there and the `web_url` of its page on that server (`null` unless the address is http or https). They are not served here.
      */
     200: {
         [key: string]: unknown;
@@ -3610,7 +3644,7 @@ export type GetDomainManifestErrors = {
      */
     403: ProblemDetail;
     /**
-     * No such domain, or the domain carries no MANIFEST yet.
+     * No such domain.
      */
     404: ProblemDetail;
 };
@@ -3704,7 +3738,7 @@ export type SaveDomainManifestErrors = {
      */
     403: ProblemDetail;
     /**
-     * No such domain, or the domain carries no MANIFEST yet.
+     * No such domain.
      */
     404: ProblemDetail;
     /**
@@ -4165,7 +4199,7 @@ export type GetDomainSyncStatusError = GetDomainSyncStatusErrors[keyof GetDomain
 
 export type GetDomainSyncStatusResponses = {
     /**
-     * The engine's own status report for this one domain, plus the mode it is synced in and this instance's GitHub connection. `local_changes` is the unshared-work count a client shows as pending, counting real work only: a refreshed folder listing (`index.md`) is derived from the engrams beside it and is never the reason for a share, riding along with one where the domain's MANIFEST declares `generated_indexes: shared` and staying on this machine where it does not. On a stacked chain the count is taken against the chain tip, so work an open proposal already carries is not counted as unshared and the count agrees with the share plan. `owned_changes` counts how many of those changes THIS session's account last wrote, by the changed file's own `generated.by` line - last-writer provenance, never authorship - so a surface can say `2 of 5 unshared changes are yours`. It is null when the request carries no session account or the domain's origin state cannot be read, which is a different thing from zero; `probe_error` is set when the live check could not reach GitHub and the rest of the report came from local state alone; `connection.connected` is false when no credential is on file, which is why a disconnected instance still answers here instead of refusing. `merged_unconsumed` names, by number, the proposals a live check found merged upstream that this domain has not pulled in yet: they stand in neither proposal list, and the next sync consumes them. Each proposal record carries `author_login`, the GitHub login the share that wrote it acted as - null on records shared before this was recorded and whenever the acting credential has no login to name, so a client shows it where it is present and nothing where it is not. `sharing` names the domain's policy and `direct_shares` the commits this machine put straight on the branch.
+     * The engine's own status report for this one domain, plus the mode it is synced in and this instance's GitHub connection. `local_changes` is the unshared-work count a client shows as pending, counting real work only: a refreshed folder listing (`index.md`) is derived from the engrams beside it and is never the reason for a share, riding along with one where the domain's MANIFEST declares `generated_indexes: shared` and staying on this machine where it does not. On a stacked chain the count is taken against the chain tip, so work an open proposal already carries is not counted as unshared and the count agrees with the share plan. `owned_changes` counts how many of those changes THIS session's account last wrote, by the changed file's own `generated.by` line - last-writer provenance, never authorship - so a surface can say `2 of 5 unshared changes are yours`. It is null when the request carries no session account or the domain's origin state cannot be read, which is a different thing from zero; `probe_error` is set when the live check could not reach GitHub and the rest of the report came from local state alone; `connection.connected` is false when no credential is on file, which is why a disconnected instance still answers here instead of refusing. `merged_unconsumed` names, by number, the proposals a live check found merged upstream that this domain has not pulled in yet: they stand in neither proposal list, and the next sync consumes them. Each proposal record carries `author_login`, the GitHub login the share that wrote it acted as - null on records shared before this was recorded and whenever the acting credential has no login to name, so a client shows it where it is present and nothing where it is not. `sharing` names the domain's policy and `direct_shares` the commits this machine put straight on the branch. `direct_refused` is null, or names the `branch`, the forge's `message`, `refused_at` and the `line` to show when the branch refused a direct commit made under the GitHub login this session's shares go out on; another login's refusal never shows, nor any on a domain that opens proposals. Show that line as given.
      *
      * Four keys say where the domain's chain of stacked proposals stands. `stack_number` is the chain's number on the forge, null when nothing is stacked. `stack_wedged` lists the declined layers still carrying open layers above them, empty when the chain is sound - a client surfaces those numbers, because a wedged chain cannot grow until one of them is withdrawn or reopened. `repair_pending` and `stack_link_pending` are the two debts a caller settles by sharing or by checking status again: a rebuild left half-done, and a chain whose layers all exist but are not grouped on the forge yet. All four are always present, quiet rather than absent off the stacked path, so one reader handles either path.
      *
@@ -5561,6 +5595,44 @@ export type RegisterOauthClientResponses = {
 };
 
 export type RegisterOauthClientResponse = RegisterOauthClientResponses[keyof RegisterOauthClientResponses];
+
+export type OauthRevokeData = {
+    /**
+     * The revocation request.
+     */
+    body: RevokeForm;
+    path?: never;
+    query?: never;
+    url: '/api/v1/oauth/revoke';
+};
+
+export type OauthRevokeErrors = {
+    /**
+     * The body is not a form, or it lacks `token` or `client_id` (`invalid_request`).
+     */
+    400: OauthErrorBody;
+    /**
+     * A cookie session did not echo its CSRF token.
+     */
+    403: ProblemDetail;
+    /**
+     * This instance does not serve OAuth: `auth.oauth` is off.
+     */
+    404: ProblemDetail;
+    /**
+     * The accounts database could not be reached.
+     */
+    500: OauthErrorBody;
+};
+
+export type OauthRevokeError = OauthRevokeErrors[keyof OauthRevokeErrors];
+
+export type OauthRevokeResponses = {
+    /**
+     * Revoked, or nothing to revoke.
+     */
+    200: unknown;
+};
 
 export type OauthTokenData = {
     /**

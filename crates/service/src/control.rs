@@ -4,11 +4,12 @@
 //! one line `{ "v": 1, "ok": true, "data": ... }` or
 //! `{ "v": 1, "ok": false, "error": ... }`. Commands: sync, status, reindex,
 //! file_stamps, collect_orphaned_domains, name_report, fix_local_spellings,
-//! sessions, tool, configure, domain_rename, origin_add,
+//! sessions, holder, tool, configure, domain_rename, origin_add,
 //! origin_update, origin_status,
 //! origin_share, origin_withdraw, origin_changes, origin_discard, origin_resolve,
 //! provision, forget_domain,
-//! forget_credential, shutdown. This is the operator channel plus the `tool` command, which
+//! forget_credential, sources_reload, mounted_routing, shutdown. This is the
+//! operator channel plus the `tool` command, which
 //! dispatches a daemon-attached CLI data verb to the shared engine and
 //! returns raw engine JSON; an MCP client's data operations still go over the
 //! MCP handshake.
@@ -102,10 +103,44 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                     if let (Value::Object(a), Value::Object(b)) = (&mut data, report) {
                         a.extend(b);
                     }
+                    // The connected servers, and the local domains they hide.
+                    data["sources"] = crate::route::sources_status(&shared.engine);
+                    let mut hidden: Vec<String> =
+                        shared.engine.shadowed_domains().into_iter().collect();
+                    hidden.sort();
+                    data["shadowed_domains"] = json!(hidden);
                     (envelope_ok(data), false)
                 }
                 Err(e) => (envelope_err(e.to_string()), false),
             }
+        }
+        // Who this daemon is, from memory: the record it published plus its
+        // state folder. A client asks this before it attaches, instead of
+        // trusting a `service.json` that may be stale or private, so it must
+        // never touch the store (`status` does).
+        "holder" => {
+            let mut data = match crate::instance::published_record() {
+                Some(record) => serde_json::to_value(record).unwrap_or_else(|_| json!({})),
+                None => json!({
+                    "pid": shared.pid,
+                    "version": crystalline_core::VERSION,
+                    "mcp_line_options": true,
+                }),
+            };
+            // A record published without a serve intent (the `hold-lock`
+            // test command) carries no `runs_in`; read it now instead.
+            if data.get("runs_in").is_none_or(Value::is_null) {
+                data["runs_in"] = json!(crate::runs_in::RunsIn::here());
+            }
+            data["state_dir"] = json!(
+                crystalline_core::config::state_dir()
+                    .ok()
+                    .map(|dir| dir.display().to_string())
+            );
+            // The config file it loaded, spelled the way a client spells its
+            // own, so `status` and `doctor` can compare the two.
+            data["config_path"] = json!(crate::instance::holder_config_path());
+            (envelope_ok(data), false)
         }
         "sessions" => (
             envelope_ok(json!({
@@ -119,13 +154,110 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         // than the MCP stream's format-dependent tool envelope (TOON by
         // default). The engine methods self-guard read-only mutations, so this
         // keeps the same refusals the MCP path gave.
+        //
+        // The caller is this machine's owner, so a call for a domain from a
+        // connected server goes to that server and a call over all domains
+        // asks every server too (`crate::route`). With no server connected
+        // the answer is exactly the engine's.
         "tool" => {
             let tool = req.get("tool").and_then(Value::as_str).unwrap_or("");
             let args = req.get("args").cloned().unwrap_or_else(|| json!({}));
-            match crate::client::dispatch_engine(&shared.engine, tool, args).await {
+            // A caller on a budget (the recall hook) says how long a source
+            // may take; it never waits longer than the route's own limits.
+            // Zero is no budget at all, so it is read as none given.
+            let deadline = req
+                .get("deadline_ms")
+                .and_then(Value::as_u64)
+                .filter(|ms| *ms > 0)
+                .map(std::time::Duration::from_millis);
+            let agent = crystalline_remote::ForwardedAgent::default();
+            match crate::route::run_tool_routed(&shared.engine, tool, args, &agent, deadline).await
+            {
                 Ok(data) => (envelope_ok(data), false),
                 Err(e) => (envelope_err(e.to_string()), false),
             }
+        }
+        // `crystalline connect`, `disconnect` and `domain rename --local`
+        // wrote sources.json from their own process: read it again (with this
+        // machine's domains as they stand now), and ask the sources once in
+        // the background.
+        "sources_reload" => {
+            let said = match shared.engine.sources() {
+                Some(sources) => {
+                    let mut said = sources.set_local(shared.engine.local_domains());
+                    said.extend(sources.reload());
+                    let refreshing = sources.clone();
+                    tokio::spawn(async move {
+                        refreshing
+                            .refresh(crystalline_remote::ONE_DOMAIN_LIMIT)
+                            .await;
+                    });
+                    // Both halves can say the same thing: once is enough.
+                    let mut once = Vec::new();
+                    for announcement in said {
+                        if !once.contains(&announcement) {
+                            once.push(announcement);
+                        }
+                    }
+                    once
+                }
+                None => Vec::new(),
+            };
+            let said: Vec<String> = said.iter().map(ToString::to_string).collect();
+            (envelope_ok(json!({ "announcements": said })), false)
+        }
+        // Session start: every source's routing model, refreshed through its
+        // etag within the deadline, then the mounted part from the caches.
+        "mounted_routing" => {
+            // How long the caller waits for this answer. The refresh itself
+            // runs with the configured deadline in a task of its own, so a
+            // server that is slow but up is never counted as failed (marked
+            // down, its pool dropped) because a caller stopped waiting. It
+            // finishes in the background and updates the cache.
+            let refresh_deadline =
+                std::time::Duration::from_millis(shared.engine.config().remote_deadline_ms());
+            let wait = req
+                .get("deadline_ms")
+                .and_then(Value::as_u64)
+                .map(std::time::Duration::from_millis)
+                .unwrap_or(refresh_deadline);
+            // `shadowed` is said only when this daemon has its sources: one
+            // serving an explicit --db or --config has none, and a hook then
+            // reads the caches itself rather than lose the hidden copies and
+            // the mounts both.
+            let (routing, shadowed) = match shared.engine.sources() {
+                Some(sources) => {
+                    sources.reload_if_changed();
+                    crate::route::sync_local(&shared.engine, &sources).await;
+                    let unasked = if sources.is_empty() {
+                        Default::default()
+                    } else {
+                        refresh_within(&sources, refresh_deadline, wait).await
+                    };
+                    (
+                        sources.mounted_routing_unasked(&unasked),
+                        Some(sources.shadowed()),
+                    )
+                }
+                None => (crystalline_remote::MountedRouting::default(), None),
+            };
+            let domains: Vec<Value> = routing
+                .domains
+                .iter()
+                .map(|m| {
+                    json!({
+                        "name": m.local,
+                        "source": m.source,
+                        "bullets": m.bullets,
+                        "domain_read_only": m.domain_read_only,
+                    })
+                })
+                .collect();
+            let mut answer = json!({ "domains": domains, "stale": routing.stale });
+            if let Some(shadowed) = shadowed {
+                answer["shadowed"] = json!(shadowed);
+            }
+            (envelope_ok(answer), false)
         }
         "sync" => {
             let domain = req.get("domain").and_then(Value::as_str);
@@ -495,25 +627,19 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         // below. That is the final answer for this transport, not a
         // placeholder waiting for a session.
         "origin_share" => {
-            let domain = req.get("domain").and_then(Value::as_str).unwrap_or("");
-            let title = req.get("title").and_then(Value::as_str);
-            let description = req.get("description").and_then(Value::as_str);
-            let proposal = match optional_number(req, "proposal") {
-                Ok(proposal) => proposal,
-                Err(message) => return (envelope_err(message), false),
-            };
-            let files = match optional_string_list(req, "files") {
-                Ok(files) => files,
+            let share = match share_request(req) {
+                Ok(share) => share,
                 Err(message) => return (envelope_err(message), false),
             };
             match shared
                 .engine
-                .origin_share(
-                    domain,
-                    title,
-                    description,
-                    proposal,
-                    files.as_deref(),
+                .origin_share_with(
+                    share.domain,
+                    share.title,
+                    share.description,
+                    share.proposal,
+                    share.files.as_deref(),
+                    share.as_proposal,
                     ShareActor::Owner,
                 )
                 .await
@@ -547,7 +673,9 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
             let domain = req.get("domain").and_then(Value::as_str).unwrap_or("");
             let path = req.get("path").and_then(Value::as_str);
             let sides = req.get("sides").and_then(Value::as_bool).unwrap_or(false);
-            match origin_changes_inline(&shared.engine, domain, path, sides).await {
+            match origin_changes_inline(&shared.engine, domain, path, sides, &ShareActor::Owner)
+                .await
+            {
                 Ok(data) => (envelope_ok(data), false),
                 Err(e) => (envelope_err(e.to_string()), false),
             }
@@ -656,7 +784,7 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         }
         other => (
             envelope_err(format!(
-                "unknown ctl command '{other}'; expected status, sessions, tool, sync, reindex, \
+                "unknown ctl command '{other}'; expected status, sessions, holder, tool, sync, reindex, \
                  routing_bullets, scaffold_manifest, domain_import, domain_export, \
                  domain_remove, domain_review, domain_rename, retag, collect_orphaned_domains, \
                  name_report, fix_local_spellings, configure, origin_add, origin_update, \
@@ -682,23 +810,20 @@ pub(crate) async fn origin_changes_inline(
     domain: &str,
     path: Option<&str>,
     sides: bool,
+    actor: &ShareActor,
 ) -> crate::engine::Result<Value> {
     if let Some(path) = path {
-        let mut listed = engine.local_changes(domain, &ShareActor::Owner).await?;
+        let mut listed = engine.local_changes(domain, actor).await?;
         // Resolved through the detail, which is what refuses an unknown path
         // by name; the list is then exactly that one entry.
-        let one = engine
-            .local_change(domain, path, &ShareActor::Owner, None)
-            .await?;
+        let one = engine.local_change(domain, path, actor, None).await?;
         listed["changes"] = json!([one]);
         return Ok(listed);
     }
     if sides {
-        return engine
-            .local_changes_detailed(domain, &ShareActor::Owner)
-            .await;
+        return engine.local_changes_detailed(domain, actor).await;
     }
-    engine.local_changes(domain, &ShareActor::Owner).await
+    engine.local_changes(domain, actor).await
 }
 
 /// Run a background-equivalent embed pass and record the count on the response.
@@ -739,6 +864,37 @@ async fn embed_onto_response(engine: &Engine, embed: bool, data: &mut Value) {
             map.insert("embed_error".to_string(), json!(e.to_string()));
         }
     }
+}
+
+/// An `origin_share` request as the daemon reads it.
+#[derive(Debug, PartialEq)]
+struct ShareRequest<'a> {
+    domain: &'a str,
+    title: Option<&'a str>,
+    description: Option<&'a str>,
+    proposal: Option<u64>,
+    files: Option<Vec<String>>,
+    as_proposal: Option<bool>,
+}
+
+/// Reads an `origin_share` request, the one `client::origin_share_request`
+/// builds. `as_proposal` must be a boolean when it is there at all: a value of
+/// another type is refused rather than read as absent, which would let the
+/// share commit directly.
+fn share_request(req: &Value) -> Result<ShareRequest<'_>, String> {
+    let as_proposal = match req.get("as_proposal") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(b)) => Some(*b),
+        Some(other) => return Err(format!("as_proposal must be true or false, not {other}")),
+    };
+    Ok(ShareRequest {
+        domain: req.get("domain").and_then(Value::as_str).unwrap_or(""),
+        title: req.get("title").and_then(Value::as_str),
+        description: req.get("description").and_then(Value::as_str),
+        proposal: optional_number(req, "proposal")?,
+        files: optional_string_list(req, "files")?,
+        as_proposal,
+    })
 }
 
 /// An optional proposal number from the envelope: absent or null is `None`,
@@ -873,17 +1029,129 @@ async fn localized_request(req: &Value, engine: &Engine) -> Option<Value> {
     Some(req)
 }
 
-fn envelope_ok(data: Value) -> Value {
+pub(crate) fn envelope_ok(data: Value) -> Value {
     json!({ "v": CTL_VERSION, "ok": true, "data": data })
 }
 
-fn envelope_err(message: impl Into<String>) -> Value {
+pub(crate) fn envelope_err(message: impl Into<String>) -> Value {
     json!({ "v": CTL_VERSION, "ok": false, "error": message.into() })
+}
+
+/// Refresh every source's routing within `refresh_deadline` in the
+/// background (single flight: a refresh already running is joined, never
+/// started again), and wait for it at most `wait`. Answers the sources whose
+/// copy is not known to be current: the ones the refresh did not get to ask
+/// (this process was still setting up its network connection), and, when
+/// the wait ran out first, every source the refresh has not confirmed yet.
+/// Those are served from their caches with a line saying they could not be
+/// checked; none of them is marked as failed for it.
+async fn refresh_within(
+    sources: &std::sync::Arc<crystalline_remote::SourceSet>,
+    refresh_deadline: std::time::Duration,
+    wait: std::time::Duration,
+) -> std::collections::BTreeSet<String> {
+    let running = sources.refresh_in_background(refresh_deadline);
+    let mut outcome = running.outcome.clone();
+    let done = tokio::time::timeout(wait, outcome.wait_for(Option::is_some)).await;
+    if let Ok(Ok(unasked)) = done
+        && let Some(unasked) = unasked.as_ref()
+    {
+        return unasked.clone();
+    }
+    // Still running (or its task ended without an outcome): a source whose
+    // cache was not written since the refresh began has not answered yet.
+    sources
+        .records()
+        .into_iter()
+        .filter(|record| {
+            crystalline_remote::read_cached(
+                &record.host_dir(sources.remote_dir()),
+                crystalline_remote::ROUTING_FILE,
+                &record.account,
+            )
+            .is_none_or(|cached| {
+                cached.fetched_at < running.started && cached.last_failure.is_none()
+            })
+        })
+        .map(|record| record.name)
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What `crystalline origin share kb --proposal` sends over the control
+    /// socket is what the daemon reads: `as_proposal` crosses as given, so the
+    /// share opens a proposal instead of committing directly, and `--direct`
+    /// and no flag cross too.
+    #[test]
+    fn origin_share_carries_as_proposal_across_the_control_socket() {
+        let files = vec!["notes/a.md".to_string()];
+        for as_proposal in [Some(true), Some(false), None] {
+            let sent = crate::client::origin_share_request(
+                "kb",
+                Some("Title"),
+                None,
+                None,
+                Some(&files),
+                as_proposal,
+            );
+            // Through the wire form, as the socket carries it.
+            let line = serde_json::to_string(&sent).unwrap();
+            let received: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(
+                share_request(&received),
+                Ok(ShareRequest {
+                    domain: "kb",
+                    title: Some("Title"),
+                    description: None,
+                    proposal: None,
+                    files: Some(files.clone()),
+                    as_proposal,
+                }),
+                "{line}"
+            );
+        }
+        let wrong = json!({ "cmd": "origin_share", "domain": "kb", "as_proposal": "true" });
+        assert_eq!(
+            share_request(&wrong),
+            Err("as_proposal must be true or false, not \"true\"".to_string())
+        );
+    }
+
+    /// `holder` answers from memory: who this daemon is, while something
+    /// else holds the store for the whole call.
+    #[tokio::test]
+    async fn holder_answers_who_this_daemon_is_without_the_store() {
+        let store = crystalline_index::TursoStore::open_in_memory()
+            .await
+            .unwrap();
+        let engine = Arc::new(Engine::new(
+            Arc::new(tokio::sync::Mutex::new(store)),
+            crystalline_core::config::GlobalConfig::default(),
+            None,
+            None,
+        ));
+        let shared = Arc::new(Shared::for_test(engine.clone()));
+        // The store is held for the whole call: `holder` must not need it.
+        let store = engine.store();
+        let _held = store.lock().await;
+        let (reply, shutdown) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            handle(&json!({ "v": 1, "cmd": "holder" }), &shared),
+        )
+        .await
+        .expect("holder never waits for the store");
+        assert!(!shutdown);
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert_eq!(reply["data"]["pid"], std::process::id());
+        assert_eq!(reply["data"]["version"], crystalline_core::VERSION);
+        assert_eq!(reply["data"]["mcp_line_options"], true);
+        assert!(reply["data"].get("runs_in").is_some());
+        assert!(reply["data"].get("state_dir").is_some());
+        assert!(reply["data"].get("config_path").is_some(), "{reply}");
+    }
 
     /// The CLI's `domain add eng` beside a running daemon writes the config
     /// file from its own process and then asks the daemon to `sync` `eng`.
@@ -1173,7 +1441,16 @@ mod tests {
             // neighbours, where a stray `optional_number` would keep this
             // test green over an arm that no longer calls it - so move this
             // pattern with the code rather than leaving it to match by luck.
-            let body = &rest[..rest.find("\n        \"").unwrap_or(rest.len())];
+            let mut body = &rest[..rest.find("\n        \"").unwrap_or(rest.len())];
+            // The share arm reads its request through `share_request`, so the
+            // guard is looked for in that function's body.
+            if body.contains("share_request(req)") {
+                let start = source
+                    .find("fn share_request(")
+                    .expect("share_request is defined");
+                let rest = &source[start..];
+                body = &rest[..rest.find("\n}\n").unwrap_or(rest.len())];
+            }
             assert!(
                 body.contains("optional_number(req, \"proposal\")"),
                 "{arm} must read its proposal through optional_number"

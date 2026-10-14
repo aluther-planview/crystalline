@@ -9,10 +9,12 @@
 
 use std::path::PathBuf;
 
+use crystalline_core::base::{BasePath, PathProblem, PublicBase};
 use crystalline_core::config::{
     AuthConfig, CaptureConfig, DatabaseBackend, DatabaseConfig, EvolveConfig, GitHubConfig,
     GlobalConfig, HttpSetting, IdentityConfig, IndexConfig, LoginConfig, OidcConfig, RecallConfig,
-    ResponseFormat, SearchConfig, ServiceConfig, ShareIdentityMode, SkillsConfig, SkillsServe,
+    RemoteConfig, ResponseFormat, SearchConfig, ServiceConfig, ShareIdentityMode, SkillsConfig,
+    SkillsServe,
 };
 use crystalline_index::{DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT};
 use crystalline_remote::{MAX_IDENTITY_NAME_BYTES, valid_identity_name};
@@ -100,6 +102,15 @@ pub struct SettingSpec {
     /// key, so masking is one flag rather than a hand-written `effective`
     /// per key and a matching list somewhere else.
     pub secret: bool,
+    /// Whether this is an operator setting: the instance's network, its
+    /// database or its sign-in. An operator key is changed only with the
+    /// crystalline CLI (`crystalline config set`), `config.yaml` or its
+    /// `CRYSTALLINE_*` variable. The MCP `configure` tool neither lists nor
+    /// changes it, so an agent cannot open the instance up, point the index
+    /// at another database or switch token checks off. Behaviour derived
+    /// from an operator key (the sign-in button's label, `web_url`, the
+    /// read-only banner) is not exposing it and stays as it is.
+    pub operator_only: bool,
     /// Parse and validate a string value, then write it into `config`.
     apply: fn(&mut GlobalConfig, &str) -> Result<(), SettingsError>,
     /// Reset this setting to its default, removing it from `config` (and its
@@ -159,6 +170,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: false,
             secret: false,
+            operator_only: false,
             apply: set_domains_root,
             clear: clear_domains_root,
             effective: domains_root_effective,
@@ -169,6 +181,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::Bool,
             startup_effective: false,
             secret: false,
+            operator_only: false,
             apply: set_enabled,
             clear: clear_enabled,
             effective: enabled_effective,
@@ -179,6 +192,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::Bool,
             startup_effective: false,
             secret: false,
+            operator_only: false,
             apply: set_stacks,
             clear: clear_stacks,
             effective: stacks_effective,
@@ -189,6 +203,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: false,
             secret: false,
+            operator_only: false,
             apply: set_share_identity,
             clear: clear_share_identity,
             effective: share_identity_effective,
@@ -199,6 +214,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: false,
             secret: false,
+            operator_only: false,
             apply: set_agent_identity,
             clear: clear_agent_identity,
             effective: agent_identity_effective,
@@ -209,6 +225,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::U64,
             startup_effective: false,
             secret: false,
+            operator_only: false,
             apply: set_poll_secs,
             clear: clear_poll_secs,
             effective: poll_secs_effective,
@@ -219,6 +236,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: false,
             secret: false,
+            operator_only: true,
             apply: set_api_url,
             clear: clear_api_url,
             effective: api_url_effective,
@@ -229,6 +247,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: false,
             secret: false,
+            operator_only: true,
             apply: set_oauth_client_id,
             clear: clear_oauth_client_id,
             effective: oauth_client_id_effective,
@@ -249,6 +268,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::Bool,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_read_only,
             clear: clear_read_only,
             effective: read_only_effective,
@@ -259,6 +279,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_http,
             clear: clear_http,
             effective: http_effective,
@@ -269,6 +290,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::Bool,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_ui,
             clear: clear_ui,
             effective: ui_effective,
@@ -279,6 +301,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::Bool,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_api,
             clear: clear_api,
             effective: api_effective,
@@ -289,16 +312,18 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_allowed_hosts,
             clear: clear_allowed_hosts,
             effective: allowed_hosts_effective,
         },
         SettingSpec {
             key: "service.public_url",
-            doc: "The address people open the Fluid web UI at, for example https://knowledge.example.com; used verbatim as the base of every web_url the tools hand back, and as the OAuth resource identifier. Unset (default) derives the address per caller: from the request for an HTTP client, from the bound port for a local one. Set it where a proxy rewrites the Host, where the instance runs in a container, or where a separate Fluid deployment fronts an API-only daemon. An instance served over plain http on a non-loopback address still derives an https address it does not serve, so set this key there (applies at the next daemon start)",
+            doc: "The address people open the Fluid web UI at, for example https://knowledge.example.com or https://example.com/crystalline under a path; used verbatim as the base of every web_url the tools hand back, and as the OAuth resource identifier. A path is the prefix the whole server answers under (its segments use lower-case letters, digits, '.', '_' and '-', and the first one may not be api, assets, health, .well-known or one of the web UI's pages). Unset (default) derives the address per caller: from the request for an HTTP client, from the bound port for a local one. Set it where a proxy rewrites the Host, where the instance runs in a container, or where a separate Fluid deployment fronts an API-only daemon. An instance served over plain http on a non-loopback address still derives an https address it does not serve, so set this key there (applies at the next daemon start)",
             kind: SettingKind::String,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_service_public_url,
             clear: clear_service_public_url,
             effective: service_public_url_effective,
@@ -309,6 +334,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: false,
             secret: false,
+            operator_only: false,
             apply: set_response_format,
             clear: clear_response_format,
             effective: response_format_effective,
@@ -319,6 +345,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: true,
             secret: false,
+            operator_only: false,
             apply: set_skills_serve,
             clear: clear_skills_serve,
             effective: skills_serve_effective,
@@ -329,6 +356,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_database_backend,
             clear: clear_database_backend,
             effective: database_backend_effective,
@@ -339,6 +367,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: true,
             secret: true,
+            operator_only: true,
             apply: set_database_url,
             clear: clear_database_url,
             effective: database_url_effective,
@@ -349,6 +378,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::F64,
             startup_effective: false,
             secret: false,
+            operator_only: false,
             apply: set_salience_weight,
             clear: clear_salience_weight,
             effective: salience_weight_effective,
@@ -359,6 +389,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::F64,
             startup_effective: false,
             secret: false,
+            operator_only: false,
             apply: set_retired_weight,
             clear: clear_retired_weight,
             effective: retired_weight_effective,
@@ -369,6 +400,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::Bool,
             startup_effective: false,
             secret: false,
+            operator_only: false,
             apply: set_index_files,
             clear: clear_index_files,
             effective: index_files_effective,
@@ -379,6 +411,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::Bool,
             startup_effective: false,
             secret: false,
+            operator_only: false,
             apply: set_capture_similar,
             clear: clear_capture_similar,
             effective: capture_similar_effective,
@@ -389,6 +422,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: false,
             secret: false,
+            operator_only: false,
             apply: set_evolve_contradictions,
             clear: clear_evolve_contradictions,
             effective: evolve_contradictions_effective,
@@ -399,6 +433,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::Bool,
             startup_effective: false,
             secret: false,
+            operator_only: false,
             apply: set_recall_enabled,
             clear: clear_recall_enabled,
             effective: recall_enabled_effective,
@@ -409,6 +444,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::U64,
             startup_effective: false,
             secret: false,
+            operator_only: false,
             apply: set_recall_limit,
             clear: clear_recall_limit,
             effective: recall_limit_effective,
@@ -419,9 +455,21 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::F64,
             startup_effective: false,
             secret: false,
+            operator_only: false,
             apply: set_recall_min_score,
             clear: clear_recall_min_score,
             effective: recall_min_score_effective,
+        },
+        SettingSpec {
+            key: "remote.deadline_ms",
+            doc: "How long a call over all domains (search without domains, recent_activity, list_domains, evolve_engrams without a domain) waits for each connected server, in milliseconds, 100 to 60000 (default 3000); a server that misses it is left out of that answer and named in it",
+            kind: SettingKind::U64,
+            startup_effective: false,
+            secret: false,
+            operator_only: false,
+            apply: set_remote_deadline_ms,
+            clear: clear_remote_deadline_ms,
+            effective: remote_deadline_ms_effective,
         },
         SettingSpec {
             key: "identity.actor",
@@ -429,6 +477,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: false,
             secret: false,
+            operator_only: false,
             apply: set_identity_actor,
             clear: clear_identity_actor,
             effective: identity_actor_effective,
@@ -439,6 +488,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_trusted_header,
             clear: clear_trusted_header,
             effective: trusted_header_effective,
@@ -449,6 +499,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::Bool,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_anonymous,
             clear: clear_anonymous,
             effective: anonymous_effective,
@@ -459,6 +510,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::Bool,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_mcp,
             clear: clear_mcp,
             effective: mcp_effective,
@@ -469,6 +521,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::Bool,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_oauth,
             clear: clear_oauth,
             effective: oauth_effective,
@@ -479,6 +532,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_max_users,
             clear: clear_max_users,
             effective: max_users_effective,
@@ -489,6 +543,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::Bool,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_proxy_headers,
             clear: clear_proxy_headers,
             effective: proxy_headers_effective,
@@ -499,6 +554,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_oidc_issuer,
             clear: clear_oidc_issuer,
             effective: oidc_issuer_effective,
@@ -509,6 +565,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_oidc_client_id,
             clear: clear_oidc_client_id,
             effective: oidc_client_id_effective,
@@ -519,6 +576,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: true,
             secret: true,
+            operator_only: true,
             apply: set_oidc_client_secret,
             clear: clear_oidc_client_secret,
             effective: oidc_client_secret_effective,
@@ -529,6 +587,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_oidc_name,
             clear: clear_oidc_name,
             effective: oidc_name_effective,
@@ -539,6 +598,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_oidc_scopes,
             clear: clear_oidc_scopes,
             effective: oidc_scopes_effective,
@@ -549,16 +609,18 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_oidc_default_role,
             clear: clear_oidc_default_role,
             effective: oidc_default_role_effective,
         },
         SettingSpec {
             key: "auth.oidc.redirect_uri",
-            doc: "The address the single sign-on provider sends the browser back to, used verbatim instead of the one derived from a request's Host and forwarded scheme; an absolute https url (http only on loopback) ending in /api/v1/auth/oidc/callback, registered with the provider in exactly that spelling - set it where a proxy rewrites the Host, unset it to derive the address per request (applies at the next daemon start)",
+            doc: "The address the single sign-on provider sends the browser back to, used verbatim instead of the one derived from a request's Host and forwarded scheme; an absolute https url (http only on loopback) ending in /api/v1/auth/oidc/callback, under the path of service.public_url when that key has one, registered with the provider in exactly that spelling - set it where a proxy rewrites the Host, unset it to derive the address per request (applies at the next daemon start)",
             kind: SettingKind::String,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_oidc_redirect_uri,
             clear: clear_oidc_redirect_uri,
             effective: oidc_redirect_uri_effective,
@@ -569,6 +631,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_login_free_attempts,
             clear: clear_login_free_attempts,
             effective: login_free_attempts_effective,
@@ -579,6 +642,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_login_max_delay,
             clear: clear_login_max_delay,
             effective: login_max_delay_effective,
@@ -599,6 +663,31 @@ pub fn unset(config: &mut GlobalConfig, key: &str) -> Result<(), SettingsError> 
     let spec = find(key)?;
     (spec.clear)(config);
     Ok(())
+}
+
+/// What MCP `configure` answers for a set or an unset of an operator key
+/// ([`SettingSpec::operator_only`]). It never repeats the key's value or the
+/// current setting, and one operator key refuses the whole call before any
+/// key in it is applied.
+pub const OPERATOR_SETTING_REFUSAL: &str = "This setting is changed only with the crystalline CLI.";
+
+/// Whether `key` is an operator key. A key the registry does not know is not.
+pub fn is_operator_key(key: &str) -> bool {
+    registry().iter().any(|s| s.key == key && s.operator_only)
+}
+
+/// Whether the registry knows `key` at all.
+pub fn is_known_key(key: &str) -> bool {
+    registry().iter().any(|s| s.key == key)
+}
+
+/// [`snapshot`] without the operator keys: what an agent is shown by MCP
+/// `configure`. The CLI keeps the full [`snapshot`].
+pub fn agent_snapshot(file: &GlobalConfig, overlay: &EnvOverlay) -> Vec<SettingView> {
+    snapshot(file, overlay)
+        .into_iter()
+        .filter(|view| !is_operator_key(&view.key))
+        .collect()
 }
 
 /// An ordered snapshot for display: every registry key with its effective
@@ -693,6 +782,21 @@ fn unknown_key(key: &str) -> SettingsError {
     ))
 }
 
+/// The unknown-key error an agent gets: the same sentence as
+/// [`unknown_key`], listing only the keys an agent may change, so an
+/// operator key's name does not reach the agent through a typo.
+pub fn unknown_agent_key(key: &str) -> SettingsError {
+    let known: Vec<&str> = registry()
+        .iter()
+        .filter(|s| !s.operator_only)
+        .map(|s| s.key)
+        .collect();
+    SettingsError(format!(
+        "Unknown setting {key}. Known settings: {}",
+        known.join(", ")
+    ))
+}
+
 /// Drop the `github` block entirely once every field in it has been cleared,
 /// so an unset config round-trips to exactly the pre-feature shape (no empty
 /// `github: {}` line).
@@ -770,6 +874,14 @@ fn drop_evolve_if_empty(config: &mut GlobalConfig) {
 fn drop_recall_if_empty(config: &mut GlobalConfig) {
     if config.recall.as_ref() == Some(&RecallConfig::default()) {
         config.recall = None;
+    }
+}
+
+/// Drop the `remote` block entirely once every field in it has been cleared,
+/// so an unset config round-trips to exactly the pre-feature shape.
+fn drop_remote_if_empty(config: &mut GlobalConfig) {
+    if config.remote.as_ref() == Some(&RemoteConfig::default()) {
+        config.remote = None;
     }
 }
 
@@ -1298,10 +1410,13 @@ pub fn service_public_url_problem(value: &str) -> Option<String> {
     if !url.username().is_empty() || url.password().is_some() {
         return Some(format!("{key} must carry no user name or password"));
     }
-    if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
+    if url.query().is_some() || url.fragment().is_some() {
         return Some(format!(
-            "{key} must be the origin alone - scheme, host and optional port, no path, query or fragment - because the web UI is served at the root"
+            "{key} must carry no query and no fragment, got '{value}'"
         ));
+    }
+    if let Err(problem) = BasePath::of_url(value) {
+        return Some(format!("{key} cannot be '{value}': {}", problem.sentence()));
     }
     None
 }
@@ -1324,6 +1439,34 @@ pub fn unusable_public_url_warning(value: &str) -> Option<String> {
     })
 }
 
+/// The stored spelling of a value the validator accepted: the origin in its
+/// ascii spelling (lower-case host, default port dropped) plus the path with
+/// one trailing slash taken off.
+fn canonical_public_url(value: &str) -> String {
+    PublicBase::parse(value.trim())
+        .expect("validated above")
+        .to_string()
+}
+
+/// `service.public_url` as a base, or `None` where it is unset or cannot be
+/// one. The one reader every surface asks: the daemon's strip layer, the
+/// cookie path, the OAuth resource and the served `<base href>`.
+pub fn public_base(config: &GlobalConfig) -> Option<PublicBase> {
+    config
+        .service_public_url()
+        .filter(|value| service_public_url_problem(value).is_none())
+        .and_then(|value| PublicBase::parse(value).ok())
+}
+
+/// The base path this instance is served under: the path of
+/// `service.public_url`, or the root. Without `public_url` there is no
+/// prefix: the daemon cannot guess one from a request.
+pub fn base_path(config: &GlobalConfig) -> BasePath {
+    public_base(config)
+        .map(|base| base.path().clone())
+        .unwrap_or_default()
+}
+
 /// Canonicalise a `service.public_url` that came straight from the config
 /// file, which no setter has seen, the same way `set_service_public_url`
 /// does, so every reader compares the same spelling whichever layer the
@@ -1341,14 +1484,11 @@ pub fn drop_unusable_public_url(config: &mut GlobalConfig) {
     match service_public_url_problem(&value) {
         Some(_) => clear_service_public_url(config),
         None => {
-            let origin = url::Url::parse(value.trim())
-                .expect("validated above")
-                .origin()
-                .ascii_serialization();
+            let canonical = canonical_public_url(&value);
             config
                 .service
                 .get_or_insert_with(ServiceConfig::default)
-                .public_url = Some(origin);
+                .public_url = Some(canonical);
         }
     }
 }
@@ -1357,17 +1497,14 @@ fn set_service_public_url(config: &mut GlobalConfig, value: &str) -> Result<(), 
     if let Some(problem) = service_public_url_problem(value) {
         return Err(SettingsError(problem));
     }
-    // Stored as its origin: the trailing slash gone, the host in its ascii
-    // spelling, a default port dropped - the one spelling every reader of the
-    // key compares, the same way the OAuth identifier is stored.
-    let origin = url::Url::parse(value.trim())
-        .expect("validated above")
-        .origin()
-        .ascii_serialization();
+    // Stored as its origin plus its path: the trailing slash gone, the host in
+    // its ascii spelling, a default port dropped - the one spelling every
+    // reader of the key compares, the same way the OAuth identifier is stored.
+    let canonical = canonical_public_url(value);
     config
         .service
         .get_or_insert_with(ServiceConfig::default)
-        .public_url = Some(origin);
+        .public_url = Some(canonical);
     Ok(())
 }
 
@@ -1759,6 +1896,37 @@ fn clear_recall_min_score(config: &mut GlobalConfig) {
 fn recall_min_score_effective(config: &GlobalConfig) -> (String, bool) {
     let is_default = config.recall.as_ref().and_then(|r| r.min_score).is_none();
     (config.recall_min_score().to_string(), is_default)
+}
+
+// --- remote.deadline_ms ----------------------------------------------------
+
+fn set_remote_deadline_ms(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let refused = || {
+        SettingsError(format!(
+            "remote.deadline_ms must be between 100 and 60000, got '{value}'"
+        ))
+    };
+    let parsed: u64 = value.parse().map_err(|_| refused())?;
+    if !(100..=60_000).contains(&parsed) {
+        return Err(refused());
+    }
+    config
+        .remote
+        .get_or_insert_with(RemoteConfig::default)
+        .deadline_ms = Some(parsed);
+    Ok(())
+}
+
+fn clear_remote_deadline_ms(config: &mut GlobalConfig) {
+    if let Some(r) = config.remote.as_mut() {
+        r.deadline_ms = None;
+    }
+    drop_remote_if_empty(config);
+}
+
+fn remote_deadline_ms_effective(config: &GlobalConfig) -> (String, bool) {
+    let is_default = config.remote.as_ref().and_then(|r| r.deadline_ms).is_none();
+    (config.remote_deadline_ms().to_string(), is_default)
 }
 
 // --- identity.actor ---------------------------------------------------------
@@ -2292,6 +2460,14 @@ pub const OIDC_CALLBACK_PATH: &str = "/api/v1/auth/oidc/callback";
 /// an address the browser never reaches).
 pub fn oidc_redirect_uri_problem(value: &str) -> Option<String> {
     let key = "auth.oidc.redirect_uri";
+    // First: a url parser reads a backslash as '/', so the prefix and the
+    // dot-segment checks below would read another path than the one written.
+    if value.contains('\\') {
+        return Some(format!(
+            "{key} cannot be '{value}': {}",
+            PathProblem::Backslash.sentence()
+        ));
+    }
     let Ok(url) = url::Url::parse(value.trim()) else {
         return Some(format!(
             "{key} must be an absolute url, for example \
@@ -2314,12 +2490,37 @@ pub fn oidc_redirect_uri_problem(value: &str) -> Option<String> {
             ));
         }
     }
-    if url.path() != OIDC_CALLBACK_PATH || url.query().is_some() || url.fragment().is_some() {
+    if url.query().is_some() || url.fragment().is_some() {
         return Some(format!(
             "{key} must end in {OIDC_CALLBACK_PATH}, with no query and no fragment - \
              that is the one address this instance serves the callback at, and the \
              provider has to have it registered in exactly that spelling"
         ));
+    }
+    // The dot segments are read from the text as written: the parser has
+    // already resolved them away in `url.path()`.
+    let written = value.trim().split(['?', '#']).next().unwrap_or("");
+    let written_path = written.split_once("://").map_or(written, |(_, rest)| rest);
+    if let Some(dots) = written_path
+        .split('/')
+        .skip(1)
+        .find(|segment| *segment == "." || *segment == "..")
+    {
+        return Some(format!(
+            "{key} cannot be '{value}': {}",
+            PathProblem::DotSegment(dots.to_string()).sentence()
+        ));
+    }
+    let Some(prefix) = url.path().strip_suffix(OIDC_CALLBACK_PATH) else {
+        return Some(format!(
+            "{key} must end in {OIDC_CALLBACK_PATH}, with no query and no fragment - \
+             that is the one address this instance serves the callback at (under the \
+             path of service.public_url when it has one), and the provider has to have \
+             it registered in exactly that spelling"
+        ));
+    };
+    if let Err(problem) = BasePath::parse(prefix) {
+        return Some(format!("{key} cannot be '{value}': {}", problem.sentence()));
     }
     None
 }
@@ -2335,6 +2536,93 @@ fn set_oidc_redirect_uri(config: &mut GlobalConfig, value: &str) -> Result<(), S
 
 fn clear_oidc_redirect_uri(config: &mut GlobalConfig) {
     clear_oidc(config, |o| &mut o.redirect_uri);
+}
+
+/// The key, spelled once for the pair check.
+pub const OIDC_REDIRECT_URI_KEY: &str = "auth.oidc.redirect_uri";
+
+/// Why `redirect_uri` does not sit under the path of `public` (no path when
+/// `public` is `None`), or `None` when it does.
+pub fn oidc_redirect_prefix_problem(
+    redirect_uri: &str,
+    public: Option<&PublicBase>,
+) -> Option<String> {
+    let url = url::Url::parse(redirect_uri.trim()).ok()?;
+    let prefix = url.path().strip_suffix(OIDC_CALLBACK_PATH)?;
+    let wanted = public.map(|base| base.path().as_str()).unwrap_or("");
+    if prefix == wanted {
+        return None;
+    }
+    Some(match public {
+        Some(base) => format!(
+            "{OIDC_REDIRECT_URI_KEY} ({redirect_uri}) and {PUBLIC_URL_KEY} ({base}) name \
+             different paths; the callback has to be {base}{OIDC_CALLBACK_PATH}"
+        ),
+        None => format!(
+            "{OIDC_REDIRECT_URI_KEY} ({redirect_uri}) carries the path '{prefix}', but \
+             {PUBLIC_URL_KEY} is not set, so the callback must be at {OIDC_CALLBACK_PATH} \
+             with no path in front; set {PUBLIC_URL_KEY} to the address with '{prefix}'"
+        ),
+    })
+}
+
+/// The pair rule over a whole config: a configured redirect uri sits under
+/// the path of `service.public_url`.
+pub fn oidc_pair_problem(config: &GlobalConfig) -> Option<String> {
+    let redirect_uri = config
+        .auth_oidc()?
+        .redirect_uri
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())?;
+    oidc_redirect_prefix_problem(redirect_uri, public_base(config).as_ref())
+}
+
+/// [`apply`] for a person standing at `configure` or `config set`: the write,
+/// then the pair rule over the effective config it leaves (file plus
+/// environment). A refused write changes nothing. The environment overlay
+/// keeps plain [`apply`], so two variables never refuse each other by the
+/// order they arrive in; `OidcSettings::resolve` checks the pair at startup.
+///
+/// The refusal cites the effective value of each key, which may come from the
+/// environment rather than the file: when `CRYSTALLINE_SERVICE_PUBLIC_URL` is
+/// set, a `config set auth.oidc.redirect_uri` is checked against that value
+/// and its sentence names it, because it is what the running server uses.
+pub fn apply_checked(
+    file: &mut GlobalConfig,
+    overlay: &EnvOverlay,
+    key: &str,
+    value: &str,
+) -> Result<(), SettingsError> {
+    let mut next = file.clone();
+    apply(&mut next, key, value)?;
+    check_pair(&next, overlay, key)?;
+    *file = next;
+    Ok(())
+}
+
+/// [`unset`] with the same pair rule as [`apply_checked`]: taking
+/// `service.public_url` away from under a configured redirect uri that
+/// carries a prefix is refused, and changes nothing.
+pub fn unset_checked(
+    file: &mut GlobalConfig,
+    overlay: &EnvOverlay,
+    key: &str,
+) -> Result<(), SettingsError> {
+    let mut next = file.clone();
+    unset(&mut next, key)?;
+    check_pair(&next, overlay, key)?;
+    *file = next;
+    Ok(())
+}
+
+fn check_pair(next: &GlobalConfig, overlay: &EnvOverlay, key: &str) -> Result<(), SettingsError> {
+    if (key == PUBLIC_URL_KEY || key == OIDC_REDIRECT_URI_KEY)
+        && let Some(problem) = oidc_pair_problem(&overlay.apply(next))
+    {
+        return Err(SettingsError(problem));
+    }
+    Ok(())
 }
 
 fn oidc_redirect_uri_effective(config: &GlobalConfig) -> (String, bool) {
@@ -2374,7 +2662,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_lists_exactly_the_forty_two_keys_in_order() {
+    fn registry_lists_exactly_the_forty_three_keys_in_order() {
         assert_eq!(
             known_keys(),
             vec![
@@ -2405,6 +2693,7 @@ mod tests {
                 "recall.enabled",
                 "recall.limit",
                 "recall.min_score",
+                "remote.deadline_ms",
                 "identity.actor",
                 "auth.trusted_header",
                 "auth.anonymous",
@@ -2423,6 +2712,84 @@ mod tests {
                 "auth.login.max_delay",
             ]
         );
+    }
+
+    /// The operator keys are the instance's network, database and sign-in:
+    /// every `auth.*`, `database.*` and `service.*` key plus the two GitHub
+    /// keys that decide which GitHub this instance talks to and as which app.
+    /// No surface outside the CLI lists, reads back or sets one of these.
+    #[test]
+    fn the_operator_keys_are_the_network_the_database_and_sign_in() {
+        let operator: Vec<&str> = registry()
+            .iter()
+            .filter(|s| s.operator_only)
+            .map(|s| s.key)
+            .collect();
+        assert_eq!(
+            operator,
+            vec![
+                "github.api_url",
+                "github.oauth_client_id",
+                "service.read_only",
+                "service.http",
+                "service.ui",
+                "service.api",
+                "service.allowed_hosts",
+                "service.public_url",
+                "database.backend",
+                "database.url",
+                "auth.trusted_header",
+                "auth.anonymous",
+                "auth.mcp",
+                "auth.oauth",
+                "auth.max_users",
+                "auth.proxy_headers",
+                "auth.oidc.issuer",
+                "auth.oidc.client_id",
+                "auth.oidc.client_secret",
+                "auth.oidc.name",
+                "auth.oidc.scopes",
+                "auth.oidc.default_role",
+                "auth.oidc.redirect_uri",
+                "auth.login.free_attempts",
+                "auth.login.max_delay",
+            ]
+        );
+        // The rule, not only the list: a key added under one of the three
+        // blocks is an operator key without anybody remembering to say so.
+        for spec in registry() {
+            let by_rule = spec.key.starts_with("auth.")
+                || spec.key.starts_with("database.")
+                || (spec.key.starts_with("service.") && spec.key != "service.response_format")
+                || spec.key == "github.api_url"
+                || spec.key == "github.oauth_client_id";
+            assert_eq!(spec.operator_only, by_rule, "{}", spec.key);
+            assert_eq!(is_operator_key(spec.key), by_rule, "{}", spec.key);
+            assert!(is_known_key(spec.key), "{}", spec.key);
+        }
+        assert!(!is_operator_key("no.such.key"));
+        assert!(!is_known_key("no.such.key"));
+    }
+
+    /// What an agent sees: the snapshot without the operator keys, and an
+    /// unknown-key error that names only the keys an agent may change.
+    #[test]
+    fn the_agent_snapshot_and_the_agent_unknown_key_error_name_no_operator_key() {
+        let views = agent_snapshot(&GlobalConfig::default(), &EnvOverlay::default());
+        assert_eq!(views.len(), 18);
+        assert!(views.iter().all(|v| !is_operator_key(&v.key)));
+        assert!(views.iter().any(|v| v.key == "github.enabled"));
+        assert!(views.iter().any(|v| v.key == "service.response_format"));
+
+        let err = unknown_agent_key("zzz.bogus").to_string();
+        assert!(
+            err.starts_with("Unknown setting zzz.bogus. Known settings: "),
+            "{err}"
+        );
+        assert!(err.contains("github.enabled"), "{err}");
+        for spec in registry().iter().filter(|s| s.operator_only) {
+            assert!(!err.contains(spec.key), "{} leaked into {err}", spec.key);
+        }
     }
 
     #[test]
@@ -2500,6 +2867,10 @@ mod tests {
                 (
                     "recall.min_score",
                     "CRYSTALLINE_RECALL_MIN_SCORE".to_string()
+                ),
+                (
+                    "remote.deadline_ms",
+                    "CRYSTALLINE_REMOTE_DEADLINE_MS".to_string()
                 ),
                 ("identity.actor", "CRYSTALLINE_IDENTITY_ACTOR".to_string()),
                 (
@@ -3073,6 +3444,7 @@ mod tests {
                 "recall.enabled",
                 "recall.limit",
                 "recall.min_score",
+                "remote.deadline_ms",
                 "identity.actor",
                 "auth.trusted_header",
                 "auth.anonymous",
@@ -3470,15 +3842,22 @@ mod tests {
         );
     }
 
-    /// One spelling reaches every reader of the key, because the OAuth
-    /// resource identifier, the startup banner and every web_url compare it
-    /// and a second spelling is a mismatch nobody can see.
+    /// One spelling reaches every reader of the key: the origin in its ascii
+    /// spelling, plus the path with one trailing slash taken off.
     #[test]
-    fn service_public_url_is_stored_as_its_origin() {
+    fn service_public_url_is_stored_as_its_origin_and_path() {
         for (written, stored) in [
             ("https://KB.Example.com:443/", "https://kb.example.com"),
             ("http://127.0.0.1:7411", "http://127.0.0.1:7411"),
             ("http://[::1]:7411/", "http://[::1]:7411"),
+            (
+                "https://Example.com/crystalline/",
+                "https://example.com/crystalline",
+            ),
+            (
+                "https://example.com:8443/team/kb",
+                "https://example.com:8443/team/kb",
+            ),
         ] {
             let mut cfg = GlobalConfig::default();
             apply(&mut cfg, "service.public_url", written).unwrap();
@@ -3498,23 +3877,66 @@ mod tests {
             "http://0.0.0.0:7411",
             "http://[::]:7411",
             "https://user:pw@kb.example.com",
-            "https://kb.example.com/crystalline",
             "https://kb.example.com/?x=1",
             "https://kb.example.com/#top",
         ] {
             let mut cfg = GlobalConfig::default();
             let err = apply(&mut cfg, "service.public_url", bad)
                 .expect_err("expected '{bad}' to be refused");
-            assert!(
-                err.to_string().contains("service.public_url"),
-                "the refusal names the key it is about: {err}"
-            );
-            assert_eq!(
-                cfg.service_public_url(),
-                None,
-                "and nothing is stored when it is refused"
-            );
+            assert!(err.to_string().contains("service.public_url"), "{err}");
+            assert_eq!(cfg.service_public_url(), None);
         }
+    }
+
+    #[test]
+    fn service_public_url_refuses_each_unusable_path_with_its_sentence() {
+        for (bad, phrase) in [
+            ("https://kb.example/a//b", "empty segment"),
+            ("https://kb.example/a/../b", "'..' segment"),
+            ("https://kb.example/Crystalline", "lower-case letters"),
+            ("https://kb.example/a%20b", "lower-case letters"),
+            ("https://kb.example/api", "cannot start with 'api'"),
+            ("https://kb.example/d/team", "cannot start with 'd'"),
+            // A url parser reads it as '/', so this would land on the root.
+            ("https://kb.example\\kb", "backslash"),
+            ("https://kb.example/kb\\team", "backslash"),
+        ] {
+            let mut cfg = GlobalConfig::default();
+            let err = apply(&mut cfg, "service.public_url", bad)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("service.public_url") && err.contains(phrase),
+                "{bad}: {err}"
+            );
+            assert_eq!(cfg.service_public_url(), None);
+        }
+    }
+
+    #[test]
+    fn a_hand_edited_public_url_keeps_its_path_through_the_load() {
+        let mut cfg = GlobalConfig {
+            service: Some(ServiceConfig {
+                public_url: Some("https://Example.com/crystalline/".to_string()),
+                ..ServiceConfig::default()
+            }),
+            ..GlobalConfig::default()
+        };
+        drop_unusable_public_url(&mut cfg);
+        assert_eq!(
+            cfg.service_public_url(),
+            Some("https://example.com/crystalline")
+        );
+        assert_eq!(base_path(&cfg).as_str(), "/crystalline");
+
+        cfg.service.as_mut().unwrap().public_url = Some("https://example.com/api".to_string());
+        drop_unusable_public_url(&mut cfg);
+        assert_eq!(
+            cfg.service_public_url(),
+            None,
+            "a reserved first segment is dropped"
+        );
+        assert!(base_path(&cfg).is_root());
     }
 
     // --- database.backend ----------------------------------------------------------
@@ -4464,6 +4886,20 @@ mod tests {
             ),
             ("/api/v1/auth/oidc/callback", "absolute"),
             ("not a url at all", "absolute"),
+            // A url parser reads it as '/', which would hide a prefix or a
+            // dot segment from the checks below it.
+            (
+                "https://kb.example.test\\kb/api/v1/auth/oidc/callback",
+                "backslash",
+            ),
+            (
+                "https://kb.example.test/kb\\..\\x/api/v1/auth/oidc/callback",
+                "backslash",
+            ),
+            (
+                "https://kb.example.test\\api\\v1\\auth\\oidc\\callback",
+                "backslash",
+            ),
         ];
         for (bad, phrase) in cases {
             let mut cfg = GlobalConfig::default();
@@ -4475,6 +4911,223 @@ mod tests {
                 "{bad} must be refused with teaching text naming '{phrase}', got: {err}"
             );
             assert!(cfg.auth.is_none(), "a rejected value is not written");
+        }
+    }
+
+    #[test]
+    fn oidc_redirect_uri_may_carry_a_prefix_in_front_of_the_callback() {
+        for good in [
+            "https://kb.example.test/crystalline/api/v1/auth/oidc/callback",
+            "https://kb.example.test/team/kb/api/v1/auth/oidc/callback",
+        ] {
+            assert!(oidc_redirect_uri_problem(good).is_none(), "{good}");
+        }
+        for (bad, phrase) in [
+            (
+                "https://kb.example.test/Crystalline/api/v1/auth/oidc/callback",
+                "lower-case",
+            ),
+            (
+                "https://kb.example.test/api/api/v1/auth/oidc/callback",
+                "cannot start with 'api'",
+            ),
+            (
+                "https://kb.example.test/crystalline/api/v1/auth/oidc/callback/x",
+                OIDC_CALLBACK_PATH,
+            ),
+            (
+                "https://kb.example.test/a/../api/v1/auth/oidc/callback",
+                "'..' segment",
+            ),
+            (
+                "https://kb.example.test/A/../api/v1/auth/oidc/callback",
+                "'..' segment",
+            ),
+        ] {
+            let problem = oidc_redirect_uri_problem(bad).unwrap();
+            assert!(problem.contains(phrase), "{bad}: {problem}");
+        }
+    }
+
+    #[test]
+    fn a_redirect_uri_under_another_path_than_public_url_is_refused_naming_both() {
+        let overlay = EnvOverlay::default();
+        let mut file = GlobalConfig::default();
+        apply_checked(
+            &mut file,
+            &overlay,
+            "service.public_url",
+            "https://kb.example/crystalline",
+        )
+        .unwrap();
+        apply_checked(
+            &mut file,
+            &overlay,
+            "auth.oidc.redirect_uri",
+            "https://kb.example/crystalline/api/v1/auth/oidc/callback",
+        )
+        .unwrap();
+
+        let err = apply_checked(
+            &mut file,
+            &overlay,
+            "auth.oidc.redirect_uri",
+            "https://kb.example/api/v1/auth/oidc/callback",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("https://kb.example/api/v1/auth/oidc/callback")
+                && err.contains("https://kb.example/crystalline"),
+            "the refusal names both values: {err}"
+        );
+        assert_eq!(
+            file.auth_oidc().and_then(|o| o.redirect_uri.as_deref()),
+            Some("https://kb.example/crystalline/api/v1/auth/oidc/callback"),
+            "a refused write changes nothing"
+        );
+
+        let err = apply_checked(
+            &mut file,
+            &overlay,
+            "service.public_url",
+            "https://kb.example/other",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("/other") && err.contains("/crystalline/api/v1"),
+            "{err}"
+        );
+        assert_eq!(
+            file.service_public_url(),
+            Some("https://kb.example/crystalline")
+        );
+    }
+
+    #[test]
+    fn without_public_url_the_redirect_uri_may_carry_no_prefix() {
+        let mut cfg = GlobalConfig::default();
+        apply(
+            &mut cfg,
+            "auth.oidc.redirect_uri",
+            "https://kb.example/crystalline/api/v1/auth/oidc/callback",
+        )
+        .unwrap();
+        let problem = oidc_pair_problem(&cfg).unwrap();
+        assert!(
+            problem.contains("service.public_url is not set"),
+            "{problem}"
+        );
+        let mut root = GlobalConfig::default();
+        apply(
+            &mut root,
+            "auth.oidc.redirect_uri",
+            "https://kb.example/api/v1/auth/oidc/callback",
+        )
+        .unwrap();
+        assert_eq!(
+            oidc_pair_problem(&root),
+            None,
+            "0.23.0's shape is still fine"
+        );
+    }
+
+    /// The unset arm of the pair rule on a set: a prefixed redirect uri is
+    /// refused while `service.public_url` is not set, naming both.
+    #[test]
+    fn a_prefixed_redirect_uri_is_refused_while_public_url_is_unset() {
+        let overlay = EnvOverlay::default();
+        let mut file = GlobalConfig::default();
+        let err = apply_checked(
+            &mut file,
+            &overlay,
+            "auth.oidc.redirect_uri",
+            "https://kb.example/crystalline/api/v1/auth/oidc/callback",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("https://kb.example/crystalline/api/v1/auth/oidc/callback")
+                && err.contains("service.public_url is not set"),
+            "{err}"
+        );
+        assert!(
+            file.auth_oidc().is_none(),
+            "a refused write changes nothing"
+        );
+    }
+
+    /// The unset arm of the pair rule on an unset: taking `service.public_url`
+    /// away from under a prefixed redirect uri is refused, and taking the
+    /// redirect uri away is always fine.
+    #[test]
+    fn unsetting_public_url_under_a_prefixed_redirect_uri_is_refused() {
+        let overlay = EnvOverlay::default();
+        let mut file = GlobalConfig::default();
+        apply_checked(
+            &mut file,
+            &overlay,
+            "service.public_url",
+            "https://kb.example/crystalline",
+        )
+        .unwrap();
+        apply_checked(
+            &mut file,
+            &overlay,
+            "auth.oidc.redirect_uri",
+            "https://kb.example/crystalline/api/v1/auth/oidc/callback",
+        )
+        .unwrap();
+
+        let err = unset_checked(&mut file, &overlay, "service.public_url")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("https://kb.example/crystalline/api/v1/auth/oidc/callback")
+                && err.contains("service.public_url is not set"),
+            "{err}"
+        );
+        assert_eq!(
+            file.service_public_url(),
+            Some("https://kb.example/crystalline"),
+            "a refused unset changes nothing"
+        );
+
+        unset_checked(&mut file, &overlay, "auth.oidc.redirect_uri").unwrap();
+        unset_checked(&mut file, &overlay, "service.public_url").unwrap();
+        assert_eq!(file.service_public_url(), None);
+    }
+
+    #[test]
+    fn the_environment_applies_the_pair_in_any_order() {
+        // The overlay uses plain `apply`, so two variables never refuse each
+        // other by the order they arrive in; the pair is checked at startup.
+        let public = (
+            "CRYSTALLINE_SERVICE_PUBLIC_URL".to_string(),
+            "https://kb.example/crystalline".to_string(),
+        );
+        let redirect = (
+            "CRYSTALLINE_AUTH_OIDC_REDIRECT_URI".to_string(),
+            "https://kb.example/crystalline/api/v1/auth/oidc/callback".to_string(),
+        );
+        for vars in [
+            vec![public.clone(), redirect.clone()],
+            vec![redirect.clone(), public.clone()],
+        ] {
+            let overlay = EnvOverlay::from_vars(vars).unwrap();
+            let effective = overlay.apply(&GlobalConfig::default());
+            assert_eq!(
+                effective.service_public_url(),
+                Some("https://kb.example/crystalline")
+            );
+            assert_eq!(
+                effective
+                    .auth_oidc()
+                    .and_then(|o| o.redirect_uri.as_deref()),
+                Some("https://kb.example/crystalline/api/v1/auth/oidc/callback")
+            );
+            assert_eq!(oidc_pair_problem(&effective), None);
         }
     }
 
@@ -4536,5 +5189,36 @@ mod tests {
         {
             assert!(spec.startup_effective, "{}", spec.key);
         }
+    }
+
+    #[test]
+    fn the_remote_deadline_is_milliseconds_between_a_tenth_and_sixty_seconds() {
+        let mut cfg = GlobalConfig::default();
+        assert_eq!(cfg.remote_deadline_ms(), 3000, "three seconds unless set");
+        apply(&mut cfg, "remote.deadline_ms", "1500").unwrap();
+        assert_eq!(cfg.remote_deadline_ms(), 1500);
+        for bad in ["99", "60001", "soon", "-1"] {
+            let err = apply(&mut cfg, "remote.deadline_ms", bad).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("remote.deadline_ms must be between 100 and 60000"),
+                "{bad}: {err}"
+            );
+        }
+        unset(&mut cfg, "remote.deadline_ms").unwrap();
+        assert!(
+            cfg.remote.is_none(),
+            "an unset key leaves no empty block behind"
+        );
+    }
+
+    #[test]
+    fn the_remote_deadline_applies_without_a_restart() {
+        let spec = registry()
+            .iter()
+            .find(|s| s.key == "remote.deadline_ms")
+            .unwrap();
+        assert!(!spec.startup_effective, "the next fan-out reads it");
+        assert_eq!(spec.kind, SettingKind::U64);
     }
 }

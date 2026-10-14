@@ -67,6 +67,8 @@ The agent creates both domains with its `add_domain` tool, a folder with a start
 
 Fluid, the web UI, is at http://localhost:7411 and the first visit creates your admin account. What the install command wired, and how to undo it: [Claude Code setup](docs/setup/claude-code.md).
 
+Using Claude Desktop? Install Crystalline first (Homebrew above, or the MSI below), then add the extension: [Claude Desktop setup](docs/setup/claude-desktop.md). If you use only Claude Desktop on a Mac, you can take the Desktop-only extension, which carries Crystalline inside.
+
 <details>
 <summary>Linux</summary>
 
@@ -89,6 +91,8 @@ The package ships a systemd unit, installed disabled: see [Linux server with sys
 
 Via MSI: download `crystalline-<version>-windows-amd64.msi` (or `crystalline-<version>-windows-arm64.msi` for Arm devices) from the [latest release](https://github.com/jordiboehme/crystalline/releases/latest) and double-click it, or install silently with `msiexec /i <file> /qn`. The installer adds Crystalline to the system PATH and upgrades in place. Windows releases are not code signed yet. Verify the download against `SHA256SUMS` or with `gh attestation verify <file> --repo jordiboehme/crystalline` ([how](docs/security.md#verify-a-release)), then confirm the SmartScreen prompt (More info > Run anyway).
 
+The MSI also registers a Windows task that starts the Crystalline daemon when you sign in, which is what the Claude Desktop extension connects to.
+
 </details>
 
 <details>
@@ -110,7 +114,7 @@ Both formulae install the same `crystalline` binary, so your MCP registrations a
 
 | Client | Setup |
 |---|---|
-| Claude Desktop | [A one-click extension, no terminal](docs/setup/claude-desktop.md) |
+| Claude Desktop | [Install Crystalline, then the extension](docs/setup/claude-desktop.md) |
 | Codex CLI | [`crystalline install codex`](docs/setup/codex.md) |
 | GitHub Copilot CLI | [`crystalline install copilot`](docs/setup/copilot.md) |
 | Cursor | [`crystalline install cursor`](docs/setup/cursor.md) |
@@ -151,7 +155,7 @@ Crystalline runs the same way in every scenario: a daemon in the middle keeps on
 | Scenario | In one line |
 |---|---|
 | [Personal workstation](docs/deployment.md#personal-workstation) | The default: local folders, agents over stdio, one shared background daemon |
-| [Claude Desktop extension](docs/deployment.md#claude-desktop-extension) | One-click `.mcpb` install, no terminal involved; the agent creates domains at runtime |
+| [Claude Desktop extension](docs/deployment.md#claude-desktop-extension) | A small extension connects Claude Desktop to the Crystalline you installed; a Desktop-only bundle with Crystalline inside exists for Mac users of Claude Desktop alone |
 | [Team server](docs/deployment.md#team-server) | One container on the network, every agent connects over HTTP |
 | [Web UI from the daemon](docs/deployment.md#web-ui-from-the-daemon) | The browser UI ships built into the binary, on by default at localhost - browse what your agents know with zero extra moving parts, and follow the links they hand you into it |
 | [Team server with Fluid](docs/deployment.md#team-server-with-fluid) | The scale-out variant: nginx replicas in front when one daemon port is not enough |
@@ -162,6 +166,8 @@ Crystalline runs the same way in every scenario: a daemon in the middle keeps on
 | [Team knowledge on GitHub](docs/deployment.md#team-knowledge-on-github) | A domain tracks a GitHub repository; sharing goes through reviewed proposals, or straight to the branch where the domain says so |
 | [Authenticated agents](docs/deployment.md#authenticated-agents) | HTTP MCP requires a personal token per agent, issued in Fluid or from the CLI |
 | [MCP clients over OAuth](docs/deployment.md#mcp-clients-over-oauth) | A hosted client such as Claude.ai signs the person in and consents once; no token is pasted |
+| [A local Crystalline with domains from shared servers](docs/deployment.md#a-local-crystalline-with-domains-from-shared-servers) | `crystalline connect` adds a server as a source; your agent sees your local domains and every server's at once, through one registration |
+| [Under a path](docs/deployment.md#under-a-path) | Share a host name: `https://example.com/crystalline` behind nginx or Caddy, with the proxy stripping the path or passing it through |
 | [Enterprise SSO](docs/deployment.md#enterprise-sso) | Sign in through an OpenID Connect provider; an account is provisioned on first sign-in |
 | [Proxy forward auth](docs/deployment.md#proxy-forward-auth) | A forward-auth proxy (Authelia, oauth2-proxy) names the signed-in person in a header quartet |
 
@@ -197,6 +203,7 @@ Every other connection exists only after you turn it on:
 - **Your single sign-on provider**, when you configure OIDC sign-in for the web UI. Crystalline talks to the issuer you name.
 - **A remote embedding service**, when you set `embeddings.provider: openai-compatible` in `config.yaml`. The text of your engrams is then sent to the endpoint you configure, to compute its embeddings. The default provider is local and sends nothing.
 - **A PostgreSQL server**, when you set `database.backend: postgres` and `database.url` to share one search index between instances. The index holds the text of your engrams.
+- **A Crystalline server you connect to**, after `crystalline connect <url>` (or with `CRYSTALLINE_REMOTE_URL` and `CRYSTALLINE_REMOTE_TOKEN` set). Searches and engram reads and writes for its domains go to that server, under your account there. A search over all domains also sends the search text to it. Your local engrams stay on your machine.
 
 Nothing else leaves the machine.
 

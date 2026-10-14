@@ -13,8 +13,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
 use crystalline_core::config::{
-    AuthConfig, DomainEntry, GitHubConfig, GlobalConfig, OriginConfig, ResponseFormat,
-    ServiceConfig,
+    AuthConfig, DatabaseBackend, DatabaseConfig, DomainEntry, GitHubConfig, GlobalConfig,
+    OidcConfig, OriginConfig, ResponseFormat, ServiceConfig,
 };
 use crystalline_index::TursoStore;
 use crystalline_remote::state::OriginState;
@@ -31,11 +31,26 @@ const ALPHA: &str = "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n 
 /// back - which is what makes it the sharp case for the reserved-name screen.
 const LOG: &str = "# Log\n\n- 2026-01-01 the domain was opened\n";
 
+const MARK_DB_URL: &str = "postgres://mk-db-user-7f3a:mk-db-pass-7f3a@mk-db-host-7f3a/mk";
+const MARK_API_URL: &str = "https://mk-ghes-7f3a.invalid/api/v3";
+const MARK_OAUTH_CLIENT: &str = "mk-oauth-client-7f3a";
+const MARK_OIDC_ISSUER: &str = "https://mk-issuer-7f3a.invalid";
+const MARK_OIDC_CLIENT: &str = "mk-oidc-client-7f3a";
+const MARK_OIDC_SECRET: &str = "mk-oidc-secret-7f3a";
+const MARK_OIDC_NAME: &str = "Mk Sign In 7f3a";
+const MARK_HOST: &str = "mk-host-7f3a.invalid";
+const MARK_PUBLIC_URL: &str = "https://mk-public-7f3a.invalid";
+const MARK_TRUSTED_HEADER: &str = "x-mk-user-7f3a";
+const MARK_REDIRECT_URI: &str = "https://mk-redirect-7f3a.invalid/api/v1/auth/oidc/callback";
+const MARK_OIDC_SCOPES: &str = "openid mk-scope-7f3a";
+
 /// What an admin-test server varies.
 #[derive(Default)]
 struct Options {
     /// Serve read-only: every mutation is refused, reads are not.
     read_only: bool,
+    /// Turn on the `auth.anonymous` viewer tier, with `auth.mcp` left off.
+    anonymous: bool,
     /// Start with `github.enabled` already on.
     github: bool,
     /// Share as the acting account's own GitHub identity rather than as the
@@ -61,6 +76,12 @@ struct Options {
     /// where GitHub is switched off or nobody is connected - the two states
     /// the sync endpoints answer differently.
     origin_domain: bool,
+    /// Put a marker value on the operator keys that are inert in this
+    /// fixture (the database url, the GitHub api url and app id, the OIDC
+    /// issuer, client id, secret, label, scopes and redirect address, the
+    /// trusted header, the public url and the allowed hosts), so the guard
+    /// test can look for them in every response.
+    operator_markers: bool,
 }
 
 struct Fixture {
@@ -84,7 +105,7 @@ async fn serve(opts: Options) -> Fixture {
         auth: Some(AuthConfig {
             trusted_header: None,
             proxy_headers: None,
-            anonymous: Some(false),
+            anonymous: Some(opts.anonymous),
             mcp: None,
             oauth: None,
             max_users: None,
@@ -112,6 +133,28 @@ async fn serve(opts: Options) -> Fixture {
     std::fs::write(dir.join("log.md"), LOG).unwrap();
     cfg.domains
         .insert("eng".to_string(), DomainEntry::file(dir));
+    if opts.operator_markers {
+        cfg.database = Some(DatabaseConfig {
+            backend: DatabaseBackend::Postgres,
+            url: Some(MARK_DB_URL.to_string()),
+        });
+        let github = cfg.github.get_or_insert_with(GitHubConfig::default);
+        github.api_url = Some(MARK_API_URL.to_string());
+        github.oauth_client_id = Some(MARK_OAUTH_CLIENT.to_string());
+        let auth = cfg.auth.get_or_insert_with(AuthConfig::default);
+        auth.oidc = Some(OidcConfig {
+            issuer: Some(MARK_OIDC_ISSUER.to_string()),
+            client_id: Some(MARK_OIDC_CLIENT.to_string()),
+            client_secret: Some(MARK_OIDC_SECRET.to_string()),
+            name: Some(MARK_OIDC_NAME.to_string()),
+            scopes: Some(MARK_OIDC_SCOPES.to_string()),
+            redirect_uri: Some(MARK_REDIRECT_URI.to_string()),
+            ..OidcConfig::default()
+        });
+        // No client in this test sends the header, so trusting it changes
+        // nothing about who the requests below are.
+        auth.trusted_header = Some(MARK_TRUSTED_HEADER.to_string());
+    }
     if opts.origin_domain {
         let team = root.join("kb");
         std::fs::create_dir_all(&team).unwrap();
@@ -144,6 +187,8 @@ async fn serve(opts: Options) -> Fixture {
     cfg.service = Some(ServiceConfig {
         response_format: Some(ResponseFormat::Json),
         read_only: Some(opts.read_only),
+        allowed_hosts: opts.operator_markers.then(|| vec![MARK_HOST.to_string()]),
+        public_url: opts.operator_markers.then(|| MARK_PUBLIC_URL.to_string()),
         ..ServiceConfig::default()
     });
     let config_path = root.join("config.yaml");
@@ -1289,7 +1334,8 @@ async fn the_manifest_read_carries_the_policies_and_the_patch_writes_one() {
         serde_json::json!([
             { "key": "generated_indexes", "kind": "choice", "declared": null, "effective": "local", "values": ["local", "shared"], "default": "local", "meaning": "Whether the generated folder listings travel with a share.", "changed_by": "owner" },
             { "key": "sharing", "kind": "choice", "declared": null, "effective": "proposal", "values": ["proposal", "direct"], "default": "proposal", "meaning": "Whether a share opens a proposal for review or commits straight to the branch.", "changed_by": "owner" },
-            { "key": "domain_name", "kind": "text", "declared": null, "effective": "kb", "values": [], "default": "", "meaning": "The name this domain is known by everywhere; links from other domains use it.", "changed_by": "owner" }
+            { "key": "domain_name", "kind": "text", "declared": null, "effective": "kb", "values": [], "default": "", "meaning": "The name this domain is known by everywhere; links from other domains use it.", "changed_by": "owner" },
+            { "key": "read_only", "kind": "choice", "declared": null, "effective": "off", "values": ["off", "on"], "default": "off", "meaning": "Whether every change to this domain through Crystalline is refused; pulls from the team still apply.", "changed_by": "owner" }
         ]),
         "{body}"
     );
@@ -1527,6 +1573,38 @@ async fn the_policy_patch_is_the_owners_and_refuses_read_only_and_a_missing_csrf
     .await
     .unwrap();
     assert_eq!(resp.status(), 403);
+}
+
+/// The engine lets the open tier change a policy where it may edit, so the
+/// REST route is what keeps the anonymous viewer tier out: with
+/// `auth.anonymous` on and `auth.mcp` off, a patch with no session is a 401
+/// and the MANIFEST on disk is unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_policy_patch_refuses_an_anonymous_viewer_on_the_open_tier() {
+    let fx = serve(Options {
+        anonymous: true,
+        ..Options::default()
+    })
+    .await;
+    let manifest = fx._tmp.path().join("eng").join("MANIFEST.md");
+    let before = std::fs::read_to_string(&manifest).unwrap();
+    let read = client()
+        .get(format!("http://{}/api/v1/domains/eng/manifest", fx.addr))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(read.status(), 200, "the viewer tier is on");
+    let resp = client()
+        .request(
+            reqwest::Method::PATCH,
+            format!("http://{}/api/v1/domains/eng/manifest", fx.addr),
+        )
+        .json(&serde_json::json!({"sharing": "direct"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "{}", resp.text().await.unwrap());
+    assert_eq!(std::fs::read_to_string(&manifest).unwrap(), before);
 }
 
 /// The offline list and detail are served with no GitHub connection and on
@@ -5093,4 +5171,191 @@ async fn import_resolves_the_domain_before_it_decompresses() {
         unknown.status(),
         "a non-admin must see the same answer whether the domain exists or not"
     );
+}
+
+/// Every JSON field name in `value`, at any depth.
+fn field_names(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (name, inner) in map {
+                out.push(name.clone());
+                field_names(inner, out);
+            }
+        }
+        serde_json::Value::Array(items) => items.iter().for_each(|v| field_names(v, out)),
+        _ => {}
+    }
+}
+
+/// **No REST response lists or reads back an operator setting.**
+///
+/// The operator keys are changed only with the crystalline CLI; MCP
+/// `configure` hides them, and this pins that the JSON API never grew a
+/// route that shows them. Derived behaviour is not exposure: the sign-in
+/// button's label comes from `auth.oidc.name` and must still reach
+/// `/auth/providers`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_rest_response_carries_an_operator_setting() {
+    let fx = serve(Options {
+        operator_markers: true,
+        ..Options::default()
+    })
+    .await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+
+    const READS: &[&str] = &[
+        "/api/v1/openapi.json",
+        "/api/v1/auth/me",
+        "/api/v1/auth/providers",
+        "/api/v1/me/identity-links",
+        "/api/v1/domains",
+        "/api/v1/domains/eng/manifest",
+        "/api/v1/domains/eng/engrams",
+        "/api/v1/domains/eng/tree",
+        "/api/v1/sync",
+        "/api/v1/search?q=alpha",
+        "/api/v1/vocabulary",
+        "/api/v1/context?anchor=crystalline://eng/alpha",
+        "/api/v1/activity",
+        "/api/v1/graph?anchor=crystalline://eng/alpha",
+        "/api/v1/evolve",
+        "/api/v1/users",
+        "/api/v1/settings/github",
+        "/api/v1/github/domain-name?repo=acme/kb",
+        "/api/v1/me/github-identity",
+        "/api/v1/me/mcp-tokens",
+        "/api/v1/me/oauth-grants",
+    ];
+    // GitHub is off in this fixture, so these two answer 409 with a sentence
+    // saying so; every other read must answer 2xx, so an error body cannot
+    // stand in for the route's real answer.
+    const REFUSED: &[&str] = &["/api/v1/sync", "/api/v1/github/domain-name?repo=acme/kb"];
+    // A stream, two redirects into the identity provider and the OAuth
+    // consent redirect: none of them answers with a JSON body to read.
+    const SKIPPED: &[&str] = &[
+        "GET /api/v1/events",
+        "GET /api/v1/auth/oidc/login",
+        "GET /api/v1/auth/oidc/callback",
+        "GET /api/v1/oauth/authorize",
+    ];
+    for op in crate::support::MOUNTED_OPERATIONS
+        .iter()
+        .filter(|op| op.starts_with("GET ") && !op.contains('{'))
+    {
+        if SKIPPED.contains(op) {
+            continue;
+        }
+        let path = op.trim_start_matches("GET ");
+        assert!(
+            READS.iter().any(|r| r.split('?').next() == Some(path)),
+            "{op} is a new read: add it to READS so the operator-setting guard covers it"
+        );
+    }
+
+    let operator_keys: Vec<&str> = crystalline_service::settings::registry()
+        .iter()
+        .filter(|s| s.operator_only)
+        .map(|s| s.key)
+        .collect();
+    let hidden = [
+        MARK_DB_URL,
+        "mk-db-pass-7f3a",
+        "mk-ghes-7f3a",
+        MARK_OAUTH_CLIENT,
+        "mk-issuer-7f3a",
+        MARK_OIDC_CLIENT,
+        MARK_OIDC_SECRET,
+        MARK_HOST,
+        "mk-public-7f3a",
+        MARK_TRUSTED_HEADER,
+        "mk-redirect-7f3a",
+        "mk-scope-7f3a",
+    ];
+    for path in READS {
+        let resp = as_session(fx.addr, reqwest::Method::GET, path, &admin)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = resp.text().await.unwrap();
+        // An error body would pass the marker checks without the route's
+        // real answer ever being read.
+        if REFUSED.contains(path) {
+            assert_eq!(status, reqwest::StatusCode::CONFLICT, "{path}: {body}");
+        } else {
+            assert!(status.is_success(), "{path} answered {status}: {body}");
+        }
+        for marker in hidden {
+            assert!(!body.contains(marker), "{path} carries {marker}: {body}");
+        }
+        if *path == "/api/v1/auth/providers" {
+            assert!(
+                body.contains(MARK_OIDC_NAME),
+                "the sign-in label is derived behaviour and stays: {body}"
+            );
+        } else {
+            assert!(!body.contains(MARK_OIDC_NAME), "{path}: {body}");
+        }
+        if *path == "/api/v1/openapi.json" {
+            continue;
+        }
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) else {
+            continue;
+        };
+        let mut names = Vec::new();
+        field_names(&json, &mut names);
+        for name in &names {
+            assert!(
+                !operator_keys.contains(&name.as_str()) && name != "settings",
+                "{path} has a field {name}: {body}"
+            );
+        }
+    }
+}
+
+/// The REST twin of the MCP refusal stays open for a person: on a team
+/// domain whose lock was switched on here, discarding the MANIFEST puts the
+/// team's copy back and so switches the lock off (spec A-1). Over MCP the
+/// same discard is refused (`mcp_collab`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_person_unlocks_a_locally_locked_team_domain_by_discarding_the_manifest() {
+    let (fx, _mock) = serve_team_with_mock().await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    register_kb(&fx, &admin).await;
+    let kb_root = fx._tmp.path().join("domains-root").join("kb");
+    let manifest_path = kb_root.join("MANIFEST.md");
+    let team = std::fs::read_to_string(&manifest_path).unwrap();
+    std::fs::write(
+        &manifest_path,
+        team.replacen("\n---\n", "\nread_only: on\n---\n", 1),
+    )
+    .unwrap();
+    as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/kb/sync",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+
+    let report = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/kb/changes/discard",
+        &admin,
+    )
+    .json(&serde_json::json!({ "paths": [{ "path": "MANIFEST.md" }] }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(report.status(), 200, "{}", report.text().await.unwrap());
+    let report: serde_json::Value = report.json().await.unwrap();
+    assert_eq!(
+        report["restored"],
+        serde_json::json!(["MANIFEST.md"]),
+        "{report}"
+    );
+    assert_eq!(std::fs::read_to_string(&manifest_path).unwrap(), team);
 }

@@ -129,7 +129,7 @@ pub const TREE_LEVEL_CAP: usize = 500;
 /// its own constant because the two bound different queries and either could
 /// move without the other: this one bounds a sorter holding bodies, that one
 /// bounds how much of the reference index a popover materializes.
-const MAX_PAGE_LIMIT: usize = 100;
+pub const MAX_PAGE_LIMIT: usize = 100;
 
 /// The deepest level [`Engine::browse_domain`] walks.
 ///
@@ -140,11 +140,16 @@ const MAX_PAGE_LIMIT: usize = 100;
 const TREE_MAX_DEPTH: usize = 64;
 
 /// The default `evolve_engrams` page size. Small on purpose: the queue is meant
-/// to be worked top-down and agreed item by item, not read in bulk.
-const EVOLVE_DEFAULT_LIMIT: usize = 10;
+/// to be worked top-down and agreed item by item, not read in bulk. Public so
+/// a merged page over connected servers is cut at the same size.
+pub const EVOLVE_DEFAULT_LIMIT: usize = 10;
+
+/// The default `search_engrams` page size. Public so a merged page over
+/// connected servers is cut at the same size.
+pub const SEARCH_DEFAULT_LIMIT: usize = 10;
 
 /// The largest `evolve_engrams` page size.
-const EVOLVE_MAX_LIMIT: usize = 100;
+pub const EVOLVE_MAX_LIMIT: usize = 100;
 
 /// The largest `inbound_references` page size.
 ///
@@ -156,28 +161,6 @@ const EVOLVE_MAX_LIMIT: usize = 100;
 /// past any popover page and small enough that the widest answer is still one
 /// screenful of rows.
 const MAX_INBOUND_LIMIT: usize = 100;
-
-/// The largest domain [`Engine::delete_preview`] enumerates sole-referent
-/// attachments on.
-///
-/// The enumeration is a full-domain read, and the cost is worth naming exactly:
-/// [`Engine::sole_referent_attachments`] lists every engram in the domain and
-/// loads the text of each one that could hold a reference, so asking "what does
-/// this delete orphan" on a domain of fifty thousand engrams reads fifty
-/// thousand engrams - to build a question, before anything is deleted. The
-/// scan stops early only when every candidate is already accounted for, which a
-/// domain that shares none of them never reaches.
-///
-/// So the bound caps **when** the enumeration runs, never what the delete does.
-/// Past it the question says the attachments were not enumerated instead of
-/// naming them, and [`Engine::delete_engram`] behaves exactly as it always has:
-/// it removes the markdown and the rows and leaves every file alone, on a
-/// domain of five hundred engrams and on a domain of fifty thousand alike.
-///
-/// Five hundred is the same shape of number as [`TREE_LEVEL_CAP`] and picked
-/// the same way: past any archive a person curates by hand, and small enough
-/// that the read behind the question stays a fraction of a second.
-pub const MAX_PREVIEW_SCAN_ENGRAMS: usize = 500;
 
 /// The fixed instruction every `evolve_engrams` response carries. It states the
 /// authority the queue does and does not have, so an agent working it never
@@ -246,7 +229,7 @@ pub const ACTOR_MAX_CHARS: usize = 120;
 ///
 /// Doc-hidden and `pub` rather than `pub(crate)`, because an actor composed
 /// out of two halves has to sanitize each half on its own rather than the
-/// composition (the service crate's `mcp::acting_actor`): a single pass over
+/// composition (the service crate's `mcp::compose_actor`): a single pass over
 /// the joined string lets the client-supplied half spend the whole budget and
 /// truncate away the half the server asserts.
 #[doc(hidden)]
@@ -359,6 +342,14 @@ pub enum EngineError {
     /// A content mutation was attempted against a read-only instance.
     #[error("this instance is read-only; content mutations are disabled")]
     ReadOnly,
+    /// A write into a domain whose MANIFEST says `read_only: on`. Carries
+    /// [`read_only_sentence`] for that domain, which names the one way back;
+    /// every surface speaks it unchanged except MCP's refusal of a switch-off
+    /// (`mcp_unlock_refusal` in the service crate). Raised only about a
+    /// domain the caller may see ([`Engine::refuse_read_only_domain`] screens
+    /// first), so it discloses nothing by existing.
+    #[error("{0}")]
+    DomainReadOnly(String),
     /// The caller is known, may see the thing they addressed, and is not
     /// allowed to do this to it. Distinct from [`EngineError::UnknownDomain`],
     /// which is what a caller who may not see it gets: this variant is only
@@ -631,6 +622,21 @@ pub struct EngramText {
     pub content: String,
     /// The content checksum: the CAS token of the next save.
     pub checksum: String,
+}
+
+/// A domain's MANIFEST source as the editor reads it: the markdown, or the
+/// fact that the domain has none yet.
+///
+/// `missing` rather than an error, because a domain without a MANIFEST is
+/// the one an admin opens the editor to fix. A missing MANIFEST reads as the
+/// empty text, so its save token is the checksum of nothing and a save
+/// carrying that token creates it ([`Engine::save_manifest`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestSource {
+    /// The markdown as stored, frontmatter included; empty when `missing`.
+    pub markdown: String,
+    /// True when the domain has no MANIFEST yet.
+    pub missing: bool,
 }
 
 /// A stage-boundary progress callback for a long connect:
@@ -980,6 +986,10 @@ pub struct Engine {
     // virtual-source write, and read here under the lock. Empty at construction
     // and for an engine that never serves MCP.
     routing_virtual: std::sync::RwLock<BTreeMap<String, Vec<String>>>,
+    // The virtual domains whose MANIFEST row says `read_only: on`, filled in
+    // the same pass as `routing_virtual` (`reload_virtual_manifests`). A file
+    // domain is never in here: its flag is read off `MANIFEST.md` on demand.
+    virtual_read_only: std::sync::RwLock<BTreeSet<String>>,
     // The name table over every registered domain: local names, the canonical
     // names MANIFESTs declare and machine-local aliases, each resolved to one
     // local name. Rebuilt from the registrations when `names_stale` is set and
@@ -1072,6 +1082,12 @@ pub struct Engine {
     // router built over one engine keeps the first store rather than silently
     // swapping the authority mid-flight.
     domain_access: std::sync::OnceLock<Arc<crate::scope::DomainAccess>>,
+    // The servers this machine offers domains from (`crystalline connect`),
+    // installed once by whoever serves this engine to its owner: the daemon at
+    // start, a one-shot CLI command before it routes. Absent everywhere else
+    // (a served instance's HTTP surface, most tests), where nothing is
+    // mounted and nothing is hidden.
+    sources: std::sync::OnceLock<Arc<crystalline_remote::SourceSet>>,
     // The origin rule the HTTP surface was built with, installed once by
     // `http_base`. It answers what this instance is called, for a local caller
     // and an HTTP one alike; absent in every process that serves no HTTP
@@ -1306,7 +1322,7 @@ pub enum ShareActor {
 /// whole point of the type: a domain the index holds no row for has synced
 /// nothing, while a count that could not be read is a number that exists and is
 /// unavailable. Collapsing them into one `None` is how a purge gate fails open,
-/// and it is what leaves a confirmation question quietly missing the figure it
+/// and it is what leaves the removal question quietly missing the figure it
 /// promises.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RemovalCount {
@@ -1346,11 +1362,11 @@ impl RemovalCount {
 /// surface, which is what makes serving the plan a read rather than a loophole.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PreviewCredential {
-    /// The share's own, or the share's own refusal. A caller about to ASK
-    /// whether to go ahead needs the answer the confirmed call would give, so a
-    /// question is never put about a share this instance would then refuse -
-    /// the MCP confirmation round (spec section 3, propose_preview's
-    /// write-class refusal probes ride along).
+    /// The share's own, or the share's own refusal: the answer the share
+    /// itself would give, so a preview never promises a share this instance
+    /// would then refuse (the preview's write-class refusal probes ride
+    /// along). No surface asks before a share with it any more; the engine's
+    /// tests use it, and it stays for a caller that wants the exact answer.
     ActingIdentity,
     /// The instance credential where the acting identity holds no personal
     /// token: the read-scope plan of spec section 6, which is what lets a
@@ -1365,8 +1381,10 @@ pub enum PreviewCredential {
 pub use crate::rename::RenameHold;
 pub use crate::rename::RenameStep;
 pub use crate::scope::OWNER_IDENTITY_NAME;
+pub use domain_settings::{DOMAIN_SETTINGS_HOW, PolicyEdit, VIRTUAL_NO_RULES};
 #[cfg(any(test, feature = "testing"))]
 pub use names::SpellingPushFault;
+pub use write_block::WriteBlock;
 
 /// What a write is told when it reaches a domain that reviews changes before
 /// they land and nobody can say whose draft it would join.
@@ -1581,6 +1599,21 @@ fn enrich_write_error(e: RemoteError, login: Option<&str>, repo: &str) -> Remote
             "the GitHub connection for @{login} has expired or was revoked - reconnect your GitHub identity (Fluid profile, or 'crystalline connect github --personal')."
         )),
         other => other,
+    }
+}
+
+/// [`enrich_write_error`] for a share, plus the one failure a share on the
+/// instance credential reads badly raw: GitHub refusing the blob or the
+/// commit with a plain 403 means the account cannot write the repository at
+/// all, so neither a direct commit nor a proposal can be made. The two
+/// organization-policy refusals are their own variants by now and pass
+/// unchanged, and personal mode keeps the words `enrich_write_error` gives it.
+fn share_write_error(e: RemoteError, login: Option<&str>, repo: &str) -> RemoteError {
+    match (e, login) {
+        (RemoteError::Api { status: 403, .. }, None) => {
+            RemoteError::Refused(crystalline_remote::error::no_write_access_guidance(repo))
+        }
+        (e, login) => enrich_write_error(e, login, repo),
     }
 }
 
@@ -2119,6 +2152,7 @@ impl Engine {
             github_refresh_locks: std::sync::Mutex::new(HashMap::new()),
             origin_poller: poller::OriginPollerState::default(),
             routing_virtual: std::sync::RwLock::new(BTreeMap::new()),
+            virtual_read_only: std::sync::RwLock::new(BTreeSet::new()),
             names: std::sync::RwLock::new((0, Arc::default())),
             names_generation: std::sync::atomic::AtomicU64::new(0),
             names_stale: std::sync::atomic::AtomicBool::new(true),
@@ -2139,6 +2173,7 @@ impl Engine {
             join_fence: tokio::sync::RwLock::new(()),
             collab: std::sync::OnceLock::new(),
             domain_access: std::sync::OnceLock::new(),
+            sources: std::sync::OnceLock::new(),
             web_origin: std::sync::OnceLock::new(),
             joins: Arc::new(crate::join::Joins::default()),
             rename_pause: crate::rename::RenamePause::default(),
@@ -2312,6 +2347,212 @@ impl Engine {
         let _ = self.domain_access.set(access);
     }
 
+    /// Install this machine's sources. A no-op on a second call.
+    pub fn set_sources(&self, sources: Arc<crystalline_remote::SourceSet>) {
+        let _ = self.sources.set(sources);
+    }
+
+    /// This machine's sources, when any were installed.
+    pub fn sources(&self) -> Option<Arc<crystalline_remote::SourceSet>> {
+        self.sources.get().cloned()
+    }
+
+    /// The local domains hidden while their source is connected (decision
+    /// D19): a copy of a mounted domain, or a late local name a source gave
+    /// out first. Every read answers them as unregistered, and a source that
+    /// is down keeps them hidden: a hidden copy is never an offline fallback.
+    pub fn shadowed_domains(&self) -> HashSet<String> {
+        self.sources()
+            .map(|s| s.shadowed().into_iter().collect())
+            .unwrap_or_default()
+    }
+
+    /// Refuse a write into a local domain a connected server hides, in the
+    /// words a domain nobody registered gets: a write never lands in the
+    /// hidden copy in the server's place, whatever the caller's scope
+    /// (decision D19). Every write view starts here.
+    pub(crate) fn refuse_shadowed(&self, name: &str) -> Result<()> {
+        let shadowed = self.shadowed_domains();
+        if shadowed.contains(name) {
+            self.domain_entry_scoped(name, &shadowed)?;
+        }
+        Ok(())
+    }
+
+    /// Refuse removing or renaming a local domain a connected server hides,
+    /// for the machine owner in the words `status` uses for it: a hidden copy
+    /// stays as it is until its source is disconnected (decision D19). Any
+    /// other caller is answered by the ownership gate, which answers a hidden
+    /// domain as one nobody registered. `spelling` may be an alias or the
+    /// canonical name: it is resolved first, hidden domains included.
+    pub(crate) async fn refuse_hidden_admin(
+        &self,
+        spelling: &str,
+        scope: &crate::scope::Scope,
+    ) -> Result<()> {
+        if !matches!(scope, crate::scope::Scope::Unrestricted) {
+            return Ok(());
+        }
+        let Some(sources) = self.sources() else {
+            return Ok(());
+        };
+        let table = sources.table();
+        if table.shadowed.is_empty() {
+            return Ok(());
+        }
+        let names = self.name_table_now().await;
+        let name = names.resolve(spelling).unwrap_or(spelling);
+        match table.hidden(name).next() {
+            Some(hidden) => Err(EngineError::Conflict(crystalline_remote::hidden_sentence(
+                hidden,
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// This machine's registered domains as the mount table reads them: the
+    /// name, its machine-local aliases and its origin identity.
+    pub fn local_domains(&self) -> Vec<crystalline_remote::LocalDomain> {
+        self.registered_domain_entries()
+            .into_iter()
+            .map(|(name, entry)| crystalline_remote::LocalDomain {
+                origin: self.origin_identity_of(&name),
+                aliases: entry.aliases.clone(),
+                name,
+            })
+            .collect()
+    }
+
+    /// Tell the sources this machine's domains changed, so a copy registered
+    /// or removed just now is hidden or shown at once rather than at the next
+    /// poll.
+    pub fn sync_sources_local(&self) {
+        if let Some(sources) = self.sources() {
+            sources.set_local(self.local_domains());
+        }
+    }
+
+    /// The source that holds `name` on this machine: the one that mounts
+    /// it, or the one whose `sources.json` record keeps it for a domain it
+    /// does not offer right now (decision D13: a name, once given, stays
+    /// that source's). `None` when no source holds it or none is installed.
+    pub fn mount_holder(&self, name: &str) -> Option<String> {
+        self.sources()?.holder_of(name)
+    }
+
+    /// The name a new local domain gets when a source holds `wanted` (it
+    /// mounts it, or keeps it reserved): `<wanted>-local`, counted up past
+    /// anything taken (decision D13). `wanted` itself when no source holds
+    /// it, and when a domain of that name is already registered here: an
+    /// existing registration keeps its name, so adopting it again never
+    /// registers a second one.
+    pub fn beside_mounts(&self, wanted: &str) -> String {
+        let Some(sources) = self.sources() else {
+            return wanted.to_string();
+        };
+        let registered = self.registered_domain_entries();
+        if registered.contains_key(wanted) || sources.holder_of(wanted).is_none() {
+            return wanted.to_string();
+        }
+        let table = sources.table();
+        let held: BTreeSet<String> = table
+            .mounts
+            .iter()
+            .map(|m| m.local.clone())
+            .chain(
+                sources
+                    .records()
+                    .into_iter()
+                    .flat_map(|s| s.mounts.into_iter().map(|m| m.local)),
+            )
+            .collect();
+        let names = self.names.read().unwrap().1.clone();
+        let free = |name: &str| {
+            !held.contains(name)
+                && !registered.contains_key(name)
+                && !registered
+                    .values()
+                    .any(|entry| entry.aliases.iter().any(|alias| alias == name))
+                && names.resolve(name).is_none()
+                && self.overlay.env_domain(name).is_none()
+        };
+        let base = format!("{wanted}-{}", crystalline_remote::LOCAL_SUFFIX);
+        if free(&base) {
+            return base;
+        }
+        (2..)
+            .map(|n| format!("{base}-{n}"))
+            .find(|name| free(name))
+            .expect("an unbounded count finds a free name")
+    }
+
+    /// What the mounts did to a new local domain: the name
+    /// [`Engine::beside_mounts`] gave it when a source held `wanted`, and
+    /// whether it is hidden at once (the same domain as a mount, by its
+    /// origin, or a name a source gave out first).
+    pub(crate) fn mount_notes(
+        &self,
+        wanted: &str,
+        name: &str,
+    ) -> Vec<crystalline_remote::MountNote> {
+        let Some(sources) = self.sources() else {
+            return Vec::new();
+        };
+        let mut notes = Vec::new();
+        if name != wanted
+            && let Some(source) = sources.holder_of(wanted)
+        {
+            notes.push(crystalline_remote::MountNote::Renamed {
+                wanted: wanted.to_string(),
+                name: name.to_string(),
+                source,
+            });
+        }
+        for hidden in sources.table().hidden(name) {
+            notes.push(match hidden.reason {
+                crystalline_remote::HiddenReason::Copy => {
+                    crystalline_remote::MountNote::HiddenCopy {
+                        name: name.to_string(),
+                        source: hidden.source.clone(),
+                    }
+                }
+                crystalline_remote::HiddenReason::Collision => {
+                    crystalline_remote::MountNote::Collision {
+                        name: name.to_string(),
+                        source: hidden.source.clone(),
+                    }
+                }
+            });
+        }
+        notes
+    }
+
+    /// Add [`Engine::mount_notes`] to a new local domain's report, joined to
+    /// a `note` it already carries. The source is named only for the machine
+    /// owner ([`crate::scope::Scope::Unrestricted`]): which servers this
+    /// machine is connected to is not anybody else's business.
+    pub(crate) fn note_beside_mounts(
+        &self,
+        result: &mut Value,
+        wanted: &str,
+        name: &str,
+        scope: &crate::scope::Scope,
+    ) {
+        let owner = matches!(scope, crate::scope::Scope::Unrestricted);
+        let mut notes: Vec<String> = self
+            .mount_notes(wanted, name)
+            .iter()
+            .map(|note| note.render(owner))
+            .collect();
+        if notes.is_empty() {
+            return;
+        }
+        if let Some(earlier) = result.get("note").and_then(Value::as_str) {
+            notes.insert(0, earlier.trim_end_matches('.').to_string());
+        }
+        result["note"] = json!(notes.join(". "));
+    }
+
     /// The origin rule the HTTP surface was built with, installed once by
     /// `http_base`. It is what answers a local caller's `service.public_url`
     /// (the value the daemon STARTED with, so a runtime configure of the key
@@ -2438,6 +2679,31 @@ impl Engine {
         })
     }
 
+    /// The account whose write list keeps `scope` from a step, when the list
+    /// is the reason. `needed` is `None` for the write question
+    /// ([`crate::scope::DomainAccess::write_list_excludes`]) and `Some(Own)` or
+    /// `Some(Manage)` for an owner or manager step
+    /// ([`crate::scope::DomainAccess::write_list_refuses`]). `None` when no
+    /// resolver is installed (the machine owner), and an unreadable store is an
+    /// error, never a permissive default.
+    pub async fn write_list_refusal(
+        &self,
+        scope: &crate::scope::Scope,
+        domain: &str,
+        needed: Option<crate::scope::DomainRight>,
+    ) -> Result<Option<String>> {
+        let Some(access) = self.domain_access.get() else {
+            return Ok(None);
+        };
+        let answer = match needed {
+            None => access.write_list_excludes(scope, domain).await,
+            Some(needed) => access.write_list_refuses(scope, domain, needed).await,
+        };
+        answer.map_err(|e| {
+            EngineError::Internal(format!("this domain's membership is unreadable: {e:#}"))
+        })
+    }
+
     /// Every domain name a read must answer as though it were not there: the
     /// private domains this caller may not see, plus every domain the index
     /// still holds that nobody has registered here.
@@ -2462,6 +2728,7 @@ impl Engine {
     pub async fn hidden_for(&self, scope: &crate::scope::Scope) -> Result<HashSet<String>> {
         let mut hidden = self.hidden_domains(scope).await?.unwrap_or_default();
         hidden.extend(self.unregistered_domains().await?);
+        hidden.extend(self.shadowed_domains());
         Ok(hidden)
     }
 
@@ -3315,6 +3582,20 @@ impl Engine {
         Ok(self.domain_entry(name)?.origin.is_some())
     }
 
+    /// What makes this domain the same domain as a copy elsewhere: the
+    /// repository, folder and branch its origin tracks, on the forge
+    /// `github.api_url` names. `None` for a domain with no origin, or one
+    /// nobody registered. A connected machine compares it with its own
+    /// domains' (spec A2, A3).
+    pub fn origin_identity_of(&self, name: &str) -> Option<crystalline_remote::OriginIdentity> {
+        let origin = self.domain_entry(name).ok()?.origin?;
+        let api_url = self.config().github.and_then(|g| g.api_url);
+        Some(crystalline_remote::OriginIdentity::of(
+            &origin,
+            api_url.as_deref(),
+        ))
+    }
+
     /// Resolve a registered domain to its content source: a filesystem root for
     /// a file domain, or the database for a virtual domain. Errors when the
     /// domain is not registered (the write path wants that), the layered lookup
@@ -3356,6 +3637,116 @@ impl Engine {
         self.domain_entry(name)
             .map(|entry| entry.is_overlay())
             .unwrap_or(false)
+    }
+
+    /// Whether `name` is a read-only domain: its MANIFEST as the team has it
+    /// (the folder for a file domain, the base row for a virtual one, never a
+    /// draft) says `read_only: on`. A name nobody registers is not read-only;
+    /// the verb that asked refuses it as unregistered anyway.
+    ///
+    /// Takes the store lock for a virtual domain whose cache was never filled,
+    /// so a caller must not hold the store guard across this call.
+    pub async fn domain_is_read_only(&self, name: &str) -> bool {
+        match self.content_source(name) {
+            Ok(ContentSource::File { root }) => crystalline_core::read_only_at(&root).is_on(),
+            Ok(ContentSource::Virtual) => {
+                if !self
+                    .virtual_names_loaded
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    self.reload_virtual_manifests().await;
+                }
+                self.virtual_read_only.read().unwrap().contains(name)
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Refuse a write into `name` while its MANIFEST says `read_only: on`.
+    ///
+    /// The one check every write path meets: the two write-view constructors
+    /// call it, the destination of a cross-domain move calls it, and the few
+    /// paths that write without a view call it by hand (the guard
+    /// `every_instance_write_guard_meets_the_domain_flag` pins that list).
+    ///
+    /// **Screened first.** A domain `scope` may not see is answered exactly as
+    /// an unregistered one, before the sentence can be reached: the refusal
+    /// names the domain, and naming a private domain to a stranger is the leak
+    /// the screen exists to close. The screen costs a visibility read only on
+    /// a domain that is read-only, so a writable domain pays one MANIFEST read.
+    pub async fn refuse_read_only_domain(
+        &self,
+        name: &str,
+        scope: &crate::scope::Scope,
+    ) -> Result<()> {
+        if !self.domain_is_read_only(name).await {
+            return Ok(());
+        }
+        self.require_domain(name, scope).await?;
+        Err(EngineError::DomainReadOnly(read_only_sentence(name)))
+    }
+
+    /// Every registered domain that is read-only right now.
+    pub async fn read_only_domain_names(&self) -> HashSet<String> {
+        let mut out = HashSet::new();
+        for name in self.registered_domain_entries().keys() {
+            if self.domain_is_read_only(name).await {
+                out.insert(name.clone());
+            }
+        }
+        out
+    }
+
+    /// The refusal an owner key earns from a caller who does not own the
+    /// domain. One spelling for the policies path and the MANIFEST text
+    /// paths, so a person reads the same rule whichever way they tried.
+    pub(crate) fn owner_key_refusal(domain: &str, key: &str) -> EngineError {
+        EngineError::Forbidden(format!(
+            "only the owner of '{domain}' or an instance admin may change `{key}`"
+        ))
+    }
+
+    /// Whether writing `after` as `domain`'s MANIFEST switches `read_only`
+    /// on: the base MANIFEST says off and `after` says on. Read against the
+    /// base and never a draft, so a draft that already says `on` is still a
+    /// switch-on at its next edit. The cheap text read goes first, so a
+    /// MANIFEST write that leaves the flag alone never reads the base.
+    pub(crate) async fn switches_read_only_on(&self, domain: &str, after: &str) -> bool {
+        crystalline_core::read_only_of_source(after).is_on()
+            && !self.domain_is_read_only(domain).await
+    }
+
+    /// Refuse a MANIFEST write that switches `read_only` on, unless `scope`
+    /// owns the domain or administers the instance (decision D10). Every
+    /// MANIFEST text writer calls it with the text it is about to write; the
+    /// policies path meets the same rule through its owner-key gate. The
+    /// anonymous open tier is refused too: the 0.24.3 open-tier rule does not
+    /// cover this key (spec A-1).
+    pub async fn refuse_read_only_switch_on(
+        &self,
+        domain: &str,
+        after: &str,
+        scope: &crate::scope::Scope,
+    ) -> Result<()> {
+        if !self.switches_read_only_on(domain, after).await {
+            return Ok(());
+        }
+        self.require_domain_owner_refusing(
+            domain,
+            scope,
+            Self::owner_key_refusal(domain, crystalline_core::READ_ONLY_KEY),
+        )
+        .await
+    }
+
+    /// Whether `identifier` names `domain`'s MANIFEST, resolved the way a
+    /// write resolves it. For the MCP handlers, which refuse every edit of a
+    /// read-only domain's MANIFEST in their own words (spec A-1).
+    pub async fn names_manifest(&self, domain: &str, identifier: &str) -> bool {
+        matches!(
+            self.resolve_in(identifier, domain).await,
+            Ok((desc, _)) if is_manifest_path(&desc.path)
+        )
     }
 
     /// Whose drafts a READ may lay over the base, for the verbs that answer
@@ -4285,7 +4676,7 @@ impl Engine {
     ///
     /// Says nothing about whether the file exists or parses; a caller that
     /// needs to know reads it.
-    fn config_file_path(&self) -> Option<PathBuf> {
+    pub fn config_file_path(&self) -> Option<PathBuf> {
         match &self.config_path {
             Some(p) => Some(p.clone()),
             None => crystalline_core::config::global_config_path().ok(),
@@ -5023,6 +5414,7 @@ mod contradictions;
 pub use contradictions::run_contradiction_worker;
 mod delete;
 mod domain_add;
+mod domain_settings;
 mod domains;
 mod edit;
 mod evolve;
@@ -5042,6 +5434,7 @@ mod sync;
 mod transfer;
 mod validate;
 mod write;
+mod write_block;
 
 /// Rank a context slice by personalized PageRank so the neighbors on the
 /// shortest, best-connected paths back to the seeds surface first.
@@ -6486,25 +6879,14 @@ fn receipt_permalink(found: Result<Option<String>>, fallback: String) -> String 
     }
 }
 
-/// Whether a domain holding `engrams` engrams is inside
-/// [`MAX_PREVIEW_SCAN_ENGRAMS`].
-///
-/// A line of arithmetic with its own name so the boundary is pinned by a test
-/// rather than by a reading: exactly the bound still enumerates, one past it
-/// does not.
-fn count_within_preview_bound(engrams: usize) -> bool {
-    engrams <= MAX_PREVIEW_SCAN_ENGRAMS
-}
-
 /// Every attachment one engram's own text points at: the `assets/` references
 /// in its body plus the one an `analyzes` claim in its frontmatter names,
 /// deduplicated and in reference order.
 ///
-/// The one enumeration of "what does this engram use", shared by the
-/// cross-domain move (which has to carry them) and by
-/// [`Engine::delete_preview`] (which has to name the ones the delete leaves
-/// behind). Text that will not parse is read as a body on its own rather than
-/// dropped, because a reference in unparseable text is still a reference.
+/// The one enumeration of "what does this engram use", which the cross-domain
+/// move uses to carry them. Text that will not parse is read as a body on its
+/// own rather than dropped, because a reference in unparseable text is still a
+/// reference.
 fn referenced_asset_paths(content: &str) -> Vec<String> {
     let parsed = parse_engram(content).ok();
     let body = parsed
@@ -7165,8 +7547,16 @@ fn note_heading_stripped(receipt: &mut Value, stripped: Option<String>) {
     }
 }
 
+/// The sentence a read-only domain refuses a write with:
+/// `'<domain>' is read-only; its owner switches read_only off in the domain policies`.
+/// One spelling for the engine, REST, Fluid and the write-block reason
+/// (`WriteBlock::DomainLocked`).
+pub fn read_only_sentence(domain: &str) -> String {
+    format!("'{domain}' is read-only; its owner switches read_only off in the domain policies")
+}
+
 /// Whether a domain-relative path is the domain's MANIFEST.
-fn is_manifest_path(rel: &str) -> bool {
+pub(crate) fn is_manifest_path(rel: &str) -> bool {
     rel == "MANIFEST.md"
 }
 
@@ -8358,19 +8748,6 @@ mod attachment_carry_tests {
         assert!(resolve_shared(Ok(HashSet::new()), &candidates).is_empty());
     }
 
-    /// The bound the delete preview enumerates under, pinned at the edge:
-    /// exactly [`MAX_PREVIEW_SCAN_ENGRAMS`] engrams still gets the full
-    /// enumeration, one more does not. The number itself may move; which side
-    /// of it each count falls on must not drift by an off-by-one.
-    #[test]
-    fn the_preview_scan_bound_includes_its_own_number() {
-        assert!(count_within_preview_bound(0));
-        assert!(count_within_preview_bound(1));
-        assert!(count_within_preview_bound(MAX_PREVIEW_SCAN_ENGRAMS));
-        assert!(!count_within_preview_bound(MAX_PREVIEW_SCAN_ENGRAMS + 1));
-        assert!(!count_within_preview_bound(50_000));
-    }
-
     #[test]
     fn the_screen_matches_every_spelling_of_a_reference() {
         assert_eq!(asset_tail("assets/shot.png"), "shot.png");
@@ -9186,6 +9563,32 @@ mod share_actor_tests {
         );
     }
 
+    /// A share on the instance credential that GitHub refuses with a plain
+    /// 403 says the account cannot write the repository; personal mode keeps
+    /// its own words, and the organization-policy refusals pass unchanged.
+    #[test]
+    fn a_share_403_on_the_instance_credential_says_the_account_cannot_write() {
+        let forbidden = || RemoteError::Api {
+            status: 403,
+            message: "Resource not accessible by integration".to_string(),
+        };
+        assert_eq!(
+            share_write_error(forbidden(), None, "acme/kb").to_string(),
+            "Your GitHub account cannot write to acme/kb, so neither a direct commit nor a proposal can be made. Ask the repository's admins for write access."
+        );
+        assert!(
+            share_write_error(forbidden(), Some("alice"), "acme/kb")
+                .to_string()
+                .contains("@alice needs write access")
+        );
+        let sso = RemoteError::SsoAuthorizationRequired {
+            org: "acme".to_string(),
+            url: "https://github.com/orgs/acme/sso".to_string(),
+        };
+        let text = sso.to_string();
+        assert_eq!(share_write_error(sso, None, "acme/kb").to_string(), text);
+    }
+
     /// The two organization-policy refusals are 403s upstream too, but the
     /// provider has already said what actually has to happen, and adding a
     /// collaborator clears neither. They reach the caller word for word.
@@ -9542,5 +9945,87 @@ mod announce_tests {
         );
         assert!(matches!(rx.try_recv().unwrap().change, Change::Domain(_)));
         assert!(rx.try_recv().is_err());
+    }
+}
+
+#[cfg(test)]
+mod hidden_copy_tests {
+    use super::*;
+    use crystalline_core::config::DomainEntry;
+    use crystalline_index::TursoStore;
+    use crystalline_remote::{CredentialKind, MountRecord, SourceRecord, SourceSet};
+
+    /// An engine with `notes` registered and a connected source `acme` that
+    /// keeps the name `notes` and has never answered, so `notes` is hidden.
+    async fn engine_hiding_notes(dir: &Path) -> Engine {
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let mut config = GlobalConfig::default();
+        let root = dir.join("notes");
+        std::fs::create_dir_all(&root).unwrap();
+        config
+            .domains
+            .insert("notes".to_string(), DomainEntry::file(root));
+        let engine = Engine::new(Arc::new(Mutex::new(store)), config, None, None);
+        let remote = dir.join("remote");
+        crystalline_remote::update_sources(&remote, |file| {
+            file.upsert(SourceRecord {
+                url: "http://127.0.0.1:9".to_string(),
+                name: "acme".to_string(),
+                account: "ada".to_string(),
+                kind: CredentialKind::Token,
+                token_endpoint: None,
+                revocation_endpoint: None,
+                connected_at: Utc::now(),
+                mounts: vec![MountRecord {
+                    remote: "notes".to_string(),
+                    local: "notes".to_string(),
+                }],
+                domains: None,
+                from_env: false,
+            });
+            Ok(())
+        })
+        .unwrap();
+        let set = SourceSet::load(remote, engine.local_domains(), |_| None);
+        engine.set_sources(Arc::new(set));
+        assert!(engine.shadowed_domains().contains("notes"));
+        engine
+    }
+
+    /// Review N3: a co-editing room's save into a draft of a domain that
+    /// became hidden is refused as an unregistered domain.
+    #[tokio::test]
+    async fn a_room_save_into_a_hidden_domain_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = engine_hiding_notes(tmp.path()).await;
+        let view = DomainView::for_actor(&engine, "notes", &HashSet::new(), "ada").unwrap();
+        let p: crate::params::SaveParams = serde_json::from_value(json!({
+            "domain": "notes",
+            "identifier": "page",
+            "content": "---\ntype: engram\ntitle: Page\npermalink: page\nstatus: stable\n---\n\n# Page\n",
+            "expected_checksum": "",
+        }))
+        .unwrap();
+        let refused = engine
+            .save_engram_in_overlay(&view, &p, "page.md")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(refused, EngineError::UnknownDomain { .. }),
+            "{refused}"
+        );
+    }
+
+    /// Review N1: the collaboration verbs' common entry refuses a hidden
+    /// copy, so share, withdraw, discard and resolve never act on it.
+    #[tokio::test]
+    async fn the_origin_lock_refuses_a_hidden_domain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = engine_hiding_notes(tmp.path()).await;
+        let refused = engine.origin_lock_registered("notes").unwrap_err();
+        assert!(
+            matches!(refused, EngineError::UnknownDomain { .. }),
+            "{refused}"
+        );
     }
 }

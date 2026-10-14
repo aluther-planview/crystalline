@@ -18,6 +18,7 @@ use crystalline_core::config::{
     },
 };
 use crystalline_core::names::{NameInput, NameTable};
+use crystalline_core::text::plural;
 use crystalline_index::{
     ChunkParams, DomainKind, NoReindexHooks, RebuildKind, Store, apply_scan, configured_model_id,
     download_local_model, provider_from_config, reindex_domains, resolve_forward_refs,
@@ -530,7 +531,7 @@ fn write_back_manifest_name_if_needed(entry: &DomainEntry, root: &Path, name: &s
 /// adopts the existing registration - whatever name it holds - rather than
 /// adding a second one over the same files. Never a write-back candidate
 /// (see [`domain_add_register`]'s doc comment), so only the name is needed.
-fn existing_file_domain_at(canonical: &Path, cfg: &GlobalConfig) -> Option<String> {
+pub(crate) fn existing_file_domain_at(canonical: &Path, cfg: &GlobalConfig) -> Option<String> {
     cfg.domains.iter().find_map(|(name, entry)| {
         (canonical_root(entry).as_deref() == Some(canonical)).then(|| name.clone())
     })
@@ -551,7 +552,7 @@ fn existing_file_domain_at(canonical: &Path, cfg: &GlobalConfig) -> Option<Strin
 /// lives in the database, which this path never opens - an empty
 /// `virtual_names` map into [`crystalline_core::names::config_name_inputs`],
 /// same as [`domain_list`]'s own no-index case.
-fn build_name_table(loaded: &crystalline_service::LoadedConfig) -> NameTable {
+pub(crate) fn build_name_table(loaded: &crystalline_service::LoadedConfig) -> NameTable {
     let empty = std::collections::BTreeMap::new();
     let mut inputs: Vec<NameInput> = Vec::new();
     for cfg in [&loaded.file, &loaded.effective] {
@@ -566,6 +567,11 @@ fn build_name_table(loaded: &crystalline_service::LoadedConfig) -> NameTable {
 /// Rewrite `<root>/MANIFEST.md` to declare `domain_name: <name>`; a no-op
 /// when it already reads that way.
 fn write_back_manifest_name(root: &Path, name: &str) -> Result<()> {
+    // A read-only domain keeps its MANIFEST as the team wrote it; the name
+    // stays the registration's, exactly as the engine's write-back does.
+    if crystalline_core::read_only_at(root).is_on() {
+        return Ok(());
+    }
     let manifest = root.join("MANIFEST.md");
     let text = std::fs::read_to_string(&manifest)
         .map_err(|e| anyhow!("reading {}: {e}", manifest.display()))?;
@@ -856,7 +862,10 @@ pub(crate) fn print_origin_add(repo: &str, data: &serde_json::Value, json: bool)
             data["files_added"].as_u64().unwrap_or(0)
         );
         if changes > 0 {
-            println!("  {changes} local file(s) differ from the origin, ready to share or update");
+            println!(
+                "  {} from the origin, ready to share or update",
+                plural(changes as usize, "local file differs", "local files differ")
+            );
         }
     }
     println!("Run: crystalline origin status --domain {name}");
@@ -873,9 +882,11 @@ pub(crate) fn print_origin_add(repo: &str, data: &serde_json::Value, json: bool)
 /// layers also says where it sits, through [`stack_line`]; a share that also
 /// carried refreshed folder listings says so in one line of its own, through
 /// [`change_count_lines`]. A direct domain's commit is reported with its
-/// branch and page (`committed`), and so are the three direct refusals: a
-/// proposal still open, a branch whose rules refuse the commit, a branch that
-/// moved twice.
+/// branch and page (`committed`). A share that fell back to a proposal, or a
+/// direct commit that works again, adds the receipt's `note` under its first
+/// line. The three direct refusals are reported too: a proposal still open
+/// (the sharer's own, or another person's), a branch whose rules refuse the
+/// commit, a branch that moved twice.
 pub(crate) fn print_origin_share(domain: &str, data: &serde_json::Value, json: bool) {
     if json {
         println!("{data}");
@@ -897,6 +908,9 @@ pub(crate) fn origin_share_lines(domain: &str, data: &serde_json::Value) -> Vec<
                 "Opened proposal: {}",
                 data["url"].as_str().unwrap_or("")
             ));
+            if let Some(note) = data["note"].as_str() {
+                lines.push(format!("  {note}"));
+            }
             if let Some(summary) = data["summary"].as_str() {
                 lines.push(format!("  {summary}"));
             }
@@ -930,6 +944,9 @@ pub(crate) fn origin_share_lines(domain: &str, data: &serde_json::Value) -> Vec<
                 "Committed to {}: {at}",
                 data["branch"].as_str().unwrap_or("")
             ));
+            if let Some(note) = data["note"].as_str() {
+                lines.push(format!("  {note}"));
+            }
             if let Some(summary) = data["summary"].as_str() {
                 lines.push(format!("  {summary}"));
             }
@@ -938,19 +955,30 @@ pub(crate) fn origin_share_lines(domain: &str, data: &serde_json::Value) -> Vec<
         }
         "proposal_open" => {
             let prop = &data["proposal"];
-            lines.push(format!(
-                "Cannot share '{domain}': proposal #{} ({}) is still open; merge or withdraw it first.",
-                prop["number"].as_u64().unwrap_or(0),
-                prop["url"].as_str().unwrap_or("")
-            ));
+            let number = prop["number"].as_u64().unwrap_or(0);
+            let url = prop["url"].as_str().unwrap_or("");
+            // An older daemon sends no `own`; its proposal_open was always
+            // the sharer's own.
+            if data["own"].as_bool() == Some(false) {
+                lines.push(format!(
+                    "Cannot share '{domain}': proposal #{number} ({url}) is another person's and is still open. Share again once it is merged or closed."
+                ));
+            } else {
+                lines.push(format!(
+                    "Cannot share '{domain}': proposal #{number} ({url}) is still open; merge or withdraw it first."
+                ));
+            }
         }
-        "branch_protected" => {
-            lines.push(format!(
-                "Cannot commit to {}: {} Set sharing: proposal in the MANIFEST, or ask a repository admin.",
+        // With no proposal on offer (another person's proposal is open), the
+        // engine's own sentence says what to do, and it is shown as given.
+        "branch_protected" => match (data["fallback"].as_str(), data["guidance"].as_str()) {
+            (None, Some(guidance)) => lines.push(guidance.to_string()),
+            _ => lines.push(format!(
+                "The branch {} does not accept direct commits from you ({}). Share the same changes as a proposal instead: crystalline origin share {domain} --proposal.",
                 data["branch"].as_str().unwrap_or(""),
                 data["message"].as_str().unwrap_or("")
-            ));
-        }
+            )),
+        },
         "branch_moved" => {
             lines.push(format!(
                 "The branch {} moved while sharing; run: crystalline origin update --domain {domain} and share again.",
@@ -976,8 +1004,12 @@ pub(crate) fn origin_share_lines(domain: &str, data: &serde_json::Value) -> Vec<
         }
         "conflicts_pending" => {
             lines.push(format!(
-                "Cannot share '{domain}': {} conflict(s) need to be resolved first.",
-                data["count"].as_u64().unwrap_or(0)
+                "Cannot share '{domain}': {} to be resolved first.",
+                plural(
+                    data["count"].as_u64().unwrap_or(0) as usize,
+                    "conflict needs",
+                    "conflicts need"
+                )
             ));
             for c in data["conflicts"].as_array().unwrap_or(&empty) {
                 lines.push(format!("  conflict: {}", c["path"].as_str().unwrap_or("")));
@@ -1256,7 +1288,7 @@ pub(crate) fn print_origin_discard(data: &serde_json::Value, json: bool) -> bool
         );
     }
     if let Some(n) = data["reindexed"].as_u64().filter(|n| *n > 0) {
-        println!("re-indexed {n} file(s)");
+        println!("re-indexed {}", plural(n as usize, "file", "files"));
     }
     acted > 0
 }
@@ -1374,11 +1406,19 @@ pub(crate) fn print_provision_status(data: &serde_json::Value, json: bool, all: 
     if !all {
         if no_provisioning > 0 {
             println!(
-                "{no_provisioning} domain(s) declare no provisioning (run `crystalline provision status --all` to list them)"
+                "{} no provisioning (run `crystalline provision status --all` to list them)",
+                plural(no_provisioning, "domain declares", "domains declare")
             );
         }
         if virtual_domains > 0 {
-            println!("{virtual_domains} virtual domain(s), which never provision artifacts");
+            println!(
+                "{} artifacts",
+                plural(
+                    virtual_domains,
+                    "virtual domain, which never provisions",
+                    "virtual domains, which never provision"
+                )
+            );
         }
     }
     for h in data["harnesses"].as_array().unwrap_or(&empty) {
@@ -1390,10 +1430,18 @@ pub(crate) fn print_provision_status(data: &serde_json::Value, json: bool, all: 
             continue;
         }
         println!(
-            "{}: {} file(s) installed, {} mcp(s) installed, {} drifted, {} edited, {} orphaned, {} missing",
+            "{}: {} installed, {} installed, {} drifted, {} edited, {} orphaned, {} missing",
             h["harness"].as_str().unwrap_or(""),
-            h["installed_files"].as_u64().unwrap_or(0),
-            h["installed_mcps"].as_u64().unwrap_or(0),
+            plural(
+                h["installed_files"].as_u64().unwrap_or(0) as usize,
+                "file",
+                "files"
+            ),
+            plural(
+                h["installed_mcps"].as_u64().unwrap_or(0) as usize,
+                "mcp",
+                "mcps"
+            ),
             h["drift"].as_u64().unwrap_or(0),
             h["edited"].as_u64().unwrap_or(0),
             h["orphaned"].as_u64().unwrap_or(0),
@@ -1484,7 +1532,14 @@ pub fn print_domain_remove(name: &str, report: &serde_json::Value, json: bool) {
     }
     let rooms = report["rooms_closed"].as_u64().unwrap_or(0);
     if rooms > 0 {
-        println!("{rooms} open co-editing session(s) were saved and closed.");
+        println!(
+            "{} saved and closed.",
+            plural(
+                rooms as usize,
+                "open co-editing session was",
+                "open co-editing sessions were"
+            )
+        );
     }
 }
 
@@ -1534,7 +1589,10 @@ fn review_plan_lines(plan: &serde_json::Value) -> Vec<String> {
             .filter(|draft| draft["kind"] == serde_json::json!("file"))
             .count();
         out.push(match files {
-            0 => format!("  {actor} ({entries} draft(s))"),
+            0 => format!(
+                "  {actor} ({})",
+                plural(entries as usize, "draft", "drafts")
+            ),
             1 => format!("  {actor} ({entries} draft changes, 1 of them a file)"),
             n => format!("  {actor} ({entries} draft changes, {n} of them files)"),
         });
@@ -1614,22 +1672,37 @@ pub fn print_domain_review(report: &serde_json::Value, json: bool) {
     }
     for row in report["folded"].as_array().cloned().unwrap_or_default() {
         println!(
-            "  folded {}: {} file(s) written, {} deleted.",
+            "  folded {}: {} written, {} deleted.",
             row["actor"].as_str().unwrap_or("?"),
-            row["written"].as_u64().unwrap_or(0),
+            plural(
+                row["written"].as_u64().unwrap_or(0) as usize,
+                "file",
+                "files"
+            ),
             row["deleted"].as_u64().unwrap_or(0)
         );
     }
     for row in report["discarded"].as_array().cloned().unwrap_or_default() {
         println!(
-            "  discarded {}: {} draft(s) ended.",
+            "  discarded {}: {} ended.",
             row["actor"].as_str().unwrap_or("?"),
-            row["entries"].as_u64().unwrap_or(0)
+            plural(
+                row["entries"].as_u64().unwrap_or(0) as usize,
+                "draft",
+                "drafts"
+            )
         );
     }
     let rooms = report["rooms_closed"].as_u64().unwrap_or(0);
     if rooms > 0 {
-        println!("{rooms} open co-editing session(s) were saved and closed.");
+        println!(
+            "{} saved and closed.",
+            plural(
+                rooms as usize,
+                "open co-editing session was",
+                "open co-editing sessions were"
+            )
+        );
     }
 }
 
@@ -2095,7 +2168,10 @@ pub async fn sync(
                     .await
                     .map_err(|e| anyhow!("sync of '{name}' failed: {e}"))?;
                 if !json {
-                    println!("reparsed {n} engram(s) of '{name}' after a parser change");
+                    println!(
+                        "reparsed {} of '{name}' after a parser change",
+                        plural(n, "engram", "engrams")
+                    );
                 }
             }
             continue;
@@ -2210,15 +2286,17 @@ pub(crate) fn sync_failure(
             .map(|r| r.domain.as_str())
             .collect();
         parts.push(format!(
-            "{failed_count} file(s) failed to sync in domain(s): {}",
+            "{} to sync in {}: {}",
+            plural(failed_count, "file failed", "files failed"),
+            plural(domains.len(), "domain", "domains"),
             domains.join(", ")
         ));
     }
     if !scan_failed.is_empty() {
         let domains: Vec<&str> = scan_failed.iter().map(|(name, _)| name.as_str()).collect();
         parts.push(format!(
-            "{} domain(s) could not be scanned at all, usually a path or permission problem: {}",
-            scan_failed.len(),
+            "{} could not be scanned at all, usually a path or permission problem: {}",
+            plural(scan_failed.len(), "domain", "domains"),
             domains.join(", ")
         ));
     }
@@ -2304,8 +2382,8 @@ pub async fn reindex(
                 .map(|name| format!("\n  crystalline domain export <dir> --domain {name}"))
                 .collect();
             bail!(
-                "refusing to wipe: the index holds {} virtual domain(s) whose engrams live nowhere else, so a wipe would delete them for good: {}. The index opened, so copying them out works - do that first, then wipe:{}\n  crystalline reindex --wipe\n\nOr rebuild without destroying anything: crystalline reindex --full",
-                virtual_domains.len(),
+                "refusing to wipe: the index holds {} whose engrams live nowhere else, so a wipe would delete them for good: {}. The index opened, so copying them out works - do that first, then wipe:{}\n  crystalline reindex --wipe\n\nOr rebuild without destroying anything: crystalline reindex --full",
+                plural(virtual_domains.len(), "virtual domain", "virtual domains"),
                 virtual_domains.join(", "),
                 exports
             );
@@ -2371,7 +2449,10 @@ pub async fn reindex(
             print_report(r);
         }
         if drafts_restored > 0 {
-            println!("  {drafts_restored} draft(s) restored from the overlay journal");
+            println!(
+                "  {} restored from the overlay journal",
+                plural(drafts_restored as usize, "draft", "drafts")
+            );
         }
         if let Some(aside) = &set_aside {
             println!(
@@ -2924,24 +3005,6 @@ pub fn render_status(data: &serde_json::Value, daemon_note: &str) {
             last
         );
     }
-}
-
-/// Show per-domain counts and index diagnostics from the index the dispatch
-/// reached. `daemon_note` says which view this is, so a direct read never
-/// masquerades as a running daemon's.
-pub async fn status(
-    route: IndexRoute,
-    cfg: &GlobalConfig,
-    json: bool,
-    daemon_note: &str,
-) -> Result<()> {
-    let value = status_value(route, cfg).await?;
-    if json {
-        println!("{value}");
-    } else {
-        render_status(&value, daemon_note);
-    }
-    Ok(())
 }
 
 // --- model download ----------------------------------------------------------
@@ -3804,14 +3867,28 @@ mod origin_share_tests {
             open[0],
             "Cannot share 'kb': proposal #4 (https://github.com/acme/knowledge/pull/4) is still open; merge or withdraw it first."
         );
+        let foreign = origin_share_lines(
+            "kb",
+            &json!({ "outcome": "proposal_open", "own": false, "proposal": { "number": 5, "url": "https://github.com/acme/knowledge/pull/5", "title": "Theirs" }, "guidance": "g" }),
+        );
+        assert_eq!(
+            foreign[0],
+            "Cannot share 'kb': proposal #5 (https://github.com/acme/knowledge/pull/5) is another person's and is still open. Share again once it is merged or closed."
+        );
         let protected = origin_share_lines(
             "kb",
-            &json!({ "outcome": "branch_protected", "branch": "main", "message": "Changes must be made through a pull request.", "guidance": "g" }),
+            &json!({ "outcome": "branch_protected", "branch": "main", "message": "Changes must be made through a pull request.", "guidance": "g", "fallback": "proposal" }),
         );
         assert_eq!(
             protected[0],
-            "Cannot commit to main: Changes must be made through a pull request. Set sharing: proposal in the MANIFEST, or ask a repository admin."
+            "The branch main does not accept direct commits from you (Changes must be made through a pull request.). Share the same changes as a proposal instead: crystalline origin share kb --proposal."
         );
+        let blocked_text = "The branch main does not accept direct commits from you (Changes must be made through a pull request.). Another person's proposal is open on this domain, so share again once it is merged or closed.";
+        let blocked = origin_share_lines(
+            "kb",
+            &json!({ "outcome": "branch_protected", "branch": "main", "message": "Changes must be made through a pull request.", "guidance": blocked_text }),
+        );
+        assert_eq!(blocked[0], blocked_text, "no proposal is offered");
         let moved = origin_share_lines(
             "kb",
             &json!({ "outcome": "branch_moved", "branch": "main", "guidance": "g" }),
@@ -3820,6 +3897,28 @@ mod origin_share_tests {
             moved[0],
             "The branch main moved while sharing; run: crystalline origin update --domain kb and share again."
         );
+    }
+
+    #[test]
+    fn a_fallback_and_a_direct_commit_that_works_again_say_so() {
+        let fell_back = origin_share_lines(
+            "kb",
+            &json!({ "outcome": "proposed", "url": "https://github.com/acme/kb/pull/9", "number": 9, "summary": "Share 1 new engram", "fell_back": true, "note": "The branch main does not accept direct commits from you, so this share opened a proposal." }),
+        );
+        assert_eq!(
+            fell_back[0],
+            "Opened proposal: https://github.com/acme/kb/pull/9"
+        );
+        assert_eq!(
+            fell_back[1],
+            "  The branch main does not accept direct commits from you, so this share opened a proposal."
+        );
+        let works = origin_share_lines(
+            "kb",
+            &json!({ "outcome": "committed", "sha": "9f2c1a7deadbeef", "url": null, "branch": "main", "summary": "Share 1 new engram", "note": "Direct commits to main work for you now." }),
+        );
+        assert_eq!(works[0], "Committed to main: 9f2c1a7");
+        assert_eq!(works[1], "  Direct commits to main work for you now.");
     }
 }
 
@@ -3887,7 +3986,7 @@ mod review_plan_tests {
             "and each file row says which it is: {lines}"
         );
         assert!(
-            lines.contains("  bo (1 draft(s))"),
+            lines.contains("  bo (1 draft)"),
             "an actor drafting no files reads exactly as they always did: {lines}"
         );
         assert!(

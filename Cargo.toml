@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.22.1"
+version = "0.25.0"
 authors = ["Jordi Böhme <jordi@boehme-lopez.de>"]
 edition = "2024"
 license = "MPL-2.0"
@@ -63,7 +63,7 @@ sqlx = { version = "0.9.0", default-features = false, features = [
     "tls-rustls",
     "postgres",
     # `EXPLAIN (FORMAT JSON)` comes back as a `json` column, which the plan
-    # registry in crates/index/tests/plans.rs reads as a tree. serde_json is
+    # registry in crates/index/tests/it/plans.rs reads as a tree. serde_json is
     # already a direct dependency of every crate that would see it.
     "json",
 ] }
@@ -247,6 +247,12 @@ tiktoken-rs = "0.12.0"
 # untouched.
 [profile.dev]
 debug = "line-tables-only"
+
+# Dependencies carry no debug info: our own code keeps line tables for
+# backtraces, and the dependency graph (turso, candle, axum, rmcp) stops
+# writing gigabytes of line tables into every test binary.
+[profile.dev.package."*"]
+debug = false
 
 # Password hashing dominates the account-creating test binaries, and argon2 at
 # opt-level 0 costs about 14x what it does optimised. The test profile inherits

@@ -101,6 +101,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Form, Json, Router};
+use crystalline_core::base::{BasePath, PublicBase};
 use crystalline_core::config::GlobalConfig;
 use openidconnect::url::{Host, Url};
 use serde_json::{Value, json};
@@ -133,13 +134,17 @@ pub const AUTHORIZE_PATH: &str = "/oauth/authorize";
 /// [`super::auth::PUBLIC_PATHS`] the way [`AUTHORIZE_PATH`] is.
 pub const AUTHORIZATIONS_PATH: &str = "/oauth/authorizations/{id}";
 
-/// The Fluid screen a person consents on, at the application root rather than
-/// under the API mount: a browser is navigated here, and what it loads is the
-/// single-page app. `?request=<id>` names the pending authorization.
+/// The Fluid screen a person consents on, at the application root under the
+/// base path rather than under the API mount: a browser is navigated here, and
+/// what it loads is the single-page app. `?request=<id>` names the pending
+/// authorization.
 pub const CONSENT_PAGE: &str = "/authorize";
 
 /// Where a code or a refresh token is exchanged, relative to the API mount.
 pub const TOKEN_PATH: &str = "/oauth/token";
+
+/// RFC 7009 token revocation, under the API mount like the other three.
+pub const REVOKE_PATH: &str = "/oauth/revoke";
 
 /// Where a client registers itself, relative to the API mount.
 pub const REGISTER_PATH: &str = "/oauth/register";
@@ -369,15 +374,19 @@ const MAX_STATE_LEN: usize = MAX_URI_LEN;
 /// are one answer rather than three.
 #[derive(Clone, Debug)]
 pub struct OriginRule {
-    /// The configured public origin, already parsed down to scheme, host and
-    /// port. `None` means derive it from each request.
+    /// The configured public base: `service.public_url` with its path when
+    /// set, otherwise the origin of the configured callback address. `None`
+    /// means derive it from each request.
     override_origin: Option<String>,
     /// `service.public_url` as the rule was built with it, in the canonical
-    /// origin spelling. Kept apart from [`OriginRule::override_origin`]
+    /// spelling: origin plus path. Kept apart from [`OriginRule::override_origin`]
     /// because a callback address is not a page address: a caller with no
     /// request to derive from may follow this one and must not follow the
     /// other.
     public_url: Option<String>,
+    /// The path of `service.public_url`, or the root. What the consent
+    /// redirect and the two insertion routes are built under.
+    base_path: BasePath,
     /// The `Host` values a *derived* origin may name, normalized the way the
     /// transport normalizes one. Empty means every one of them, which is both
     /// an unconfigured `service.allowed_hosts` and a single `*` in it - the
@@ -502,18 +511,18 @@ impl OriginRule {
         // value that reached a config some other way - hand-built, hand-edited
         // past the load that drops it - refuses it too rather than publishing
         // an address nothing can open.
-        let public_url = config.service_public_url().and_then(|value| {
+        let public = config.service_public_url().and_then(|value| {
             if let Some(warning) = crate::settings::unusable_public_url_warning(value) {
                 tracing::warn!("{warning}");
                 return None;
             }
-            Some(super::auth_store::normalize_resource(
-                &openidconnect::url::Url::parse(value)
-                    .expect("the validator above parsed it")
-                    .origin()
-                    .ascii_serialization(),
-            ))
+            Some(PublicBase::parse(value).expect("the validator above accepted it"))
         });
+        let public_url = public
+            .as_ref()
+            .map(|base| super::auth_store::normalize_resource(&base.to_string()));
+        let public_origin = public.as_ref().map(|base| base.origin().to_string());
+        let base_path = public.map(|base| base.path().clone()).unwrap_or_default();
         let configured = config
             .auth_oidc()
             .and_then(|oidc| oidc.redirect_uri.as_deref())
@@ -532,7 +541,7 @@ impl OriginRule {
                     None
                 }
             });
-        if let (Some(p), Some(r)) = (public_url.as_deref(), redirect_origin.as_deref())
+        if let (Some(p), Some(r)) = (public_origin.as_deref(), redirect_origin.as_deref())
             && p != r
         {
             tracing::info!(
@@ -560,18 +569,25 @@ impl OriginRule {
         OriginRule {
             override_origin,
             public_url,
+            base_path,
             allowed_hosts,
         }
     }
 
     /// `service.public_url` as the rule was built with it, in the canonical
-    /// origin spelling. `None` where the key is unset, which is where a
+    /// spelling: origin plus path. `None` where the key is unset, which is where a
     /// caller with no request behind it falls back to the bind instead.
     pub fn public_url(&self) -> Option<&str> {
         self.public_url.as_deref()
     }
 
-    /// The origin a request arrived at, in the spelling everything else
+    /// The path this instance is served under, empty at the root.
+    pub fn base_path(&self) -> &BasePath {
+        &self.base_path
+    }
+
+    /// The base a request arrived at: `service.public_url` with its path when
+    /// set, the derived origin otherwise, in the spelling everything else
     /// compares.
     ///
     /// [`normalize_resource`] is applied once, here, on both branches: the
@@ -775,14 +791,26 @@ impl RegistrationLimiter {
     }
 }
 
-/// The url of the protected-resource document on `origin`, which is what a
-/// `401` points a client at.
+/// The url of the protected-resource document of `base`, which is what a
+/// `401` points a client at: the RFC 9728 address, with the path of a
+/// prefixed base inserted after the host.
 ///
 /// Deliberately not built through the same helper as the three endpoint urls:
-/// this one is a root document and those three live under the API mount, and a
-/// shared helper is how one of them would silently acquire the other's prefix.
-pub fn resource_metadata_url(origin: &str) -> String {
-    format!("{origin}{PROTECTED_RESOURCE_PATH}")
+/// this one is a well-known document and those three live under the API
+/// mount, and a shared helper is how one of them would silently acquire the
+/// other's prefix.
+///
+/// At the root the value is the 0.23.0 one byte for byte: the origin there is
+/// often derived from the request and kept as it arrived, and parsing it would
+/// lower-case the host and drop a default port, so the pointer would no longer
+/// match the `resource` of the document it names. Under a prefix the base is
+/// `service.public_url` in its canonical spelling already, so the parse
+/// changes nothing but the place of the path.
+pub fn resource_metadata_url(base: &str) -> String {
+    match PublicBase::parse(base) {
+        Ok(parsed) if !parsed.path().is_root() => parsed.well_known(PROTECTED_RESOURCE_PATH),
+        _ => format!("{base}{PROTECTED_RESOURCE_PATH}"),
+    }
 }
 
 /// The absolute url of an endpoint that lives under the API mount.
@@ -790,16 +818,33 @@ fn api_url(origin: &str, path: &str) -> String {
     format!("{origin}{API_PREFIX}{path}")
 }
 
-/// The two root documents, mounted beside `/health` on the root router.
+/// The two root documents, mounted beside `/health` on the root router, and
+/// under a prefix also at their RFC 9728 and RFC 8414 addresses, where the
+/// path is inserted after the host (`/.well-known/oauth-protected-resource/
+/// crystalline`). Those are outside the prefix by definition, so the strip
+/// layer never touches them. The copies inside the prefix
+/// (`/crystalline/.well-known/...`) need no route of their own: the strip
+/// layer hands them to the two root routes.
 ///
 /// `None` is `auth.oauth` off: the paths still exist and answer `404`, so a
 /// probe gets one answer whatever it accepts and whatever else the router
 /// serves. See the module documentation.
-pub fn well_known_routes(oauth: Option<OriginRule>) -> Router {
-    Router::new()
+pub fn well_known_routes(oauth: Option<OriginRule>, base_path: &BasePath) -> Router {
+    let mut router = Router::new()
         .route(PROTECTED_RESOURCE_PATH, get(protected_resource))
-        .route(AUTHORIZATION_SERVER_PATH, get(authorization_server))
-        .with_state(oauth)
+        .route(AUTHORIZATION_SERVER_PATH, get(authorization_server));
+    if !base_path.is_root() {
+        router = router
+            .route(
+                &format!("{PROTECTED_RESOURCE_PATH}{}", base_path.as_str()),
+                get(protected_resource),
+            )
+            .route(
+                &format!("{AUTHORIZATION_SERVER_PATH}{}", base_path.as_str()),
+                get(authorization_server),
+            );
+    }
+    router.with_state(oauth)
 }
 
 /// `GET /.well-known/oauth-protected-resource`.
@@ -878,6 +923,7 @@ fn authorization_server_document(origin: &str) -> Value {
         "authorization_endpoint": api_url(origin, AUTHORIZE_PATH),
         "token_endpoint": api_url(origin, TOKEN_PATH),
         "registration_endpoint": api_url(origin, REGISTER_PATH),
+        "revocation_endpoint": api_url(origin, REVOKE_PATH),
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
@@ -2489,7 +2535,10 @@ pub async fn authorize(
         client_id = %client_id,
         "an mcp client started an authorization"
     );
-    Ok(found(format!("{CONSENT_PAGE}?request={id}")))
+    Ok(found(format!(
+        "{}{CONSENT_PAGE}?request={id}",
+        oauth.origin.base_path().as_str()
+    )))
 }
 
 /// `GET /oauth/authorizations/{id}` - what is being asked for.
@@ -3214,6 +3263,116 @@ async fn rotate_refresh(
     }
 }
 
+/// The form of `POST /oauth/revoke` (RFC 7009 section 2.1).
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+pub struct RevokeForm {
+    /// The access token (`coa_`) or refresh token (`cor_`) to revoke. Either
+    /// ends the whole grant.
+    pub token: Option<String>,
+    /// `access_token` or `refresh_token`. A hint only: the prefix decides.
+    pub token_type_hint: Option<String>,
+    /// The registration the token was issued to.
+    #[schema(example = "coc_0f1e2d3c4b5a69788796a5b4c3d2e1f0")]
+    pub client_id: Option<String>,
+}
+
+impl std::fmt::Debug for RevokeForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RevokeForm")
+            .field("token", &self.token.as_ref().map(|_| "[redacted]"))
+            .field("token_type_hint", &self.token_type_hint)
+            .field("client_id", &self.client_id)
+            .finish()
+    }
+}
+
+/// `POST /oauth/revoke` - end a grant by one of its tokens.
+///
+/// What `crystalline disconnect` calls, and what any public client may call:
+/// it holds no session and needs none, since the token it presents is the
+/// proof. The answer is `200` whether or not anything matched (RFC 7009
+/// section 2.2): a revocation of something already gone has done its job, and
+/// a different answer would tell a prober which tokens are live.
+#[utoipa::path(
+    post,
+    path = "/api/v1/oauth/revoke",
+    tag = "oauth",
+    operation_id = "oauth_revoke",
+    summary = "Revoke an OAuth grant by one of its tokens.",
+    description = "RFC 7009 token revocation, form-encoded. `token` is the \
+                   access or the refresh token and `client_id` the registration \
+                   it was issued to; either token ends the whole grant. The \
+                   answer is 200 with an empty body whether or not a grant \
+                   matched.",
+    request_body(
+        content = RevokeForm,
+        content_type = "application/x-www-form-urlencoded",
+        description = "The revocation request.",
+    ),
+    responses(
+        (status = 200, description = "Revoked, or nothing to revoke."),
+        (
+            status = 400,
+            description = "The body is not a form, or it lacks `token` or \
+                           `client_id` (`invalid_request`).",
+            body = OauthErrorBody,
+        ),
+        (
+            status = 403,
+            description = "A cookie session did not echo its CSRF token.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "This instance does not serve OAuth: `auth.oauth` \
+                           is off.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 500,
+            description = "The accounts database could not be reached.",
+            body = OauthErrorBody,
+        ),
+    ),
+)]
+pub async fn revoke(
+    State(state): State<RestState>,
+    form: Result<Form<RevokeForm>, FormRejection>,
+) -> Result<(NoStore, StatusCode), OauthError> {
+    state.oauth.as_ref().ok_or_else(OauthError::no_oauth_here)?;
+    let Form(form) = form.map_err(|_| {
+        OauthError::invalid_request(
+            "a revocation is a form body sent as application/x-www-form-urlencoded",
+        )
+    })?;
+    let token = form
+        .token
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| OauthError::invalid_request("a revocation names the token to revoke"))?;
+    let client_id = form
+        .client_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|client| !client.is_empty())
+        .ok_or_else(|| {
+            OauthError::invalid_request("a revocation names the client_id the token was issued to")
+        })?;
+    if token.starts_with(super::auth_store::OAUTH_ACCESS_PREFIX)
+        || token.starts_with(super::auth_store::OAUTH_REFRESH_PREFIX)
+    {
+        state
+            .auth
+            .revoke_oauth_grant_by_token(token, client_id)
+            .await
+            .map_err(|error| store_unavailable("revoking an oauth grant", &error))?;
+    }
+    Ok((no_store(), StatusCode::OK))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3689,6 +3848,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_origin_rule_keeps_the_path_of_public_url() {
+        let mut config = GlobalConfig::default();
+        crate::settings::apply(
+            &mut config,
+            "service.public_url",
+            "https://example.com/crystalline/",
+        )
+        .unwrap();
+        let rule = OriginRule::from_config(&config, &[]);
+        assert_eq!(rule.public_url(), Some("https://example.com/crystalline"));
+        assert_eq!(rule.base_path().as_str(), "/crystalline");
+        assert_eq!(
+            rule.origin(&HeaderMap::new()).unwrap(),
+            "https://example.com/crystalline"
+        );
+
+        let root = OriginRule::from_config(&GlobalConfig::default(), &[]);
+        assert!(root.base_path().is_root());
+    }
+
     /// A configured callback address names the origin, path and all cut off,
     /// and it wins over whatever the request says.
     #[test]
@@ -3998,6 +4178,7 @@ mod tests {
                 "authorization_endpoint": "https://knowledge.example/api/v1/oauth/authorize",
                 "token_endpoint": "https://knowledge.example/api/v1/oauth/token",
                 "registration_endpoint": "https://knowledge.example/api/v1/oauth/register",
+                "revocation_endpoint": "https://knowledge.example/api/v1/oauth/revoke",
                 "response_types_supported": ["code"],
                 "grant_types_supported": ["authorization_code", "refresh_token"],
                 "code_challenge_methods_supported": ["S256"],
@@ -4010,6 +4191,38 @@ mod tests {
             "https://knowledge.example/.well-known/oauth-protected-resource",
             "the pointer is a root document, with no API mount in it"
         );
+    }
+
+    #[test]
+    fn the_resource_metadata_pointer_inserts_the_path_after_the_host() {
+        assert_eq!(
+            resource_metadata_url("https://example.com/crystalline"),
+            "https://example.com/.well-known/oauth-protected-resource/crystalline"
+        );
+        assert_eq!(
+            resource_metadata_url("https://knowledge.example"),
+            "https://knowledge.example/.well-known/oauth-protected-resource"
+        );
+    }
+
+    /// **At the root the pointer is spelled the way 0.23.0 spelled it.** The
+    /// origin there is derived from the request and kept as it arrived, so
+    /// the pointer must not lower-case the host or drop a default port: it
+    /// would then differ from the `resource` the document publishes for the
+    /// same request.
+    #[test]
+    fn at_the_root_the_resource_metadata_pointer_keeps_the_origin_as_written() {
+        for origin in [
+            "https://Knowledge.Example",
+            "https://kb.example:443",
+            "http://localhost:80",
+        ] {
+            assert_eq!(
+                resource_metadata_url(origin),
+                format!("{origin}/.well-known/oauth-protected-resource"),
+                "{origin}"
+            );
+        }
     }
 
     /// **The rules a redirect uri is stored under, and the rule a presented

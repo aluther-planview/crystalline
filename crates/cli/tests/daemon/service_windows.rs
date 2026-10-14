@@ -56,12 +56,18 @@ impl Env {
     /// off: it is on at `127.0.0.1:7411` by default and a port is the one thing
     /// a scratch directory cannot isolate, so concurrent daemons here would race
     /// each other and the runner for one real port. No test in this file wants
-    /// an endpoint.
+    /// an endpoint. The task seam answers "no task", so a spawn whose
+    /// breakaway is refused never asks the real Task Scheduler, which on a
+    /// machine with the MSI installed would start the real daemon.
     fn apply(&self, cmd: &mut Command) {
         cmd.env("USERPROFILE", &self.dir)
             .env("APPDATA", self.dir.join("roaming"))
             .env("LOCALAPPDATA", self.dir.join("local"))
-            .env("CRYSTALLINE_SERVICE_HTTP", "false");
+            .env("CRYSTALLINE_SERVICE_HTTP", "false")
+            .env("CRYSTALLINE_TEST_DAEMON_TASK", "missing")
+            // A models cache named in the developer's shell must not be
+            // reached by `doctor --fix`.
+            .env_remove("CRYSTALLINE_MODELS_DIR");
     }
 
     fn state_dir(&self) -> PathBuf {
@@ -529,6 +535,53 @@ fn a_relative_db_still_reaches_the_file_the_client_meant_on_windows() {
     );
 }
 
+/// Put this test process in a fresh job that forbids breakaway, the way a
+/// harness does, so every spawn below sees a refused breakaway. Closed on
+/// drop; the job has no kill-on-close limit.
+struct NoBreakawayJob(windows_sys::Win32::Foundation::HANDLE);
+
+impl NoBreakawayJob {
+    fn join() -> NoBreakawayJob {
+        use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        // SAFETY: both arguments may be null (no security attributes, no
+        // name), which makes a private job with default limits.
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        assert!(
+            !job.is_null(),
+            "CreateJobObjectW: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: the valid handle just created and this process's pseudo handle.
+        let joined = unsafe { AssignProcessToJobObject(job, GetCurrentProcess()) };
+        assert!(
+            joined != 0,
+            "AssignProcessToJobObject: {}",
+            std::io::Error::last_os_error()
+        );
+        NoBreakawayJob(job)
+    }
+}
+
+impl Drop for NoBreakawayJob {
+    fn drop(&mut self) {
+        // SAFETY: the handle this guard owns, closed once.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
+/// A `crystalline mcp` in `env` with the task seam answering `task` and the
+/// client log at `info` written to `log`. `adjust` runs last.
+fn bridge_in_job(env: &Env, log: &Path, task: &str, adjust: impl FnOnce(&mut Command)) -> Bridge {
+    let mut cmd = Command::new(bin());
+    env.apply(&mut cmd);
+    cmd.env("CRYSTALLINE_TEST_DAEMON_TASK", task)
+        .env("RUST_LOG", "info");
+    adjust(&mut cmd);
+    cmd.arg("mcp");
+    Bridge::start_with(cmd, std::fs::File::create(log).unwrap().into())
+}
+
 /// The refusal path end to end: this test process joins a fresh job with no
 /// limit flags, so no breakaway. The client it starts is in that job, its
 /// breakaway spawn is refused and the daemon starts inside the job, knows it
@@ -538,27 +591,8 @@ fn a_relative_db_still_reaches_the_file_the_client_meant_on_windows() {
 /// or later, which every runner is.
 #[test]
 fn a_daemon_that_cannot_leave_the_job_says_so() {
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-
     let env = Env::new("win-job");
-    // SAFETY: both arguments may be null (no security attributes, no name),
-    // which makes a private job with default limits; the result is checked.
-    let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-    assert!(
-        !job.is_null(),
-        "CreateJobObjectW: {}",
-        std::io::Error::last_os_error()
-    );
-    // SAFETY: `job` is the valid handle just created and `GetCurrentProcess`
-    // returns this process's pseudo handle, which never needs closing.
-    let joined = unsafe { AssignProcessToJobObject(job, GetCurrentProcess()) };
-    assert!(
-        joined != 0,
-        "AssignProcessToJobObject: {}",
-        std::io::Error::last_os_error()
-    );
+    let job = NoBreakawayJob::join();
 
     let client_log_path = env.dir.join("client.stderr");
     let bridge = Bridge::attach_logging_to(&env, &client_log_path);
@@ -569,8 +603,7 @@ fn a_daemon_that_cannot_leave_the_job_says_so() {
     let client_log = std::fs::read_to_string(&client_log_path).unwrap_or_default();
     shutdown_daemon(&env);
     // The job handle goes last; the job has no kill-on-close limit.
-    // SAFETY: `job` is a valid handle owned by this test and closed once.
-    unsafe { CloseHandle(job) };
+    drop(job);
 
     let runs_in = &status["runs_in"];
     assert_eq!(runs_in["in_job"], json!(true), "{status}");
@@ -588,4 +621,166 @@ fn a_daemon_that_cannot_leave_the_job_says_so() {
         doctor.contains("[warning] the daemon runs inside a job it cannot leave"),
         "doctor warns: {doctor}"
     );
+}
+
+/// A shaping variable set in the client (`Env::apply` sets
+/// `CRYSTALLINE_SERVICE_HTTP`) keeps a refused spawn inside the job, even
+/// with a task that would start: the task's daemon would not get it.
+#[test]
+fn a_refused_breakaway_with_a_shaping_variable_keeps_its_own_spawn() {
+    let env = Env::new("win-gate-shaping");
+    let job = NoBreakawayJob::join();
+    let log_path = env.dir.join("client.stderr");
+    let bridge = bridge_in_job(&env, &log_path, "serve", |_| {});
+    let status = wait_for_ctl_status(&env);
+    drop(bridge);
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    shutdown_daemon(&env);
+    drop(job);
+    assert_eq!(
+        status["runs_in"]["breakaway_refused"],
+        json!(true),
+        "{status}"
+    );
+    assert!(
+        log.contains("CRYSTALLINE_SERVICE_HTTP would not reach a daemon the task starts"),
+        "{log}"
+    );
+    assert!(!log.contains("started the daemon instead"), "{log}");
+}
+
+/// With no shaping variable set, the task stands in for the refused spawn.
+/// HTTP is off in the file instead of the variable, which would be shaping.
+#[test]
+fn a_refused_breakaway_without_a_shaping_variable_lets_the_task_stand_in() {
+    let env = Env::new("win-gate-plain");
+    std::fs::write(
+        env.state_dir().join("config.yaml"),
+        "embeddings:\n  provider: disabled-for-tests\n  model: none\nservice:\n  http: false\n",
+    )
+    .unwrap();
+    let job = NoBreakawayJob::join();
+    let log_path = env.dir.join("client.stderr");
+    let bridge = bridge_in_job(&env, &log_path, "serve", |cmd| {
+        // Nothing shaping may reach the client, also not from the runner.
+        for name in crystalline_service::shaping::shaping_set_here() {
+            cmd.env_remove(name);
+        }
+        cmd.env_remove("CRYSTALLINE_SERVICE_HTTP");
+    });
+    let status = wait_for_ctl_status(&env);
+    drop(bridge);
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    shutdown_daemon(&env);
+    drop(job);
+    assert_eq!(
+        status["runs_in"]["breakaway_refused"],
+        json!(false),
+        "{status}"
+    );
+    assert!(
+        log.contains(r"the task \Crystalline\Daemon started the daemon instead"),
+        "{log}"
+    );
+}
+
+/// The clean stop at the session end, end to end: Windows ends a windowless
+/// process at sign-out without a word, so a daemon started the way the task
+/// starts it has the hidden window, and WM_ENDSESSION through that window
+/// runs the graceful stop to its end. What this cannot show is that Windows
+/// itself sends the message at a real sign-out; that stays a check on a real
+/// machine.
+#[test]
+fn a_task_started_daemon_stops_cleanly_when_the_session_ends() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        ENDSESSION_LOGOFF, FindWindowW, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_ENDSESSION,
+    };
+
+    let env = Env::new("win-session-end");
+    let mut serve = Command::new(bin());
+    env.apply(&mut serve);
+    serve
+        .env_remove("RUST_LOG")
+        .env("CRYSTALLINE_TEST_NO_KEYCHAIN", "1")
+        .args(["serve", "--from-task"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut daemon = Reap(serve.spawn().unwrap());
+    let state = env.state_dir();
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let class: Vec<u16> = "CrystallineSessionEnd".encode_utf16().chain([0]).collect();
+    let title: Vec<u16> = format!("Crystalline daemon {}", daemon.0.id())
+        .encode_utf16()
+        .chain([0])
+        .collect();
+    let hwnd = loop {
+        // SAFETY: two NUL-terminated wide strings that live for the call.
+        let found = unsafe { FindWindowW(class.as_ptr(), title.as_ptr()) };
+        if !found.is_null() && env.info_path().is_file() {
+            break found;
+        }
+        assert!(
+            daemon.0.try_wait().unwrap().is_none(),
+            "the daemon left before its window appeared"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "the daemon's window never appeared"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+
+    let mut result = 0usize;
+    let started = Instant::now();
+    // SAFETY: a window handle FindWindowW just returned; the call waits at
+    // most 8 s and returns early if the daemon's thread is gone.
+    unsafe {
+        SendMessageTimeoutW(
+            hwnd,
+            WM_ENDSESSION,
+            1,
+            ENDSESSION_LOGOFF as isize,
+            SMTO_ABORTIFHUNG,
+            8000,
+            &mut result,
+        )
+    };
+    let exit = loop {
+        if let Some(status) = daemon.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "the daemon did not leave"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "inside the session-end budget: {:?}",
+        started.elapsed()
+    );
+    assert!(exit.success(), "a clean exit: {exit:?}");
+    let log = std::fs::read_to_string(state.join("daemon.log")).unwrap();
+    assert!(log.contains("stopping (Windows sign-out)"), "{log}");
+    assert!(
+        log.contains("shutdown: removing the record, the socket and the lock file"),
+        "{log}"
+    );
+    assert!(
+        !log.contains("shutdown did not finish"),
+        "the watchdog was not needed: {log}"
+    );
+    assert!(!env.info_path().exists(), "the record is gone");
+    let lock = state.join("service.lock");
+    if lock.exists() {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        fs4::FileExt::try_lock(&file).expect("the lock was released");
+    }
 }

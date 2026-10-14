@@ -1,0 +1,1162 @@
+//! A fast, synthetic smoke test for the verify engine, ahead of the larger
+//! fixture-corpus integration tests owned by the CLI crate. Exercises the
+//! scanner, a representative rule from each family and the JSON/github
+//! reporters against a couple of temp-dir domains.
+
+use std::fs;
+use std::path::Path;
+
+use crystalline_core::parse_engram;
+use crystalline_core::verify::{self, Format, Severity, VerifyOptions};
+use tempfile::tempdir;
+
+fn write(dir: &std::path::Path, rel: &str, content: &str) {
+    let path = dir.join(rel);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    fs::write(path, content).unwrap();
+}
+
+#[test]
+fn good_domain_has_no_issues() {
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n## Scope\n\n- Facts about the solar system\n\n## When to Use\n\n- When asked about moons or planets\n",
+    );
+    write(
+        dir.path(),
+        "phobos.md",
+        "---\ntype: engram\ntitle: Phobos\npermalink: phobos\ntags:\n- moons\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n# Phobos\n\nThe larger and closer of the two small moons that orbit Mars. It completes\nan orbit in under eight hours.\n",
+    );
+
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    assert_eq!(
+        report.issues.iter().map(|i| i.rule).collect::<Vec<_>>(),
+        Vec::<&str>::new(),
+        "unexpected issues: {:#?}",
+        report.issues
+    );
+    assert_eq!(report.exit_code(), 0);
+    assert_eq!(report.summary.domains, 1);
+    assert_eq!(report.summary.files_scanned, 2);
+}
+
+#[test]
+fn reserved_index_and_log_files_are_skipped_entirely() {
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n## Scope\n\n- Facts about the solar system\n\n## When to Use\n\n- When asked about moons or planets\n",
+    );
+    // A spec-correct index file carries no frontmatter at all, and a log file
+    // is free prose: verifying either would flag a perfectly valid file, so
+    // both are skipped before any rule sees them.
+    write(
+        dir.path(),
+        "index.md",
+        "# Contents\n\n* [MANIFEST](MANIFEST.md)\n* [moons/](moons/)\n",
+    );
+    write(dir.path(), "moons/log.md", "# Log\n\n- Added Phobos\n");
+    write(
+        dir.path(),
+        "moons/phobos.md",
+        "---\ntype: engram\ntitle: Phobos\npermalink: moons/phobos\ntags:\n- moons\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n# Phobos\n\nThe larger and closer of the two small moons that orbit Mars. It completes\nan orbit in under eight hours.\n",
+    );
+
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    assert_eq!(
+        report.issues.iter().map(|i| i.rule).collect::<Vec<_>>(),
+        Vec::<&str>::new(),
+        "unexpected issues: {:#?}",
+        report.issues
+    );
+    assert_eq!(
+        report.summary.files_scanned, 2,
+        "only the two concept documents are scanned"
+    );
+}
+
+#[test]
+fn missing_manifest_is_m001_error() {
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "phobos.md",
+        "---\ntype: engram\ntitle: Phobos\npermalink: phobos\ntags:\n- moons\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nBody text with enough lines.\nSecond line.\nThird line.\n",
+    );
+
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    assert!(
+        report
+            .issues
+            .iter()
+            .any(|i| i.rule == "M001" && i.severity == Severity::Error)
+    );
+    assert_eq!(report.exit_code(), 1);
+}
+
+#[test]
+fn required_field_and_encoding_and_temporal_and_quality_rules_fire() {
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n## Scope\n\n- Gardening facts\n\n## When to Use\n\n- When asked about plants\n",
+    );
+    // Missing tags/status/recorded_at, near-empty body -> E004, T001 (x2), Q001.
+    write(
+        dir.path(),
+        "bad.md",
+        "---\ntype: engram\ntitle: Bad Engram\npermalink: bad\n---\n\nOne line only.\n",
+    );
+
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    let rules: Vec<&str> = report.issues.iter().map(|i| i.rule).collect();
+    assert!(rules.contains(&"E004"), "{rules:?}");
+    assert!(rules.contains(&"T001"), "{rules:?}");
+    assert!(rules.contains(&"Q001"), "{rules:?}");
+}
+
+#[test]
+fn a_timestamp_in_a_date_field_is_a_t003_error() {
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n## Scope\n\n- Facts about time\n\n## When to Use\n\n- When asked about dates\n",
+    );
+    // A day-granular field carrying an RFC 3339 timestamp: the parser parks it
+    // in `extra`, so the temporal rule flags it as not a plain ISO date.
+    write(
+        dir.path(),
+        "timey.md",
+        "---\ntype: engram\ntitle: Timey\npermalink: timey\ntags:\n- t\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\nvalid_from: 2026-07-15T10:30:00Z\n---\n\n# Timey\n\nA date field must be a plain ISO date, never a full timestamp with a time.\n",
+    );
+
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    let t003 = report
+        .issues
+        .iter()
+        .find(|i| i.rule == "T003" && i.path.ends_with("timey.md"))
+        .expect("T003 present");
+    assert_eq!(t003.severity, Severity::Error);
+    assert_eq!(report.exit_code(), 1);
+}
+
+#[test]
+fn check_temporal_reports_a_malformed_verified_entry() {
+    // An entry without a `by` actor cannot be read as an OKF verification, so
+    // it is flagged the same way a malformed `generated` block is.
+    let engram = parse_engram(
+        "---\ntype: engram\ntitle: Trusty\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\nverified:\n- at: 2026-07-27T09:15:00+00:00\n---\n\nBody.\n",
+    )
+    .unwrap();
+    let issues = verify::check_temporal(Path::new("trusty.md"), &engram);
+    let issue = issues
+        .iter()
+        .find(|i| i.rule == "T003")
+        .expect("T003 present");
+    assert_eq!(issue.severity, Severity::Error);
+    assert!(issue.message.contains("verified"), "{}", issue.message);
+}
+
+#[test]
+fn check_temporal_reports_timestamp_and_sentinel_together() {
+    // `valid_from` carries a timestamp (T003) and `valid_to` a sentinel
+    // far-future date (T008); the per-engram check surfaces both.
+    let engram = parse_engram(
+        "---\ntype: engram\ntitle: Timey\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\nvalid_from: 2026-07-15T10:30:00Z\nvalid_to: 9000-01-01\n---\n\nBody.\n",
+    )
+    .unwrap();
+    let issues = verify::check_temporal(Path::new("timey.md"), &engram);
+    let rules: Vec<&str> = issues.iter().map(|i| i.rule).collect();
+    assert!(rules.contains(&"T003"), "{rules:?}");
+    assert!(rules.contains(&"T008"), "{rules:?}");
+}
+
+#[test]
+fn domain_prefixed_permalink_is_e008_warning() {
+    let dir = tempdir().unwrap();
+    // The domain root's folder name IS the domain name the scanner derives.
+    let root = dir.path().join("astronomy");
+    write(
+        &root,
+        "MANIFEST.md",
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n## Scope\n\n- Facts about the solar system\n\n## When to Use\n\n- When asked about moons or planets\n",
+    );
+    // The permalink repeats the domain name without a folder to justify it.
+    write(
+        &root,
+        "phobos.md",
+        "---\ntype: engram\ntitle: Phobos\npermalink: astronomy/phobos\ntags:\n- moons\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Phobos\n\nThe larger and closer of the two small moons that orbit Mars. It completes\nan orbit in under eight hours.\n",
+    );
+
+    let report = verify::verify_paths([&root], &VerifyOptions::default()).unwrap();
+    let e008 = report
+        .issues
+        .iter()
+        .find(|i| i.rule == "E008")
+        .expect("E008 present");
+    assert_eq!(e008.severity, Severity::Warning);
+    assert!(e008.message.contains("domain-relative"), "{}", e008.message);
+    // A warning alone never fails the run.
+    assert_eq!(report.exit_code(), 0);
+}
+
+#[test]
+fn a_real_subfolder_sharing_the_domain_name_is_not_e008() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("astronomy");
+    write(
+        &root,
+        "MANIFEST.md",
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n## Scope\n\n- Facts about the solar system\n\n## When to Use\n\n- When asked about moons or planets\n",
+    );
+    // The file genuinely lives in a subfolder named like the domain, so the
+    // permalink is the path made explicit - correct by path, not a prefix.
+    write(
+        &root,
+        "astronomy/deimos.md",
+        "---\ntype: engram\ntitle: Deimos\npermalink: astronomy/deimos\ntags:\n- moons\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Deimos\n\nThe smaller and farther of the two moons of Mars. It completes an orbit\nin about thirty hours.\n",
+    );
+
+    let report = verify::verify_paths([&root], &VerifyOptions::default()).unwrap();
+    assert!(
+        !report.issues.iter().any(|i| i.rule == "E008"),
+        "a path-explained prefix must not warn: {:#?}",
+        report.issues
+    );
+}
+
+#[test]
+fn strict_promotes_warning_rules_to_error() {
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n## Scope\n\n- Gardening facts\n",
+    );
+
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    let m101 = report
+        .issues
+        .iter()
+        .find(|i| i.rule == "M101")
+        .expect("M101 present");
+    assert_eq!(m101.severity, Severity::Warning);
+
+    let strict = VerifyOptions {
+        strict: true,
+        ..Default::default()
+    };
+    let report = verify::verify_paths([dir.path()], &strict).unwrap();
+    let m101 = report
+        .issues
+        .iter()
+        .find(|i| i.rule == "M101")
+        .expect("M101 present");
+    assert_eq!(m101.severity, Severity::Error);
+    assert_eq!(report.exit_code(), 1);
+}
+
+// --- The domain's own verify settings (M108, issue 101) ------------------------
+
+const CLEAN_MANIFEST: &str = "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n## Scope\n\n- Gardening facts\n\n## When to Use\n\n- When asked about gardens\n";
+
+#[test]
+fn an_unknown_severity_word_is_one_m108_warning_naming_rule_and_word() {
+    let dir = tempdir().unwrap();
+    write(dir.path(), "MANIFEST.md", CLEAN_MANIFEST);
+    write(
+        dir.path(),
+        ".crystalline.yaml",
+        "verify:\n  rules:\n    E007: of\n    L003: warnig\n    M101: off\n",
+    );
+
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    let m108: Vec<_> = report.issues.iter().filter(|i| i.rule == "M108").collect();
+    assert_eq!(m108.len(), 2, "{:#?}", report.issues);
+    assert!(m108.iter().all(|i| i.severity == Severity::Warning));
+    assert!(
+        m108.iter()
+            .all(|i| i.path.to_string_lossy().ends_with(".crystalline.yaml")),
+        "{m108:#?}"
+    );
+    assert!(m108[0].message.contains("E007") && m108[0].message.contains("'of'"));
+    assert!(m108[1].message.contains("L003") && m108[1].message.contains("'warnig'"));
+    assert_eq!(
+        report.exit_code(),
+        0,
+        "a config typo never fails verify on its own"
+    );
+}
+
+#[test]
+fn a_config_file_that_does_not_parse_is_one_m108_warning() {
+    let dir = tempdir().unwrap();
+    write(dir.path(), "MANIFEST.md", CLEAN_MANIFEST);
+    write(
+        dir.path(),
+        ".crystalline.yaml",
+        "verify:\n  rules: [unclosed\n",
+    );
+
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    let m108: Vec<_> = report.issues.iter().filter(|i| i.rule == "M108").collect();
+    assert_eq!(m108.len(), 1, "{:#?}", report.issues);
+    assert!(
+        m108[0].message.contains("does not parse"),
+        "{}",
+        m108[0].message
+    );
+    // The fix hint is about the YAML that failed to parse, not the
+    // severity-word hint every unknown-word M108 carries: a parse failure
+    // pointed at "off, error, warning or info" is a fix for a problem the
+    // file does not have.
+    let fix = m108[0].fix.as_deref().unwrap_or("");
+    assert!(fix.contains("YAML"), "{fix}");
+    assert!(
+        !fix.to_lowercase().contains("off")
+            && !fix.to_lowercase().contains("error")
+            && !fix.to_lowercase().contains("warning")
+            && !fix.to_lowercase().contains("info"),
+        "the parse-failure hint must not mention severity words: {fix}"
+    );
+}
+
+#[test]
+fn a_value_that_is_not_a_word_is_one_m108_and_the_other_overrides_apply() {
+    let dir = tempdir().unwrap();
+    // No `## When to Use`: M101, a warning by default, fires unless the
+    // override beside the two bad values turns it off.
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n## Scope\n\n- Gardening facts\n",
+    );
+    write(
+        dir.path(),
+        ".crystalline.yaml",
+        "verify:\n  rules:\n    E007: 1\n    E001: false\n    M101: off\n",
+    );
+
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    assert!(
+        report.issues.iter().all(|i| i.rule != "M101"),
+        "the valid override still applies: {:#?}",
+        report.issues
+    );
+    let m108: Vec<_> = report.issues.iter().filter(|i| i.rule == "M108").collect();
+    let messages: Vec<&str> = m108.iter().map(|i| i.message.as_str()).collect();
+    assert_eq!(m108.len(), 2, "{messages:#?}");
+    assert!(messages.contains(&"E007: the value must be a word such as off, warning or error"));
+    assert!(messages.contains(&"E001: the value must be a word such as off, warning or error"));
+    assert!(
+        messages.iter().all(|m| !m.contains("does not parse")),
+        "the file parsed: {messages:#?}"
+    );
+    for issue in &m108 {
+        let fix = issue.fix.as_deref().unwrap_or("");
+        assert!(!fix.contains("YAML"), "no YAML-syntax hint here: {fix}");
+    }
+}
+
+#[test]
+fn strict_promotes_m108_and_a_typo_no_longer_skips_the_promotion() {
+    let dir = tempdir().unwrap();
+    // No `## When to Use`: M101, a Warning-default rule, fires.
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n## Scope\n\n- Gardening facts\n",
+    );
+    write(
+        dir.path(),
+        ".crystalline.yaml",
+        "verify:\n  rules:\n    M101: warnig\n",
+    );
+
+    let strict = VerifyOptions {
+        strict: true,
+        ..Default::default()
+    };
+    let report = verify::verify_paths([dir.path()], &strict).unwrap();
+    let m101 = report.issues.iter().find(|i| i.rule == "M101").unwrap();
+    assert_eq!(
+        m101.severity,
+        Severity::Error,
+        "a word verify does not know keeps the default, and --strict still promotes it"
+    );
+    let m108 = report.issues.iter().find(|i| i.rule == "M108").unwrap();
+    assert_eq!(m108.severity, Severity::Error);
+    assert_eq!(report.exit_code(), 1);
+}
+
+#[test]
+fn reporters_render_without_panicking() {
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "phobos.md",
+        "---\ntype: engram\ntitle: Phobos\n---\n\nShort.\n",
+    );
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+
+    let json = verify::to_json(&report);
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed["version"], 1);
+    assert!(parsed["issues"].is_array());
+
+    let github = verify::to_github(&report);
+    assert!(
+        github.contains("::error") || github.contains("::warning") || github.contains("::notice")
+    );
+
+    let human = verify::render(Format::Human, &report, false);
+    assert!(
+        human.contains(" error, ") || human.contains(" errors, "),
+        "{human}"
+    );
+}
+
+#[test]
+fn nonexistent_path_is_a_scan_error() {
+    let err =
+        verify::verify_paths(["/no/such/path/at/all"], &VerifyOptions::default()).unwrap_err();
+    match err {
+        verify::ScanError::NotFound(_) => {}
+        other => panic!("expected NotFound, got {other:?}"),
+    }
+}
+
+// --- Provisioning rules (M005, M104, M105, M106) and scan exclusion ----------
+
+/// A structurally valid harbor MANIFEST whose `## Provisioning` section carries
+/// `prov`, so a provisioning rule fires in isolation from the other M-rules.
+fn manifest_with_provisioning(prov: &str) -> String {
+    format!(
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n## Scope\n\n- Charts of the harbor\n\n## When to Use\n\n- When asked about the harbor\n\n## Provisioning\n\n{prov}"
+    )
+}
+
+#[test]
+fn invalid_provisioning_path_is_m005_error() {
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        &manifest_with_provisioning("- skills: /abs\n"),
+    );
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    let m005 = report
+        .issues
+        .iter()
+        .find(|i| i.rule == "M005")
+        .expect("M005 present");
+    assert_eq!(m005.severity, Severity::Error);
+    assert_eq!(report.exit_code(), 1);
+
+    // A valid in-root decl (its folder present) does not trigger M005.
+    let ok = tempdir().unwrap();
+    write(
+        ok.path(),
+        "MANIFEST.md",
+        &manifest_with_provisioning("- skills: skills\n"),
+    );
+    std::fs::create_dir_all(ok.path().join("skills")).unwrap();
+    let report = verify::verify_paths([ok.path()], &VerifyOptions::default()).unwrap();
+    assert!(!report.issues.iter().any(|i| i.rule == "M005"));
+}
+
+#[test]
+fn unknown_provisioning_type_is_m104_warning() {
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        &manifest_with_provisioning("- prompts: ../prompts\n"),
+    );
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    let m104 = report
+        .issues
+        .iter()
+        .find(|i| i.rule == "M104")
+        .expect("M104 present");
+    assert_eq!(m104.severity, Severity::Warning);
+    assert!(m104.message.contains("prompts"), "{}", m104.message);
+    assert_eq!(report.exit_code(), 0);
+
+    // A known type does not trigger M104.
+    let ok = tempdir().unwrap();
+    write(
+        ok.path(),
+        "MANIFEST.md",
+        &manifest_with_provisioning("- skills: ../skills\n"),
+    );
+    let report = verify::verify_paths([ok.path()], &VerifyOptions::default()).unwrap();
+    assert!(!report.issues.iter().any(|i| i.rule == "M104"));
+}
+
+#[test]
+fn missing_in_root_provisioning_folder_is_m105_warning() {
+    // In-root decl whose folder is absent on disk: warns.
+    let missing = tempdir().unwrap();
+    write(
+        missing.path(),
+        "MANIFEST.md",
+        &manifest_with_provisioning("- skills: skills\n"),
+    );
+    let report = verify::verify_paths([missing.path()], &VerifyOptions::default()).unwrap();
+    let m105 = report
+        .issues
+        .iter()
+        .find(|i| i.rule == "M105")
+        .expect("M105 present");
+    assert_eq!(m105.severity, Severity::Warning);
+    assert!(m105.message.contains("skills"), "{}", m105.message);
+
+    // The same decl with the folder present does not warn.
+    let present = tempdir().unwrap();
+    write(
+        present.path(),
+        "MANIFEST.md",
+        &manifest_with_provisioning("- skills: skills\n"),
+    );
+    std::fs::create_dir_all(present.path().join("skills")).unwrap();
+    let report = verify::verify_paths([present.path()], &VerifyOptions::default()).unwrap();
+    assert!(!report.issues.iter().any(|i| i.rule == "M105"));
+
+    // An out-of-root decl is never disk-checked, so a missing `../skills` does
+    // not warn.
+    let out = tempdir().unwrap();
+    write(
+        out.path(),
+        "MANIFEST.md",
+        &manifest_with_provisioning("- skills: ../skills\n"),
+    );
+    let report = verify::verify_paths([out.path()], &VerifyOptions::default()).unwrap();
+    assert!(!report.issues.iter().any(|i| i.rule == "M105"));
+}
+
+#[test]
+fn malformed_and_duplicate_provisioning_are_m106_warnings() {
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        &manifest_with_provisioning(
+            "- skills without a colon\n- skills: ../skills\n- skills: ../other\n",
+        ),
+    );
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    let m106: Vec<_> = report.issues.iter().filter(|i| i.rule == "M106").collect();
+    assert_eq!(m106.len(), 2, "malformed + duplicate: {:#?}", report.issues);
+    assert!(m106.iter().all(|i| i.severity == Severity::Warning));
+
+    // A clean section triggers no M106.
+    let ok = tempdir().unwrap();
+    write(
+        ok.path(),
+        "MANIFEST.md",
+        &manifest_with_provisioning("- skills: ../skills\n"),
+    );
+    let report = verify::verify_paths([ok.path()], &VerifyOptions::default()).unwrap();
+    assert!(!report.issues.iter().any(|i| i.rule == "M106"));
+}
+
+#[test]
+fn provisioned_in_root_folder_is_excluded_from_the_scan() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "MANIFEST.md",
+        &manifest_with_provisioning("- skills: skills\n"),
+    );
+    // An artifact under the declared folder must not be scanned as an engram.
+    write(
+        root,
+        "skills/tide-tables/SKILL.md",
+        "---\ntype: skill\ntitle: Tide Tables\n---\n\n# Tide Tables\n",
+    );
+    // A sibling engram outside the folder is still collected.
+    write(
+        root,
+        "notes/harbor-log.md",
+        "---\ntype: engram\ntitle: Harbor Log\npermalink: notes/harbor-log\ntags:\n- log\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Harbor Log\n\nThe tide came in twice today, as it always does at this port.\n",
+    );
+    // A near-miss sibling whose name merely starts with `skills` is a normal
+    // folder: exclusion matches whole path components, not string prefixes.
+    write(
+        root,
+        "skills-tables/berth-notes.md",
+        "---\ntype: engram\ntitle: Berth Notes\npermalink: skills-tables/berth-notes\ntags:\n- log\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Berth Notes\n\nBerth three is shallow at low tide and best avoided by deep keels.\n",
+    );
+
+    let report = verify::verify_paths([root], &VerifyOptions::default()).unwrap();
+    // MANIFEST.md and both engrams are scanned; only the SKILL.md is pruned.
+    assert_eq!(report.summary.files_scanned, 3, "{:#?}", report.issues);
+    assert!(
+        !report.issues.iter().any(|i| i.path.ends_with("SKILL.md")),
+        "the excluded artifact must raise no issues: {:#?}",
+        report.issues
+    );
+}
+
+// --- Tag alias rule (M107) ---------------------------------------------------
+
+/// A structurally valid harbor MANIFEST whose `## Tag Aliases` section carries
+/// `aliases`, so the tag-alias rule fires in isolation from the other M-rules.
+fn manifest_with_tag_aliases(aliases: &str) -> String {
+    format!(
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n## Scope\n\n- Charts of the harbor\n\n## When to Use\n\n- When asked about the harbor\n\n## Tag Aliases\n\n{aliases}"
+    )
+}
+
+#[test]
+fn every_tag_alias_problem_kind_is_one_m107_warning() {
+    // One bullet of each problem kind: malformed, self, duplicate,
+    // non-canonical target and chained - five problems, five M107 warnings.
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        &manifest_with_tag_aliases(
+            "- no arrow\n- self -> self\n- dup -> one\n- dup -> two\n- old -> Bad_Target\n- x -> y\n- y -> z\n",
+        ),
+    );
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    let m107: Vec<_> = report.issues.iter().filter(|i| i.rule == "M107").collect();
+    assert_eq!(m107.len(), 5, "one per problem: {:#?}", report.issues);
+    assert!(m107.iter().all(|i| i.severity == Severity::Warning));
+    assert!(
+        m107.iter().all(|i| i.message.contains("## Tag Aliases")),
+        "{m107:#?}"
+    );
+    // Warnings alone never fail the run.
+    assert_eq!(report.exit_code(), 0);
+}
+
+#[test]
+fn clean_tag_aliases_section_emits_no_m107() {
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        &manifest_with_tag_aliases("- multi_word -> multi-word\n- old-name -> new-name\n"),
+    );
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    assert!(
+        !report.issues.iter().any(|i| i.rule == "M107"),
+        "{:#?}",
+        report.issues
+    );
+    assert_eq!(report.exit_code(), 0);
+}
+
+#[test]
+fn a_domain_whose_paths_differ_only_in_case_reports_e009() {
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n## Scope\n\n- Apex classes\n\n## When to Use\n\n- When asked about a class\n",
+    );
+    let engram = "---\ntype: engram\ntitle: Custom Header Module\npermalink: custom-header-module\ntags:\n- apex\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n# Custom Header Module\n\nThe header module the community pages render above every record list.\n";
+    write(
+        dir.path(),
+        "Platform.Components.Common/CustomHeaderModule.md",
+        engram,
+    );
+    write(
+        dir.path(),
+        "platform.components.common/CustomHeaderModule.md",
+        engram,
+    );
+
+    // The pair this rule reports is exactly the pair a case-insensitive
+    // filesystem cannot hold, so on macOS and Windows the second write landed
+    // on the first file and there is nothing here to find. The rule's own
+    // behaviour is pinned without a filesystem in `verify::format`'s unit
+    // tests; this one adds the scanner and the reporter on the Linux legs of
+    // CI, where the two paths really do coexist.
+    if report_files(dir.path()) < 3 {
+        eprintln!(
+            "skipped: this filesystem is case-insensitive, so the colliding pair cannot be created"
+        );
+        return;
+    }
+
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    let e009: Vec<&verify::Issue> = report.issues.iter().filter(|i| i.rule == "E009").collect();
+    assert_eq!(e009.len(), 1, "unexpected issues: {:#?}", report.issues);
+    assert_eq!(e009[0].severity, Severity::Error);
+    assert!(
+        e009[0]
+            .message
+            .contains("Platform.Components.Common/CustomHeaderModule.md")
+            && e009[0]
+                .message
+                .contains("platform.components.common/CustomHeaderModule.md"),
+        "both paths must be named: {}",
+        e009[0].message
+    );
+    assert_eq!(report.exit_code(), 1);
+}
+
+#[test]
+fn a_domain_with_no_case_collision_reports_no_e009() {
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n## Scope\n\n- Apex classes\n\n## When to Use\n\n- When asked about a class\n",
+    );
+    write(
+        dir.path(),
+        "Platform.Components.Common/CustomHeaderModule.md",
+        "---\ntype: engram\ntitle: Custom Header Module\npermalink: custom-header-module\ntags:\n- apex\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n# Custom Header Module\n\nThe header module the community pages render above every record list.\n",
+    );
+    write(
+        dir.path(),
+        "Platform.Components.Utils/DateUtils.md",
+        "---\ntype: engram\ntitle: Date Utils\npermalink: date-utils\ntags:\n- apex\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n# Date Utils\n\nDate arithmetic shared by the scheduling batch jobs.\n",
+    );
+
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    assert!(
+        report.issues.iter().all(|i| i.rule != "E009"),
+        "unexpected issues: {:#?}",
+        report.issues
+    );
+}
+
+/// How many markdown files the scan actually finds under `root`, which on a
+/// case-insensitive filesystem is fewer than were written.
+fn report_files(root: &Path) -> usize {
+    verify::verify_paths([root], &VerifyOptions::default())
+        .unwrap()
+        .summary
+        .files_scanned
+}
+
+// --- The generated_indexes frontmatter switch (M006) -------------------------
+
+/// A structurally valid harbor MANIFEST declaring `generated_indexes: value`,
+/// so the switch's rule fires in isolation from the other M-rules.
+fn manifest_declaring_indexes(value: &str) -> String {
+    format!(
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\ngenerated_indexes: {value}\n---\n\n## Scope\n\n- Charts of the harbor\n\n## When to Use\n\n- When asked about the harbor\n"
+    )
+}
+
+#[test]
+fn an_unrecognized_generated_indexes_value_is_m006_error() {
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        &manifest_declaring_indexes("true"),
+    );
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    let m006 = report
+        .issues
+        .iter()
+        .find(|i| i.rule == "M006")
+        .expect("M006 present");
+    assert_eq!(m006.severity, Severity::Error);
+    assert!(m006.message.contains("generated_indexes: true"), "{m006:?}");
+    // The finding says which way the value was read, since reading it the
+    // other way is what a domain must never do by accident.
+    let help = m006.fix.clone().expect("fix");
+    assert!(help.contains("local"), "{help}");
+    assert!(help.contains("shared"), "{help}");
+    assert_eq!(report.exit_code(), 1);
+}
+
+#[test]
+fn both_recognized_generated_indexes_values_are_clean() {
+    for value in ["local", "shared"] {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "MANIFEST.md",
+            &manifest_declaring_indexes(value),
+        );
+        let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+        assert!(
+            !report.issues.iter().any(|i| i.rule == "M006"),
+            "`{value}` is a policy, not a finding: {:?}",
+            report.issues
+        );
+    }
+}
+
+// --- The sharing frontmatter switch (M007) -----------------------------------
+
+fn manifest_declaring_sharing(value: &str) -> String {
+    format!(
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\nsharing: {value}\n---\n\n## Scope\n\n- Charts of the harbor\n\n## When to Use\n\n- When asked about the harbor\n"
+    )
+}
+
+#[test]
+fn an_unrecognized_sharing_value_is_m007_error() {
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        &manifest_declaring_sharing("dirct"),
+    );
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    let m007 = report
+        .issues
+        .iter()
+        .find(|i| i.rule == "M007")
+        .expect("M007 present");
+    assert_eq!(m007.severity, Severity::Error);
+    assert_eq!(
+        m007.message,
+        "`sharing: dirct` is neither `proposal` nor `direct`"
+    );
+    assert_eq!(
+        m007.fix.as_deref(),
+        Some(
+            "read as `proposal`, so shares still open a proposal for review; write `direct` to commit straight to the branch"
+        )
+    );
+    assert_eq!(report.exit_code(), 1);
+}
+
+#[test]
+fn both_recognized_sharing_values_and_an_absent_key_are_clean() {
+    for value in ["proposal", "direct"] {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "MANIFEST.md",
+            &manifest_declaring_sharing(value),
+        );
+        let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+        assert!(
+            !report.issues.iter().any(|i| i.rule == "M007"),
+            "`{value}`: {:?}",
+            report.issues
+        );
+    }
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        &manifest_declaring_indexes("local"),
+    );
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    assert!(
+        !report.issues.iter().any(|i| i.rule == "M007"),
+        "absent: {:?}",
+        report.issues
+    );
+}
+
+// --- The domain_name declaration (M008) --------------------------------------
+
+fn manifest_declaring_domain_name(value: &str) -> String {
+    format!(
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\ndomain_name: {value}\n---\n\n## Scope\n\n- Charts of the harbor\n\n## When to Use\n\n- When asked about the harbor\n"
+    )
+}
+
+#[test]
+fn an_invalid_domain_name_is_m008_error() {
+    for (value, shown) in [("../up", "../up"), ("1.0", "1"), ("true", "true")] {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "MANIFEST.md",
+            &manifest_declaring_domain_name(value),
+        );
+        let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+        let m008 = report
+            .issues
+            .iter()
+            .find(|i| i.rule == "M008")
+            .expect("M008 present");
+        assert_eq!(m008.severity, Severity::Error, "{value}");
+        assert!(
+            m008.message
+                .starts_with(&format!("`domain_name: {shown}` cannot name a domain")),
+            "{}",
+            m008.message
+        );
+        assert_eq!(
+            m008.fix.as_deref(),
+            Some(
+                "ignored until fixed; write a quoted name of letters, digits, hyphens, underscores and dots, for example domain_name: 'platform'"
+            )
+        );
+        assert_eq!(report.exit_code(), 1);
+    }
+}
+
+#[test]
+fn a_valid_or_absent_domain_name_is_clean() {
+    for value in ["platform", "'1.0'", "eng.docs"] {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "MANIFEST.md",
+            &manifest_declaring_domain_name(value),
+        );
+        let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+        assert!(
+            !report.issues.iter().any(|i| i.rule == "M008"),
+            "`{value}`: {:?}",
+            report.issues
+        );
+    }
+}
+
+// --- The read_only frontmatter switch (M009) ---------------------------------
+
+fn manifest_declaring_read_only(value: &str) -> String {
+    format!(
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\nread_only: {value}\n---\n\n## Scope\n\n- Charts of the harbor\n\n## When to Use\n\n- When asked about the harbor\n"
+    )
+}
+
+#[test]
+fn an_unrecognized_read_only_value_is_m009_error() {
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        &manifest_declaring_read_only("true"),
+    );
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    let m009 = report
+        .issues
+        .iter()
+        .find(|i| i.rule == "M009")
+        .expect("M009 present");
+    assert_eq!(m009.severity, Severity::Error);
+    assert_eq!(m009.message, "`read_only: true` is neither `off` nor `on`");
+    assert_eq!(
+        m009.fix.as_deref(),
+        Some("read as `off`, so the domain still takes changes; write `on` to make it read-only")
+    );
+    assert_eq!(report.exit_code(), 1);
+}
+
+#[test]
+fn both_recognized_read_only_values_are_clean() {
+    for value in ["off", "on"] {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "MANIFEST.md",
+            &manifest_declaring_read_only(value),
+        );
+        let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+        assert!(
+            !report.issues.iter().any(|i| i.rule == "M009"),
+            "`{value}`: {:?}",
+            report.issues
+        );
+    }
+}
+
+/// The MANIFEST issue 91 left behind: `## When to Use` twice, the first one
+/// empty, which is the one routing reads.
+const DOUBLED_MANIFEST: &str = "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n## Scope\n\n- Facts about the solar system\n\n## When to Use\n\n## When to Use\n\n- When asked about moons or planets\n";
+
+#[test]
+fn the_manifest_rules_over_one_text_find_what_validate_finds() {
+    let found =
+        verify::check_manifest_source(Path::new("MANIFEST.md"), DOUBLED_MANIFEST, None, None);
+    let mut rules: Vec<&str> = found.iter().map(|i| i.rule).collect();
+    rules.sort_unstable();
+    // The empty first section (an error, and the routing fallback warning)
+    // and the doubled heading, pointed at the second one's line.
+    assert_eq!(rules, ["M004", "M101", "M103"], "{found:#?}");
+    let m004 = found.iter().find(|i| i.rule == "M004").unwrap();
+    assert_eq!(m004.severity, Severity::Error);
+    let m103 = found.iter().find(|i| i.rule == "M103").unwrap();
+    assert_eq!(m103.severity, Severity::Warning);
+    assert_eq!(m103.line, Some(17));
+
+    // The same text as a scanned domain draws the same M findings from
+    // validate, because both run one body of rules.
+    let dir = tempdir().unwrap();
+    write(dir.path(), "MANIFEST.md", DOUBLED_MANIFEST);
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    let mut scanned: Vec<(&str, Option<usize>)> = report
+        .issues
+        .iter()
+        .filter(|i| i.rule.starts_with('M'))
+        .map(|i| (i.rule, i.line))
+        .collect();
+    scanned.sort_unstable();
+    let mut direct: Vec<(&str, Option<usize>)> = found.iter().map(|i| (i.rule, i.line)).collect();
+    direct.sort_unstable();
+    assert_eq!(scanned, direct);
+}
+
+#[test]
+fn a_clean_or_unparseable_manifest_text_draws_nothing() {
+    let clean = DOUBLED_MANIFEST.replacen("## When to Use\n\n## When to Use", "## When to Use", 1);
+    assert!(verify::check_manifest_source(Path::new("MANIFEST.md"), &clean, None, None).is_empty());
+    // A parse failure is the format rules' finding, not a MANIFEST one.
+    assert!(
+        verify::check_manifest_source(Path::new("MANIFEST.md"), "---\n: [\n---\n", None, None)
+            .is_empty()
+    );
+}
+
+#[test]
+fn the_manifest_rules_over_one_text_honour_the_domains_overrides() {
+    let config = crystalline_core::config::VerifyConfig {
+        rules: [("M103".to_string(), "off".to_string())]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    let found = verify::check_manifest_source(
+        Path::new("MANIFEST.md"),
+        DOUBLED_MANIFEST,
+        None,
+        Some(&config),
+    );
+    assert!(found.iter().all(|i| i.rule != "M103"), "{found:#?}");
+    assert!(found.iter().any(|i| i.rule == "M004"), "{found:#?}");
+}
+
+#[test]
+fn cross_domain_links_resolve_against_the_manifest_domain_name() {
+    // `a-knowledge/` declares `domain_name: a`, so offline verify must judge
+    // cross-domain links against `a`, not the folder name: `[[a:runbook]]`
+    // resolves cleanly, while `[[a-knowledge:runbook]]` now names a domain
+    // outside the scan set (L006, informational) rather than the domain
+    // itself (which would be L001, a broken link within a known domain).
+    let dir = tempdir().unwrap();
+    let a = dir.path().join("a-knowledge");
+    let b = dir.path().join("b");
+    write(
+        &a,
+        "MANIFEST.md",
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\ndomain_name: a\n---\n\n## Scope\n\n- Scope text here for the domain\n\n## When to Use\n\n- When testing\n",
+    );
+    write(
+        &a,
+        "runbook.md",
+        "---\ntype: engram\ntitle: Runbook\npermalink: runbook\ntags:\n- ops\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n# Runbook\n\nSome runbook content that is long enough to pass the quality checks.\n\nA second paragraph of prose, so the body clears the minimum line count.\n",
+    );
+    write(
+        &b,
+        "MANIFEST.md",
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n## Scope\n\n- Scope text here for the domain\n\n## When to Use\n\n- When testing\n",
+    );
+    write(
+        &b,
+        "linker.md",
+        "---\ntype: engram\ntitle: Linker\npermalink: linker\ntags:\n- ops\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n# Linker\n\nSee [[a:runbook]] and [[a-knowledge:runbook]] for details on this thing.\n\nA second paragraph of prose, so the body clears the minimum line count.\n",
+    );
+
+    let report =
+        verify::verify_paths([a.as_path(), b.as_path()], &VerifyOptions::default()).unwrap();
+
+    let link_issues: Vec<_> = report
+        .issues
+        .iter()
+        .filter(|i| i.rule == "L001" || i.rule == "L006")
+        .collect();
+    assert_eq!(
+        link_issues.len(),
+        1,
+        "expected exactly one link issue: {:#?}",
+        report.issues
+    );
+    let issue = link_issues[0];
+    assert_eq!(issue.rule, "L006");
+    assert_eq!(
+        issue.message,
+        "link references domain `a-knowledge`, which is outside the scan set"
+    );
+}
+
+#[test]
+fn a_bare_link_to_another_domains_title_names_the_prefixed_link() {
+    let dir = tempdir().unwrap();
+    let manifest = "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n## Scope\n\n- Scope text here for the domain\n\n## When to Use\n\n- When testing\n";
+    let ops = dir.path().join("ops");
+    let docs = dir.path().join("docs");
+    write(&ops, "MANIFEST.md", manifest);
+    write(&docs, "MANIFEST.md", manifest);
+    write(
+        &ops,
+        "runbook.md",
+        "---\ntype: engram\ntitle: Incident Runbook\npermalink: runbook\ntags:\n- ops\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n# Incident Runbook\n\nSteps for the on-call engineer when the pager goes off at night.\n\nA second paragraph of prose, so the body clears the minimum line count.\n",
+    );
+    write(
+        &docs,
+        "linker.md",
+        "---\ntype: engram\ntitle: Linker\npermalink: linker\ntags:\n- ops\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n# Linker\n\nSee [[Incident Runbook]] and [[Nowhere At All]] for the details here.\n\nA second paragraph of prose, so the body clears the minimum line count.\n",
+    );
+
+    let report =
+        verify::verify_paths([ops.as_path(), docs.as_path()], &VerifyOptions::default()).unwrap();
+    let mut l001: Vec<&str> = report
+        .issues
+        .iter()
+        .filter(|i| i.rule == "L001")
+        .map(|i| i.message.as_str())
+        .collect();
+    l001.sort_unstable();
+    assert_eq!(
+        l001,
+        vec![
+            "broken wikilink to `Incident Runbook` (found in `ops`, link it as `[[ops:Incident Runbook]]`)",
+            "broken wikilink to `Nowhere At All`",
+        ],
+        "{:#?}",
+        report.issues
+    );
+    assert!(
+        report
+            .issues
+            .iter()
+            .filter(|i| i.rule == "L001")
+            .all(|i| i.severity == Severity::Warning)
+    );
+}
+
+/// A file that is not UTF-8 is reported under the encoding rule, `E006`, and
+/// the rest of the domain is still verified: it never aborts the scan.
+#[test]
+fn a_file_that_is_not_utf8_is_an_e006_error_and_the_scan_goes_on() {
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n## Scope\n\n- Encoding facts\n\n## When to Use\n\n- When asked about encodings\n",
+    );
+    fs::write(
+        dir.path().join("latin1.md"),
+        b"---\ntype: engram\ntitle: Latin\npermalink: latin\ntags:\n- t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nCaf\xe9 au lait.\n",
+    )
+    .unwrap();
+
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    let e006 = report
+        .issues
+        .iter()
+        .find(|i| i.rule == "E006" && i.path.ends_with("latin1.md"))
+        .expect("E006 present");
+    assert_eq!(e006.severity, Severity::Error);
+    assert!(e006.message.contains("not valid UTF-8"), "{}", e006.message);
+    assert_eq!(e006.line, Some(11));
+    assert_eq!(report.summary.files_scanned, 2);
+}

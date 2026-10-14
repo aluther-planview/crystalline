@@ -32,7 +32,7 @@ use chrono::{DateTime, Utc};
 use crystalline_remote::RemoteError;
 use crystalline_remote::changes::LocalChange;
 use crystalline_remote::ops::{self, OriginStatusReport, ProposeOutcome, PullReport};
-use crystalline_remote::state::{OriginState, ProposalStatus};
+use crystalline_remote::state::{DirectRefusal, OriginState, ProposalStatus};
 use serde_json::{Value, json};
 
 use crate::engine::EngineError;
@@ -154,6 +154,27 @@ pub(crate) fn proposal_transitions_json(
         .collect()
 }
 
+/// The recorded refusal a status shows its caller: the one recorded for
+/// `viewer`, the login the caller's shares go out on, and only while the
+/// domain shares directly. A refusal is a fact about one person, so another
+/// login's never shows; `None` for `viewer` is a caller whose login could not
+/// be resolved, who is shown none. On a `sharing: proposal` domain a refusal
+/// means nothing for anyone, and the next share there clears it.
+pub(crate) fn viewer_refusal<'r>(
+    report: &'r OriginStatusReport,
+    viewer: Option<Option<&str>>,
+    sharing: crystalline_core::Sharing,
+) -> Option<&'r DirectRefusal> {
+    if sharing != crystalline_core::Sharing::Direct {
+        return None;
+    }
+    let login = viewer?;
+    report
+        .direct_refused
+        .iter()
+        .find(|refusal| refusal.login.as_deref() == login)
+}
+
 /// Shapes one domain's [`OriginStatusReport`] into `origin_status`'s
 /// per-domain entry: `{ domain, repo, branch, base_commit, behind,
 /// local_changes, skipped_large, open_proposals, declined_proposals,
@@ -189,6 +210,10 @@ pub(crate) fn proposal_transitions_json(
 /// no proposal record to read its own history off, and the file list belongs
 /// to the commit rather than to a status glance.
 ///
+/// `direct_refused` names `refusal`, the caller's own recorded refusal of a
+/// direct commit (see [`viewer_refusal`]), with the line to show, and is
+/// `null` when there is none.
+///
 /// `kept_branches` names share branches Crystalline keeps upstream (merged,
 /// declined or withdrawn shares), each with why it was retired, what kept it
 /// and the sentence to show; always present, empty when nothing is kept.
@@ -203,6 +228,7 @@ pub(crate) fn status_report_json(
     report: &OriginStatusReport,
     probe_error: Option<String>,
     detail: Option<Value>,
+    refusal: Option<&DirectRefusal>,
 ) -> Value {
     let open: Vec<Value> = report
         .open_proposals
@@ -239,6 +265,12 @@ pub(crate) fn status_report_json(
             "shared_at": share.shared_at,
             "author_login": share.author_login,
         })).collect::<Vec<Value>>(),
+        "direct_refused": refusal.map(|refusal| json!({
+            "branch": refusal.branch,
+            "message": refusal.message,
+            "refused_at": refusal.refused_at,
+            "line": crystalline_remote::error::direct_refused_line(&refusal.branch),
+        })),
     });
     if let Some(detail) = detail
         && let Some(object) = value.as_object_mut()
@@ -594,30 +626,77 @@ pub(crate) fn propose_outcome_json(outcome: &ProposeOutcome) -> Value {
             "proposal": { "number": number, "url": url, "branch": branch },
             "guidance": DIVERGED_GUIDANCE,
         }),
-        ProposeOutcome::Committed(report) => json!({
-            "outcome": "committed",
-            "sha": report.sha,
-            "url": report.url,
-            "branch": report.branch,
-            "added": report.added,
-            "updated": report.updated,
-            "deleted": report.deleted,
-            "skipped_large": report.skipped_large,
-            "summary": report.summary,
-        }),
-        ProposeOutcome::ProposalOpen { number, url, title } => json!({
+        ProposeOutcome::FellBack {
+            report,
+            refused_branch,
+        } => {
+            let mut receipt = propose_outcome_json(&ProposeOutcome::Proposed(report.clone()));
+            receipt["fell_back"] = json!(true);
+            receipt["note"] = json!(crystalline_remote::error::fell_back_line(refused_branch));
+            receipt
+        }
+        ProposeOutcome::Committed(report) => {
+            let mut receipt = json!({
+                "outcome": "committed",
+                "sha": report.sha,
+                "url": report.url,
+                "branch": report.branch,
+                "added": report.added,
+                "updated": report.updated,
+                "deleted": report.deleted,
+                "skipped_large": report.skipped_large,
+                "summary": report.summary,
+            });
+            if report.refusal_cleared {
+                receipt["note"] = json!(crystalline_remote::error::direct_works_again_line(
+                    &report.branch
+                ));
+            }
+            receipt
+        }
+        ProposeOutcome::ProposalOpen {
+            number,
+            url,
+            title,
+            own,
+        } => json!({
             "outcome": "proposal_open",
             "proposal": { "number": number, "url": url, "title": title },
-            "guidance": format!(
-                "merge or withdraw proposal #{number} first; a domain that shares directly commits onto the branch the proposal is waiting to land on"
-            ),
+            "own": own,
+            "guidance": if *own {
+                format!(
+                    "merge or withdraw proposal #{number} first; a domain that shares directly commits onto the branch the proposal is waiting to land on"
+                )
+            } else {
+                format!(
+                    "proposal #{number} is another person's and is still open; share again once it is merged or closed"
+                )
+            },
         }),
-        ProposeOutcome::BranchProtected { branch, message } => json!({
-            "outcome": "branch_protected",
-            "branch": branch,
-            "message": message,
-            "guidance": crystalline_remote::error::branch_protected_guidance(branch, message),
-        }),
+        ProposeOutcome::BranchProtected {
+            branch,
+            message,
+            offers_proposal,
+        } => {
+            let guidance = if *offers_proposal {
+                crystalline_remote::error::branch_protected_guidance(branch, message)
+            } else {
+                crystalline_remote::error::branch_protected_blocked_guidance(branch, message)
+            };
+            let mut receipt = json!({
+                "outcome": "branch_protected",
+                "branch": branch,
+                "message": message,
+                "guidance": guidance,
+            });
+            // Only where a proposal share would be taken: while only another
+            // login's proposal is open here it answers proposal_open, so no
+            // button is offered for it.
+            if *offers_proposal {
+                receipt["fallback"] = json!("proposal");
+            }
+            receipt
+        }
         ProposeOutcome::BranchMoved { branch } => json!({
             "outcome": "branch_moved",
             "branch": branch,
@@ -836,6 +915,9 @@ pub(crate) fn share_plan_json(plan: &ops::SharePlan, root: Option<&Path>) -> Val
         "changes": changes,
         "sharing": plan.sharing.as_str(),
     });
+    if let Some(note) = &plan.note {
+        v["note"] = json!(note);
+    }
     match &plan.action {
         ops::PlannedAction::Create => v["action"] = json!("create"),
         ops::PlannedAction::Update { number, url } => {
@@ -882,131 +964,21 @@ pub(crate) fn share_plan_json(plan: &ops::SharePlan, root: Option<&Path>) -> Val
             v["action"] = json!("commit");
             v["branch"] = json!(branch);
         }
-        ops::PlannedAction::ProposalOpen { number, url, title } => {
+        ops::PlannedAction::ProposalOpen {
+            number,
+            url,
+            title,
+            own,
+        } => {
             v["action"] = json!("proposal_open");
             v["number"] = json!(number);
             v["url"] = json!(url);
             v["title"] = json!(title);
+            v["own"] = json!(own);
         }
     }
     v
 }
-
-/// Resolves the layer a withdrawal would take out and shapes it for
-/// `origin_withdraw_preview`: `{ number, title, url, declined, layers_above,
-/// only_layer, reverting }`.
-///
-/// **Target resolution mirrors [`ops::withdraw`]'s, read off one offline
-/// [`OriginStatusReport`] instead of origin state.** A named number is looked
-/// for among the open layers and then the declined records - a declined
-/// proposal can be withdrawn too, which tidies its record away - then among
-/// the merged-but-unconsumed numbers, which answer the withdrawal's own
-/// refusal ("already merged") rather than pretending the number is unknown. A
-/// number that is none of the three is [`RemoteError::ProposalNotFound`]. With
-/// no number the target is the single open proposal, or, on a chain this
-/// machine knows as a stack, the TOP open layer: the one nothing is built on.
-/// Anything else - no open proposal, or the legacy multi-open shape from
-/// before stacking - is [`RemoteError::NoWithdrawTarget`] carrying both
-/// candidate lists, exactly the teaching error the withdrawal itself would
-/// raise a moment later.
-///
-/// **Two things the forge knows and this report does not, and what each
-/// costs.** `ops::withdraw` asks the forge (through the cached
-/// `stacks_available` verdict) whether this origin serves stacks at all; a
-/// preview may not touch the forge, so it takes `stacks_allowed` (the
-/// `github.stacks` setting) together with the two chain facts the report
-/// carries. Those can only disagree for a chain that records a stack number no
-/// forge ever served, and the disagreement costs a question naming the top
-/// layer in front of a withdrawal that then refuses.
-///
-/// The second is `repair_pending`, and it is the one that could otherwise
-/// name the wrong layer. `ops::withdraw` finishes a half-done repair BEFORE it
-/// resolves its target, and that repair can settle layers out of the chain, so
-/// a preview reading the pre-repair state can name the top layer as it stands
-/// now while the withdrawal - resolving after the repair - takes out the one
-/// below it. So an implicit target is refused outright while the chain is
-/// mid-repair, in words that say how to get past it: name the number, or run a
-/// share or a status first and let the repair finish. A named number needs no
-/// such guard, since it resolves to the same record either side of a repair.
-///
-/// `declined` says the target is a closed record rather than a live proposal,
-/// so a question can say what a withdrawal of it actually does (nothing is
-/// closed on the forge; the record is cleared). `layers_above` counts the OPEN
-/// layers standing above the target in chain order (zero for the top one, and
-/// for a declined record, which stands in no chain), because those are the
-/// layers a withdrawal re-bases. `only_layer` says the target is the domain's
-/// one open proposal. `reverting` carries the call's own `revert` flag
-/// through, so the question can name the working-tree half of what it is about
-/// to do.
-pub(crate) fn withdraw_plan_json(
-    report: &OriginStatusReport,
-    proposal: Option<u64>,
-    revert: bool,
-    stacks_allowed: bool,
-) -> Result<Value, RemoteError> {
-    let open = &report.open_proposals;
-    let target = match proposal {
-        Some(number) => open
-            .iter()
-            .chain(report.declined_proposals.iter())
-            .find(|p| p.number == number)
-            .ok_or_else(|| {
-                if report.merged_unconsumed.contains(&number) {
-                    merged_cannot_be_withdrawn(number)
-                } else {
-                    RemoteError::ProposalNotFound { number }
-                }
-            })?,
-        None => {
-            if report.repair_pending {
-                return Err(RemoteError::Refused(MID_REPAIR_NEEDS_A_NUMBER.to_string()));
-            }
-            // `ops::chain_is_stacked`'s test, over the same three facts: a
-            // chain of one is trivially stackable, and beyond that this
-            // machine must know the chain as a stack (a recorded number, or a
-            // link it still owes the forge).
-            let stacked_chain = stacks_allowed
-                && (open.len() <= 1 || report.stack_number.is_some() || report.stack_link_pending);
-            match open.as_slice() {
-                [single] => single,
-                [.., top] if stacked_chain => top,
-                _ => {
-                    return Err(RemoteError::NoWithdrawTarget {
-                        open: open.iter().map(|p| p.number).collect(),
-                        declined: report.declined_proposals.iter().map(|p| p.number).collect(),
-                    });
-                }
-            }
-        }
-    };
-    let layers_above = open
-        .iter()
-        .position(|p| p.number == target.number)
-        .map_or(0, |index| open.len() - index - 1);
-    Ok(json!({
-        "number": target.number,
-        "title": target.title,
-        "url": target.url,
-        "declined": target.status == ProposalStatus::Declined,
-        "layers_above": layers_above,
-        "only_layer": open.len() == 1 && open[0].number == target.number,
-        "reverting": revert,
-    }))
-}
-
-/// The withdrawal's own refusal for a proposal that has already merged, worded
-/// exactly as [`ops::withdraw`] words it so the preview and the act it
-/// previews teach the same sentence.
-fn merged_cannot_be_withdrawn(number: u64) -> RemoteError {
-    RemoteError::Refused(format!(
-        "proposal #{number} has already merged and cannot be withdrawn"
-    ))
-}
-
-/// What a withdrawal with no proposal number is told while the chain is
-/// mid-repair: the two ways forward, since the repair itself is what decides
-/// which layer is the top one.
-const MID_REPAIR_NEEDS_A_NUMBER: &str = "this domain's chain is mid-repair, so which layer stands on top is not settled yet; withdraw with an explicit proposal number, or share or check origin status first to finish the repair.";
 
 /// Shapes [`ops::withdraw`]'s report into `origin_withdraw`'s JSON: the
 /// proposal number, whether a live pull request was closed on the forge, the
@@ -1067,6 +1039,7 @@ pub(crate) fn resolution_from<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crystalline_core::Sharing;
 
     /// An engram written by `actor`, or one with no provenance block at all
     /// when `actor` is `None`.
@@ -1216,6 +1189,7 @@ mod tests {
         )
         .unwrap();
         let plan = ops::SharePlan {
+            note: None,
             action: ops::PlannedAction::Create,
             changes: LocalChanges {
                 changes: vec![LocalChange::Modified {
@@ -1797,6 +1771,7 @@ mod tests {
             repair_pending: false,
             kept_branches: Vec::new(),
             stack_link_pending: false,
+            direct_refused: Vec::new(),
             direct_shares: vec![crystalline_remote::state::DirectShare {
                 sha: "c0ffee".to_string(),
                 url: Some("https://forge.test/acme/brand-knowledge/commit/c0ffee".to_string()),
@@ -1812,7 +1787,7 @@ mod tests {
                 }],
             }],
         };
-        let v = status_report_json("eng", &report, None, None);
+        let v = status_report_json("eng", &report, None, None, None);
         assert_eq!(v["domain"], "eng");
         assert_eq!(v["repo"], "acme/brand-knowledge");
         assert_eq!(v["behind"], true);
@@ -1827,6 +1802,77 @@ mod tests {
         assert_eq!(v["direct_shares"][0]["sha"], "c0ffee", "{v}");
         assert_eq!(v["direct_shares"][0]["author_login"], "instance-gh", "{v}");
         assert!(v["direct_shares"][0].get("files").is_none(), "{v}");
+        assert!(v["direct_refused"].is_null(), "{v}");
+    }
+
+    #[test]
+    fn the_status_names_a_recorded_refusal_with_its_line() {
+        let report = OriginStatusReport {
+            repo: "acme/kb".to_string(),
+            branch: "main".to_string(),
+            base_commit: "abc123".to_string(),
+            behind: Some(false),
+            local_changes: 1,
+            skipped_large: vec![],
+            open_proposals: vec![],
+            declined_proposals: vec![],
+            merged_unconsumed: vec![],
+            conflicts: vec![],
+            last_checked: None,
+            amended_upstream: vec![],
+            stack_number: None,
+            stack_wedged: vec![],
+            repair_pending: false,
+            kept_branches: Vec::new(),
+            stack_link_pending: false,
+            direct_shares: vec![],
+            direct_refused: vec![refused_for(Some("alice")), refused_for(None)],
+        };
+        let refusal = viewer_refusal(&report, Some(Some("alice")), Sharing::Direct);
+        assert_eq!(refusal, Some(&report.direct_refused[0]));
+        let v = status_report_json("kb", &report, None, None, refusal);
+        assert_eq!(v["direct_refused"]["branch"], "main", "{v}");
+        assert_eq!(
+            v["direct_refused"]["line"],
+            "Direct commits to main are refused for you, so your shares go as proposals."
+        );
+        let v = status_report_json("kb", &report, None, None, None);
+        assert!(v["direct_refused"].is_null(), "{v}");
+    }
+
+    fn refused_for(login: Option<&str>) -> crystalline_remote::state::DirectRefusal {
+        crystalline_remote::state::DirectRefusal {
+            login: login.map(str::to_string),
+            branch: "main".to_string(),
+            message: "Changes must be made through a pull request.".to_string(),
+            refused_at: chrono::Utc::now(),
+        }
+    }
+
+    /// Each caller sees the refusal of their own login and nobody else's; a
+    /// caller with no resolvable login sees none, and a proposal domain shows
+    /// none to anyone.
+    #[test]
+    fn a_status_shows_only_the_callers_own_refusal_and_only_on_a_direct_domain() {
+        let mut report = poll_status_fixture();
+        report.direct_refused = vec![refused_for(Some("alice")), refused_for(None)];
+        assert_eq!(
+            viewer_refusal(&report, Some(Some("alice")), Sharing::Direct),
+            Some(&report.direct_refused[0])
+        );
+        assert_eq!(
+            viewer_refusal(&report, Some(None), Sharing::Direct),
+            Some(&report.direct_refused[1])
+        );
+        assert_eq!(
+            viewer_refusal(&report, Some(Some("bob")), Sharing::Direct),
+            None
+        );
+        assert_eq!(viewer_refusal(&report, None, Sharing::Direct), None);
+        assert_eq!(
+            viewer_refusal(&report, Some(Some("alice")), Sharing::Proposal),
+            None
+        );
     }
 
     /// The merged-but-unpulled numbers ride both status shapes, because both
@@ -1837,7 +1883,7 @@ mod tests {
         let mut report = poll_status_fixture();
         report.merged_unconsumed = vec![4, 9];
         assert_eq!(
-            status_report_json("eng", &report, None, None)["merged_unconsumed"],
+            status_report_json("eng", &report, None, None, None)["merged_unconsumed"],
             json!([4, 9])
         );
         assert_eq!(
@@ -1866,9 +1912,10 @@ mod tests {
             repair_pending: true,
             kept_branches: Vec::new(),
             stack_link_pending: true,
+            direct_refused: Vec::new(),
             direct_shares: Vec::new(),
         };
-        let v = status_report_json("eng", &report, None, None);
+        let v = status_report_json("eng", &report, None, None, None);
         assert_eq!(v["stack_number"], 42);
         assert_eq!(v["stack_wedged"], json!([7]));
         assert_eq!(v["repair_pending"], true);
@@ -1895,9 +1942,10 @@ mod tests {
             repair_pending: false,
             kept_branches: Vec::new(),
             stack_link_pending: false,
+            direct_refused: Vec::new(),
             direct_shares: Vec::new(),
         };
-        let v = status_report_json("eng", &report, None, None);
+        let v = status_report_json("eng", &report, None, None, None);
         assert!(v["stack_number"].is_null(), "{v}");
         assert_eq!(v["stack_wedged"], json!([]));
         assert_eq!(v["repair_pending"], false);
@@ -1924,10 +1972,11 @@ mod tests {
             repair_pending: false,
             kept_branches: Vec::new(),
             stack_link_pending: false,
+            direct_refused: Vec::new(),
             direct_shares: Vec::new(),
         };
         let message = RemoteError::Offline.to_string();
-        let v = status_report_json("eng", &report, Some(message.clone()), None);
+        let v = status_report_json("eng", &report, Some(message.clone()), None, None);
         assert_eq!(v["probe_error"], message);
     }
 
@@ -1954,6 +2003,7 @@ mod tests {
             repair_pending: false,
             kept_branches: Vec::new(),
             stack_link_pending: false,
+            direct_refused: Vec::new(),
             direct_shares: Vec::new(),
         }
     }
@@ -2027,7 +2077,7 @@ mod tests {
             "message": "Branch crystalline/share-1 is kept: pull request #7 is based on it and could not be moved to main. The next sync tries again.",
         }]);
         assert_eq!(
-            status_report_json("eng", &report, None, None)["kept_branches"],
+            status_report_json("eng", &report, None, None, None)["kept_branches"],
             expected
         );
         assert_eq!(
@@ -2038,7 +2088,7 @@ mod tests {
         // Present and empty rather than absent when nothing is kept.
         let plain = poll_status_fixture();
         assert_eq!(
-            status_report_json("eng", &plain, None, None)["kept_branches"],
+            status_report_json("eng", &plain, None, None, None)["kept_branches"],
             json!([])
         );
         assert_eq!(
@@ -2212,6 +2262,7 @@ mod tests {
     fn share_plan_json_names_the_action_and_every_change() {
         use crystalline_remote::changes::{LocalChange, LocalChanges};
         let plan = ops::SharePlan {
+            note: None,
             action: ops::PlannedAction::Update {
                 number: 4,
                 url: "https://github.com/acme/brand-knowledge/pull/4".to_string(),
@@ -2290,6 +2341,7 @@ mod tests {
             sha256: "aa".to_string(),
         };
         let plan = ops::SharePlan {
+            note: None,
             action: ops::PlannedAction::Create,
             changes: LocalChanges {
                 changes: vec![
@@ -2334,6 +2386,7 @@ mod tests {
     fn share_plan_json_shapes_the_remaining_actions() {
         use crystalline_remote::changes::LocalChanges;
         let plan = |action| ops::SharePlan {
+            note: None,
             action,
             changes: LocalChanges::default(),
             effective_title: String::new(),
@@ -2360,6 +2413,50 @@ mod tests {
         assert_eq!(diverged["branch"], "crystalline/share-brand");
     }
 
+    #[test]
+    fn a_fallback_is_the_proposal_receipt_with_its_line() {
+        let report = ops::ProposeReport {
+            url: "https://github.com/acme/kb/pull/9".to_string(),
+            number: 9,
+            branch: "crystalline/share-kb-1".to_string(),
+            added: vec!["notes/a.md".to_string()],
+            updated: vec![],
+            deleted: vec![],
+            skipped_large: vec![],
+            summary: "Share 1 new engram".to_string(),
+            stack_number: None,
+            stack_position: None,
+        };
+        let v = propose_outcome_json(&ProposeOutcome::FellBack {
+            report,
+            refused_branch: "main".to_string(),
+        });
+        assert_eq!(v["outcome"], "proposed");
+        assert_eq!(v["number"], 9);
+        assert_eq!(v["fell_back"], true);
+        assert_eq!(
+            v["note"],
+            "The branch main does not accept direct commits from you, so this share opened a proposal."
+        );
+    }
+
+    #[test]
+    fn a_commit_that_cleared_a_refusal_says_direct_commits_work_again() {
+        let v = propose_outcome_json(&ProposeOutcome::Committed(ops::CommitReport {
+            sha: "9f2c".to_string(),
+            url: None,
+            branch: "main".to_string(),
+            added: vec!["notes/b.md".to_string()],
+            updated: vec![],
+            deleted: vec![],
+            skipped_large: vec![],
+            summary: "Shares 1 new engram.".to_string(),
+            refusal_cleared: true,
+        }));
+        assert_eq!(v["outcome"], "committed");
+        assert_eq!(v["note"], "Direct commits to main work for you now.");
+    }
+
     /// A direct share's four answers: what landed, and the three refusals
     /// that are shaped as outcomes rather than errors because each one names
     /// what to do next.
@@ -2374,6 +2471,7 @@ mod tests {
             deleted: vec![],
             skipped_large: vec![],
             summary: "Shares 1 new engram.".to_string(),
+            refusal_cleared: false,
         }));
         assert_eq!(v["outcome"], "committed");
         assert_eq!(v["sha"], "9f2c");
@@ -2381,11 +2479,13 @@ mod tests {
         assert_eq!(v["branch"], "main");
         assert_eq!(v["added"], json!(["notes/b.md"]));
         assert!(v.get("number").is_none(), "a commit has no proposal number");
+        assert!(v.get("note").is_none(), "no refusal was cleared");
 
         let open = propose_outcome_json(&ProposeOutcome::ProposalOpen {
             number: 4,
             url: "https://github.test/pull/4".to_string(),
             title: "Refine".to_string(),
+            own: true,
         });
         assert_eq!(open["outcome"], "proposal_open");
         assert_eq!(open["proposal"]["number"], 4);
@@ -2395,10 +2495,24 @@ mod tests {
                 .unwrap()
                 .contains("merge or withdraw proposal #4 first")
         );
+        assert_eq!(open["own"], true);
+        let foreign = propose_outcome_json(&ProposeOutcome::ProposalOpen {
+            number: 5,
+            url: "https://github.test/pull/5".to_string(),
+            title: "Theirs".to_string(),
+            own: false,
+        });
+        assert_eq!(foreign["outcome"], "proposal_open");
+        assert_eq!(foreign["own"], false);
+        assert_eq!(
+            foreign["guidance"],
+            "proposal #5 is another person's and is still open; share again once it is merged or closed"
+        );
 
         let protected = propose_outcome_json(&ProposeOutcome::BranchProtected {
             branch: "main".to_string(),
             message: "Changes must be made through a pull request.".to_string(),
+            offers_proposal: true,
         });
         assert_eq!(protected["outcome"], "branch_protected");
         assert_eq!(
@@ -2409,7 +2523,20 @@ mod tests {
             protected["guidance"]
                 .as_str()
                 .unwrap()
-                .contains("sharing: proposal")
+                .contains("share_changes with as_proposal: true")
+        );
+        assert_eq!(protected["fallback"], "proposal");
+        // While only another login's proposal is open, no proposal is offered.
+        let blocked = propose_outcome_json(&ProposeOutcome::BranchProtected {
+            branch: "main".to_string(),
+            message: "Changes must be made through a pull request.".to_string(),
+            offers_proposal: false,
+        });
+        assert_eq!(blocked["outcome"], "branch_protected");
+        assert!(blocked.get("fallback").is_none(), "{blocked}");
+        assert_eq!(
+            blocked["guidance"],
+            "The branch main does not accept direct commits from you (Changes must be made through a pull request.). Another person's proposal is open on this domain, so share again once it is merged or closed."
         );
 
         let moved = propose_outcome_json(&ProposeOutcome::BranchMoved {
@@ -2425,6 +2552,7 @@ mod tests {
     fn share_plan_json_names_the_commit_and_proposal_open_actions_and_the_policy() {
         use crystalline_remote::changes::LocalChanges;
         let plan = |action| ops::SharePlan {
+            note: None,
             action,
             changes: LocalChanges::default(),
             effective_title: String::new(),
@@ -2440,10 +2568,12 @@ mod tests {
             number: 4,
             url: "https://github.test/pull/4".to_string(),
             title: "Refine".to_string(),
+            own: true,
         }));
         assert_eq!(open["action"], "proposal_open");
         assert_eq!(open["number"], 4);
         assert_eq!(open["title"], "Refine");
+        assert_eq!(open["own"], true);
         let proposal = plan_json(&ops::SharePlan {
             sharing: crystalline_core::Sharing::Proposal,
             ..plan(ops::PlannedAction::Create)
@@ -2455,6 +2585,7 @@ mod tests {
     fn share_plan_json_names_the_stack_and_amend_actions() {
         use crystalline_remote::changes::LocalChanges;
         let plan = |action| ops::SharePlan {
+            note: None,
             action,
             changes: LocalChanges::default(),
             effective_title: String::new(),
@@ -2481,163 +2612,6 @@ mod tests {
             "the amended layer names itself, so the confirm question can too"
         );
         assert_eq!(amend["layers_above"], 1);
-    }
-
-    /// A chain fixture for the withdrawal preview: `open` layers bottom-first,
-    /// the way origin state and [`OriginStatusReport`] both order them.
-    fn chain_fixture(open: &[u64], declined: &[u64], stacked: bool) -> OriginStatusReport {
-        let proposals = |numbers: &[u64], status: ProposalStatus| {
-            numbers
-                .iter()
-                .map(|n| {
-                    let mut p = proposal_fixture(
-                        *n,
-                        &format!("https://github.test/pull/{n}"),
-                        &format!("Layer {n}"),
-                    );
-                    p.status = status;
-                    p
-                })
-                .collect::<Vec<_>>()
-        };
-        OriginStatusReport {
-            repo: "acme/brand-knowledge".to_string(),
-            branch: "main".to_string(),
-            base_commit: "abc123".to_string(),
-            behind: None,
-            local_changes: 0,
-            skipped_large: vec![],
-            open_proposals: proposals(open, ProposalStatus::Open),
-            declined_proposals: proposals(declined, ProposalStatus::Declined),
-            merged_unconsumed: vec![],
-            conflicts: vec![],
-            last_checked: None,
-            amended_upstream: vec![],
-            stack_number: stacked.then_some(42),
-            stack_wedged: vec![],
-            repair_pending: false,
-            kept_branches: Vec::new(),
-            stack_link_pending: false,
-            direct_shares: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn withdraw_plan_json_defaults_to_the_top_open_layer_and_counts_what_stands_above() {
-        // No number on a stacked chain: the top layer, the one nothing is
-        // built on, exactly as `ops::withdraw` resolves it.
-        let report = chain_fixture(&[5, 6, 7], &[], true);
-        let v = withdraw_plan_json(&report, None, false, true).unwrap();
-        assert_eq!(v["number"], 7);
-        assert_eq!(v["title"], "Layer 7");
-        assert_eq!(v["url"], "https://github.test/pull/7");
-        assert_eq!(v["layers_above"], 0);
-        assert_eq!(v["only_layer"], false);
-        assert_eq!(v["reverting"], false);
-
-        // A named layer lower down carries the cascade count with it.
-        let v = withdraw_plan_json(&report, Some(5), true, true).unwrap();
-        assert_eq!(v["number"], 5);
-        assert_eq!(v["layers_above"], 2);
-        assert_eq!(v["reverting"], true);
-    }
-
-    #[test]
-    fn withdraw_plan_json_names_the_lone_open_proposal() {
-        let report = chain_fixture(&[4], &[], false);
-        let v = withdraw_plan_json(&report, None, false, false).unwrap();
-        assert_eq!(v["number"], 4);
-        assert_eq!(v["layers_above"], 0);
-        assert_eq!(v["only_layer"], true);
-    }
-
-    /// The two refusals travel verbatim, because they are the teaching text
-    /// the caller acts on: an unknown number, and the legacy multi-open shape
-    /// this machine does not know as a stack.
-    #[test]
-    fn withdraw_plan_json_refuses_an_unknown_number_and_the_legacy_multi_open_shape() {
-        let report = chain_fixture(&[5, 6], &[3], true);
-        let err = withdraw_plan_json(&report, Some(99), false, true).unwrap_err();
-        assert!(matches!(err, RemoteError::ProposalNotFound { number: 99 }));
-
-        // Two open layers and no stack this machine knows: the caller has to
-        // say which one, and both candidate lists ride along.
-        let legacy = chain_fixture(&[5, 6], &[3], false);
-        let err = withdraw_plan_json(&legacy, None, false, true).unwrap_err();
-        match err {
-            RemoteError::NoWithdrawTarget { open, declined } => {
-                assert_eq!(open, vec![5, 6]);
-                assert_eq!(declined, vec![3]);
-            }
-            other => panic!("{other}"),
-        }
-
-        // And nothing open at all is the same refusal.
-        let empty = chain_fixture(&[], &[], false);
-        assert!(matches!(
-            withdraw_plan_json(&empty, None, false, true),
-            Err(RemoteError::NoWithdrawTarget { .. })
-        ));
-    }
-
-    /// A declined proposal can be withdrawn - it tidies the record away - so
-    /// naming its number previews rather than refusing, and says which kind of
-    /// record it found. Nothing stands above a record that stands in no chain,
-    /// so the cascade count is zero.
-    #[test]
-    fn withdraw_plan_json_previews_a_declined_proposal_named_by_number() {
-        let report = chain_fixture(&[5], &[3], false);
-        let v = withdraw_plan_json(&report, Some(3), false, false).unwrap();
-        assert_eq!(v["number"], 3);
-        assert_eq!(v["declined"], true);
-        assert_eq!(v["layers_above"], 0);
-        assert_eq!(v["only_layer"], false);
-
-        // An open target is not declined, and says so rather than leaving the
-        // key out: one reader, either shape.
-        let open = withdraw_plan_json(&report, Some(5), false, false).unwrap();
-        assert_eq!(open["declined"], false);
-    }
-
-    /// A number that merged upstream and has not been pulled in yet gets the
-    /// withdrawal's own refusal, not a not-found: the record exists, it simply
-    /// cannot be withdrawn, and only one of those two sentences tells the
-    /// caller what to do next.
-    #[test]
-    fn withdraw_plan_json_answers_the_merged_refusal_for_an_unconsumed_merge() {
-        let mut report = chain_fixture(&[5], &[], false);
-        report.merged_unconsumed = vec![4];
-        let err = withdraw_plan_json(&report, Some(4), false, false).unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "proposal #4 has already merged and cannot be withdrawn"
-        );
-        // And a number that is nowhere at all still says exactly that.
-        let err = withdraw_plan_json(&report, Some(99), false, false).unwrap_err();
-        assert!(matches!(err, RemoteError::ProposalNotFound { number: 99 }));
-    }
-
-    /// Mid-repair, an implicit target is refused rather than guessed.
-    ///
-    /// `ops::withdraw` finishes the repair before it resolves, and the repair
-    /// can settle a layer out of the chain, so the top layer this report names
-    /// is not necessarily the top layer the withdrawal would find. A named
-    /// number resolves to the same record either side of the repair, so it is
-    /// previewed as usual.
-    #[test]
-    fn withdraw_plan_json_refuses_an_implicit_target_while_the_chain_is_mid_repair() {
-        let mut report = chain_fixture(&[5, 6], &[], true);
-        report.repair_pending = true;
-        let err = withdraw_plan_json(&report, None, false, true).unwrap_err();
-        let message = err.to_string();
-        assert!(message.contains("mid-repair"), "{message}");
-        assert!(
-            message.contains("explicit proposal number"),
-            "the refusal names the way out: {message}"
-        );
-
-        let v = withdraw_plan_json(&report, Some(5), false, true).unwrap();
-        assert_eq!(v["number"], 5);
     }
 
     #[test]
@@ -2708,9 +2682,10 @@ mod tests {
             repair_pending: false,
             kept_branches: Vec::new(),
             stack_link_pending: false,
+            direct_refused: Vec::new(),
             direct_shares: Vec::new(),
         };
-        let v = status_report_json("eng", &report, None, None);
+        let v = status_report_json("eng", &report, None, None, None);
         assert_eq!(v["open_proposals"][0]["number"], 1);
         assert_eq!(v["open_proposals"][0]["amended_upstream"], false);
         assert_eq!(v["open_proposals"][1]["number"], 2);
@@ -2751,9 +2726,10 @@ mod tests {
             repair_pending: false,
             kept_branches: Vec::new(),
             stack_link_pending: false,
+            direct_refused: Vec::new(),
             direct_shares: Vec::new(),
         };
-        let v = status_report_json("eng", &report, None, None);
+        let v = status_report_json("eng", &report, None, None, None);
         assert_eq!(v["open_proposals"][0]["author_login"], "alice");
         assert!(
             v["open_proposals"][1]["author_login"].is_null(),

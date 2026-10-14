@@ -21,17 +21,17 @@
 mod migrations;
 mod search;
 
-/// The search statements the plan registry (`tests/plans.rs`) reads, reachable
+/// The search statements the plan registry (`tests/it/plans.rs`) reads, reachable
 /// from outside the crate and from nowhere else in it. `search` is a private
 /// submodule, so without this the registry would hold a second copy of each
 /// statement, and a copy is a thing that can be right about SQL nobody runs.
 /// [`DEFAULT_MIN_SIMILARITY`] is re-exported the same way, for the same
-/// reason: the cross-backend parity test in `tests/store.rs` reads it rather
+/// reason: the cross-backend parity test in `tests/it/store.rs` reads it rather
 /// than holding a second copy of the number.
 #[doc(hidden)]
 pub use search::{
-    DEFAULT_MIN_SIMILARITY, filter_only_sql, lexical_candidate_sql, node_hydrate_sql,
-    semantic_hydrate_sql, semantic_phase1_sql,
+    DEFAULT_MIN_SIMILARITY, domain_scope_sql, filter_only_count_sql, filter_only_sql,
+    lexical_candidate_sql, node_hydrate_sql, semantic_hydrate_sql, semantic_phase1_sql,
 };
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -377,7 +377,7 @@ impl TursoStore {
     }
 
     /// Drop one index by name. Test scaffolding for the plan registry's
-    /// red-first leg (`tests/plans.rs`), which proves the guard has teeth by
+    /// red-first leg (`tests/it/plans.rs`), which proves the guard has teeth by
     /// taking an index away and watching the plan turn into a scan. Nothing
     /// ships calling this: the schema is the migrations' business.
     #[doc(hidden)]
@@ -456,7 +456,7 @@ impl TursoStore {
         // duplicate means no failing statement aborts the batch transaction.
         let probe = query_all(
             &self.conn,
-            "SELECT id, path FROM engram WHERE domain_id=?1 AND actor=?4 AND (path=?2 OR permalink=?3)",
+            UPSERT_PROBE_SQL,
             vec![
                 Value::Integer(domain.0),
                 Value::Text(record.path.clone()),
@@ -638,6 +638,11 @@ impl TursoStore {
             self.conn.execute(&sql, params).await?;
         }
 
+        // Frontmatter values, exactly where the tag rows are written: one row
+        // per list element and per scalar of every non-promoted key, so
+        // `$contains` seeks instead of reading every row's `metadata`.
+        insert_meta_values(&self.conn, engram_id, &record.metadata).await?;
+
         Ok(EngramId(engram_id))
     }
 
@@ -647,18 +652,20 @@ impl TursoStore {
     /// clears its chunks explicitly in [`Store::delete_engram`].
     async fn delete_children(&self, engram_id: i64) -> Result<()> {
         let eid = vec![Value::Integer(engram_id)];
-        self.conn
-            .execute(
-                "DELETE FROM observation_tag WHERE observation_id IN (SELECT id FROM observation WHERE engram_id=?1)",
-                eid.clone(),
-            )
-            .await?;
-        for sql in [
-            "DELETE FROM observation WHERE engram_id=?1",
-            "DELETE FROM engram_tag WHERE engram_id=?1",
-            "DELETE FROM relation WHERE engram_id=?1",
-            "DELETE FROM link WHERE engram_id=?1",
-        ] {
+        // The observation tags first, while their observations still name
+        // them; none at all for an engram without observations.
+        let observations = query_all(&self.conn, OBSERVATION_IDS_SQL, eid.clone()).await?;
+        for row in &observations {
+            if let Some(observation) = cell_i64(row, 0) {
+                self.conn
+                    .execute(
+                        DELETE_OBSERVATION_TAGS_SQL,
+                        vec![Value::Integer(observation)],
+                    )
+                    .await?;
+            }
+        }
+        for sql in CHILD_ROWS_DELETE_SQL {
             self.conn.execute(sql, eid.clone()).await?;
         }
         Ok(())
@@ -973,6 +980,45 @@ fn value_rows(width: usize, count: usize, trailing: Option<&str>) -> String {
     rows.join(",")
 }
 
+/// How many engrams one page of the `engram_meta_value` backfill reads, so
+/// the migration's memory stays bounded on a large index.
+const BACKFILL_PAGE: i64 = 1000;
+
+/// Write one engram's `engram_meta_value` rows from its `metadata`, in the
+/// caller's transaction (see [`crate::store::meta_value_rows`]). The caller
+/// has cleared the old rows: [`TursoStore::delete_children`] on an update.
+async fn insert_meta_values(
+    conn: &Connection,
+    engram_id: i64,
+    metadata: &serde_json::Value,
+) -> Result<()> {
+    let rows: Vec<(i64, String, String)> = crate::store::meta_value_rows(metadata)
+        .into_iter()
+        .map(|(key, value)| (engram_id, key, value))
+        .collect();
+    insert_meta_rows(conn, &rows).await
+}
+
+/// Insert `(engram id, key, value)` rows into `engram_meta_value`, any number
+/// of engrams' rows per statement, [`INSERT_CHUNK`] rows at a time (three
+/// binds a row, under the 999-parameter ceiling).
+async fn insert_meta_rows(conn: &Connection, rows: &[(i64, String, String)]) -> Result<()> {
+    for batch in rows.chunks(INSERT_CHUNK) {
+        let mut params: Vec<Value> = Vec::with_capacity(batch.len() * 3);
+        for (engram_id, key, value) in batch {
+            params.push(Value::Integer(*engram_id));
+            params.push(Value::Text(key.clone()));
+            params.push(Value::Text(value.clone()));
+        }
+        let sql = format!(
+            "INSERT OR IGNORE INTO engram_meta_value(engram_id, key, value) VALUES {}",
+            value_rows(3, batch.len(), None)
+        );
+        conn.execute(&sql, params).await?;
+    }
+    Ok(())
+}
+
 /// The multi-row observation INSERT for `count` rows, returning each new row's id
 /// with its source line so observation tags map to the right observation without
 /// depending on `RETURNING` row order.
@@ -992,7 +1038,7 @@ fn resolve_pending_sql(table: &str) -> String {
 
 // --- the hot statements ------------------------------------------------------
 //
-// Named here rather than written inline in their methods so `tests/plans.rs`
+// Named here rather than written inline in their methods so `tests/it/plans.rs`
 // can explain the statement this store issues rather than a copy of it. Every
 // one of them is in the registry there, and a rewrite that costs one its index
 // fails with the name of the function that issues it. Nothing else about them
@@ -1010,6 +1056,50 @@ fn resolve_pending_sql(table: &str) -> String {
 #[doc(hidden)]
 pub const FILE_STAMPS_SQL: &str =
     "SELECT path, mtime, size, sha256 FROM engram WHERE domain_id=?1 AND actor = ''";
+
+/// The probe behind every upsert: the row of this actor at this path (an
+/// update), and any row of this actor that already holds this permalink
+/// under another path (a duplicate the batch reports instead of failing on).
+///
+/// Two arms, each a full-key seek of its own unique index. One `OR` over the
+/// two is planned as a walk of `idx_engram_domain`, which every upsert then
+/// paid in full: quadratic over a first index, twice that over a full
+/// reindex. A row that matches both arms comes back twice, which the caller
+/// reads as the same id.
+#[doc(hidden)]
+pub const UPSERT_PROBE_SQL: &str = "SELECT id, path FROM engram WHERE domain_id=?1 AND path=?2 AND actor=?4 \
+     UNION ALL SELECT id, path FROM engram WHERE domain_id=?1 AND permalink=?3 AND actor=?4";
+
+/// The ids of one engram's observations, read before their tags are deleted.
+#[doc(hidden)]
+pub const OBSERVATION_IDS_SQL: &str = "SELECT id FROM observation WHERE engram_id=?1";
+
+/// The tags of one observation. One statement per observation rather than one
+/// `IN (SELECT ...)` or `IN (?, ?, ...)` for the engram: turso builds either
+/// list in an ephemeral table, which is a temp directory and a temp file per
+/// statement, and an engram without observations then pays nothing at all.
+#[doc(hidden)]
+pub const DELETE_OBSERVATION_TAGS_SQL: &str = "DELETE FROM observation_tag WHERE observation_id=?1";
+
+/// The other child rows of one engram, each through its `engram_id` index.
+#[doc(hidden)]
+pub const CHILD_ROWS_DELETE_SQL: [&str; 5] = [
+    "DELETE FROM observation WHERE engram_id=?1",
+    "DELETE FROM engram_tag WHERE engram_id=?1",
+    "DELETE FROM engram_meta_value WHERE engram_id=?1",
+    "DELETE FROM relation WHERE engram_id=?1",
+    "DELETE FROM link WHERE engram_id=?1",
+];
+
+/// Every statement `delete_children` can run, with the engram id
+/// (or, for the tag delete, an observation id) as `?1`. Named so
+/// `tests/it/turso_only.rs` can explain each one.
+#[doc(hidden)]
+pub fn child_delete_statements() -> Vec<&'static str> {
+    let mut all = vec![OBSERVATION_IDS_SQL, DELETE_OBSERVATION_TAGS_SQL];
+    all.extend(CHILD_ROWS_DELETE_SQL);
+    all
+}
 
 /// The read behind [`Store::contradiction_pairs_scored`], one domain's pair
 /// rows for one model through `idx_contradiction_pair_domain`.
@@ -1062,6 +1152,37 @@ pub const DELETE_ENGRAM_CONTRADICTIONS_SQL: &str =
 #[doc(hidden)]
 pub const DELETE_ENGRAM_CONTRADICTION_PAIRS_SQL: &str =
     "DELETE FROM contradiction_pair WHERE engram_a=?1 OR engram_b=?1";
+
+/// The wikilinks that name one engram, unbound by [`Store::delete_engram`]
+/// and [`Store::clear_overlay_entry`] through `idx_link_to`: a row in any
+/// domain that pointed at the deleted engram reads as pending again, and the
+/// next write at that address binds it once more through the ordinary resolve
+/// passes.
+#[doc(hidden)]
+pub const UNBIND_INBOUND_LINKS_SQL: &str = "UPDATE link SET to_id = NULL WHERE to_id = ?1";
+
+/// The relation twin of [`UNBIND_INBOUND_LINKS_SQL`], through `idx_relation_to`.
+#[doc(hidden)]
+pub const UNBIND_INBOUND_RELATIONS_SQL: &str = "UPDATE relation SET to_id = NULL WHERE to_id = ?1";
+
+/// The wikilinks from other domains that name an engram of a domain being
+/// cleared, unbound by [`Store::clear_domain`] before the engram rows go: the
+/// subquery seeks `idx_engram_domain`, each match seeks `idx_link_to`. The
+/// domain's own links are already deleted by then, so only inbound rows from
+/// elsewhere are touched, and they read as pending again.
+// -- actor: all - the clear takes every actor's engram rows in the domain,
+// so every reference that named one of them is unbound, a draft's too.
+#[doc(hidden)]
+pub const CLEAR_DOMAIN_UNBIND_INBOUND_LINKS_SQL: &str =
+    "UPDATE link SET to_id = NULL WHERE to_id IN (SELECT id FROM engram WHERE domain_id = ?1)";
+
+/// The relation twin of [`CLEAR_DOMAIN_UNBIND_INBOUND_LINKS_SQL`], through
+/// `idx_relation_to`.
+// -- actor: all - the clear takes every actor's engram rows in the domain,
+// so every reference that named one of them is unbound, a draft's too.
+#[doc(hidden)]
+pub const CLEAR_DOMAIN_UNBIND_INBOUND_RELATIONS_SQL: &str =
+    "UPDATE relation SET to_id = NULL WHERE to_id IN (SELECT id FROM engram WHERE domain_id = ?1)";
 
 /// The read behind [`Store::scored_pair_count`], through
 /// `idx_contradiction_pair_model`: unlike [`CONTRADICTION_PAIRS_SCORED_SQL`],
@@ -1334,6 +1455,26 @@ impl Store for TursoStore {
         Ok(rows
             .iter()
             .filter_map(|r| Some((cell_text(r, 0)?, DomainId(cell_i64(r, 1)?))))
+            .collect())
+    }
+
+    async fn meta_values(&self) -> Result<Vec<(EngramId, String, String)>> {
+        // TEXT sorts byte-wise here, as in `domain_spellings`.
+        let rows = query_all(
+            &self.conn,
+            "SELECT engram_id, key, value FROM engram_meta_value ORDER BY engram_id, key, value",
+            Vec::new(),
+        )
+        .await?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| {
+                Some((
+                    EngramId(cell_i64(r, 0)?),
+                    cell_text(r, 1)?,
+                    cell_text(r, 2)?,
+                ))
+            })
             .collect())
     }
 
@@ -1780,10 +1921,17 @@ impl Store for TursoStore {
             "DELETE FROM observation_tag WHERE observation_id IN \
              (SELECT o.id FROM observation o JOIN engram e ON e.id=o.engram_id WHERE e.domain_id=?1)",
             "DELETE FROM engram_tag WHERE engram_id IN (SELECT id FROM engram WHERE domain_id=?1)",
+            "DELETE FROM engram_meta_value WHERE engram_id IN (SELECT id FROM engram WHERE domain_id=?1)",
             "DELETE FROM chunk WHERE engram_id IN (SELECT id FROM engram WHERE domain_id=?1)",
             "DELETE FROM observation WHERE engram_id IN (SELECT id FROM engram WHERE domain_id=?1)",
             "DELETE FROM relation WHERE domain_id=?1",
             "DELETE FROM link WHERE domain_id=?1",
+            // Every reference from another domain that named one of these
+            // engrams goes back to pending before the rows go, in whatever
+            // transaction the caller holds, as `delete_engram` does: a `to_id`
+            // naming a row nobody holds would read as resolved forever.
+            CLEAR_DOMAIN_UNBIND_INBOUND_LINKS_SQL,
+            CLEAR_DOMAIN_UNBIND_INBOUND_RELATIONS_SQL,
             // -- actor: all - the bodies of every row about to go, named
             // through them since `engram_content` has no domain of its own.
             "DELETE FROM engram_content WHERE engram_id IN \
@@ -1826,6 +1974,12 @@ impl Store for TursoStore {
                 self.conn.execute(sql, vec![Value::Integer(id)]).await?;
             }
             self.delete_children(id).await?;
+            // Every reference that named this engram, from any domain and any
+            // actor, goes back to pending in the same transaction: a `to_id`
+            // naming a row nobody holds would read as resolved forever.
+            for sql in [UNBIND_INBOUND_LINKS_SQL, UNBIND_INBOUND_RELATIONS_SQL] {
+                self.conn.execute(sql, vec![Value::Integer(id)]).await?;
+            }
             self.conn
                 .execute(
                     "DELETE FROM chunk WHERE engram_id=?1",
@@ -3401,6 +3555,14 @@ impl Store for TursoStore {
             return Ok(false);
         };
         self.delete_children(id).await?;
+        // Every reference that named this draft, from any domain, goes back
+        // to pending in the same transaction, as `delete_engram` does for a
+        // base row: a `to_id` naming a row nobody holds would read as
+        // resolved forever. The author's own references in this domain are
+        // bound again by the engine's re-resolve pass right after.
+        for sql in [UNBIND_INBOUND_LINKS_SQL, UNBIND_INBOUND_RELATIONS_SQL] {
+            self.conn.execute(sql, vec![Value::Integer(id)]).await?;
+        }
         self.conn
             .execute(
                 "DELETE FROM chunk WHERE engram_id=?1",
@@ -4024,7 +4186,7 @@ mod tests {
     /// The resolve pass seeks the title index on the arm that needs it.
     ///
     /// The in-source twin of the registry's two `resolve_pending_*` entries
-    /// (`tests/plans.rs`), kept rather than folded into it: the registry asks
+    /// (`tests/it/plans.rs`), kept rather than folded into it: the registry asks
     /// the general question - does any arm of this statement scan a guarded
     /// table - and this asks the specific one, which index each arm seeks, by
     /// name. A statement can lose the title index to a rewrite that still has

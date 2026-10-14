@@ -17,6 +17,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod address;
 pub mod attachment;
+pub mod base;
 pub mod config;
 pub mod emit;
 pub mod engram;
@@ -27,6 +28,7 @@ pub mod index;
 pub mod jsonc_edit;
 pub mod line_endings;
 pub mod manifest;
+pub mod manifest_view;
 pub mod names;
 pub mod parse;
 pub mod path;
@@ -34,10 +36,12 @@ pub mod prompt;
 pub mod provision;
 pub mod relink;
 pub mod schema;
+pub mod secret_env;
 pub mod similarity;
 pub mod skills;
 pub mod tags;
 pub mod temporal;
+pub mod text;
 pub mod verify;
 pub mod yaml;
 
@@ -52,8 +56,9 @@ pub use attachment::{
 };
 pub use emit::emit_engram;
 pub use engram::{
-    EVOLVE_ACK_KEY, Engram, EvolveAck, Frontmatter, Generated, Heading, LinkTarget, Observation,
-    RECOMMENDED_STATUSES, RECOMMENDED_TYPES, Relation, SchemaDef, Verification, Verified, WikiLink,
+    EVOLVE_ACK_KEY, Engram, EvolveAck, Frontmatter, Generated, Heading, LinkTarget,
+    META_KEY_MAX_BYTES, META_VALUE_MAX_BYTES, Observation, RECOMMENDED_STATUSES, RECOMMENDED_TYPES,
+    Relation, SchemaDef, Verification, Verified, WikiLink, meta_value_text,
 };
 pub use harness::profile::{
     CommandSpelling, EntryShape, HookDialect, HostSignal, McpStyle, PathSpec, PointerStyle,
@@ -68,9 +73,10 @@ pub use line_endings::{NotUtf8, to_lf, utf8_to_lf};
 pub use manifest::{
     ArtifactType, DOMAIN_NAME_KEY, GENERATED_INDEXES_KEY, GeneratedIndexes, Manifest, PolicyKey,
     PolicyKind, PolicyRole, ProblemKind, ProvisioningDecl, ProvisioningProblem,
-    ProvisioningSection, SHARING_KEY, Sharing, StarterStanza, TagAliasDecl, TagAliasProblem,
-    TagAliasProblemKind, TagAliasSection, append_tag_alias, domain_name_at, domain_name_of_source,
-    generated_indexes_at, in_root_artifact_dirs, manifest_template, policy_registry, sharing_at,
+    ProvisioningSection, READ_ONLY_KEY, ReadOnly, SHARING_KEY, Sharing, StarterStanza,
+    TagAliasDecl, TagAliasProblem, TagAliasProblemKind, TagAliasSection, append_tag_alias,
+    domain_name_at, domain_name_of_source, generated_indexes_at, in_root_artifact_dirs,
+    manifest_template, policy_registry, read_only_at, read_only_of_source, sharing_at,
     starter_stanzas, tag_alias_pairs,
 };
 pub use names::{NameInput, NameTable};
@@ -99,6 +105,7 @@ pub use tags::{fold_tag, is_lower_hyphen, retag};
 pub use temporal::{
     DATE_FIELDS, DateFieldError, VerifiedFieldError, normalize_temporal_fields, normalize_verified,
 };
+pub use text::plural;
 pub use verify::{Issue, Severity, VerifyOptions, VerifyReport, verify_paths};
 pub use yaml::YamlValue;
 

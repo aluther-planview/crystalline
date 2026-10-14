@@ -58,6 +58,8 @@ import type {
   StarterStanza,
 } from "../api/domain";
 import { DOMAINS_QUERY_KEY, fetchDomains } from "../api/domains";
+import { DomainLockChip } from "../components/DomainLockChip";
+import { useDomainWritable } from "../domainWritable";
 import type { EngramFilters, EngramPage, ListingOrder } from "../api/engrams";
 import {
   NO_FILTERS,
@@ -70,6 +72,7 @@ import { fetchMembers, membersKey, sameAccount } from "../api/members";
 import { fetchTags, vocabularyKey } from "../api/vocabulary";
 import type { TagCount } from "../api/vocabulary";
 import { useAuth } from "../auth/AuthContext";
+import { navigateTo } from "../base";
 import { NO_COMMANDS, useRegisterCommands } from "../commands";
 import type { PaletteCommand } from "../commands";
 import { BackupCard } from "../components/BackupCard";
@@ -195,6 +198,7 @@ function DomainPage({
   folders: string[];
 }) {
   const { user, capabilities } = useAuth();
+  const { canWrite, domainLocked } = useDomainWritable(domain);
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   /**
@@ -393,7 +397,7 @@ function DomainPage({
     const rows: PaletteCommand[] = [];
     // Every write row here drops out while renaming: the keyboard route
     // does not get to reach a control the page itself shows disabled.
-    if (capabilities.canWrite && !isRenaming) {
+    if (canWrite && !isRenaming) {
       rows.push({
         id: "create",
         title: "New engram",
@@ -403,7 +407,11 @@ function DomainPage({
       });
     }
     if (capabilities.canAdminister) {
-      if (manifestEditable && !isRenaming) {
+      // The MANIFEST editor and the import write into the domain, so they ask
+      // `canWrite` as well: neither is offered on a locked domain or to an
+      // admin whose write list leaves it out. The policies card stays, since
+      // that is where a person switches the lock off.
+      if (canWrite && manifestEditable && !isRenaming) {
         rows.push({
           id: "manifest-edit",
           title: "Edit MANIFEST",
@@ -421,10 +429,10 @@ function DomainPage({
         // press a link that may not even be rendered. Not a write, so it is
         // not withheld while renaming.
         run: () => {
-          window.location.assign(archiveDownloadUrl(domain));
+          navigateTo(archiveDownloadUrl(domain));
         },
       });
-      if (!isRenaming) {
+      if (canWrite && !isRenaming) {
         rows.push({
           id: "import-archive",
           title: "Import archive",
@@ -446,8 +454,8 @@ function DomainPage({
     return rows.length === 0 ? NO_COMMANDS : rows;
   }, [
     canUnregister,
+    canWrite,
     capabilities.canAdminister,
-    capabilities.canWrite,
     domain,
     isRenaming,
     manifestEditable,
@@ -471,6 +479,7 @@ function DomainPage({
             that named this domain on the way here.
           */}
           {summary?.private === true && <Chip variant="accent">private</Chip>}
+          {domainLocked && <DomainLockChip />}
           {/*
             Reached only by the domain's owner or an instance admin - the
             exact rule the danger zone's own controls follow, since it is the
@@ -703,7 +712,7 @@ function DomainPage({
             document: while the read is in flight, and after one the server
             refused.
           */}
-          {capabilities.canAdminister && manifestEditable && (
+          {capabilities.canAdminister && canWrite && manifestEditable && (
             <>
               <Link
                 to={manifestEditRoute(domain)}
@@ -744,7 +753,10 @@ function DomainPage({
           pending={manifest.isPending}
           error={manifest.error}
           onStart={
-            capabilities.canAdminister && manifestEditable && !isRenaming
+            capabilities.canAdminister &&
+            canWrite &&
+            manifestEditable &&
+            !isRenaming
               ? (section) => {
                   void navigate(manifestEditRoute(domain), {
                     state: { seedSection: section },
@@ -844,6 +856,7 @@ function DomainPage({
           onImport={() => {
             setImporting(true);
           }}
+          canImport={canWrite}
           renaming={isRenaming}
         />
       )}
@@ -874,7 +887,7 @@ function FolderPage({
   path: string;
   folders: string[];
 }) {
-  const { capabilities } = useAuth();
+  const { canWrite } = useDomainWritable(domain);
   const { filters, browse, filtering, listingOrder, apply } = useListingState();
   const [creating, setCreating] = useState(false);
   const tags = useQuery({
@@ -899,7 +912,7 @@ function FolderPage({
 
   const commands = useMemo<readonly PaletteCommand[]>(
     () =>
-      capabilities.canWrite
+      canWrite
         ? [
             {
               id: "create",
@@ -910,7 +923,7 @@ function FolderPage({
             },
           ]
         : NO_COMMANDS,
-    [capabilities.canWrite],
+    [canWrite],
   );
   useRegisterCommands(commands);
 
@@ -1035,7 +1048,7 @@ function EngramsSection({
    */
   renaming?: boolean;
 }) {
-  const { capabilities } = useAuth();
+  const { canWrite } = useDomainWritable(domain);
   const newEngramReasonId = useId();
   const newEngramDisabledReason = renaming ? RENAMING_REASON : undefined;
 
@@ -1045,7 +1058,7 @@ function EngramsSection({
         <h2 id="domain-engrams" className="text-section">
           Engrams
         </h2>
-        {capabilities.canWrite && (
+        {canWrite && (
           <>
             <button
               type="button"
@@ -1231,6 +1244,7 @@ function ManifestPanel({
   const empty =
     isMissing(error) ||
     manifest === undefined ||
+    manifest.missing ||
     manifest.markdown.trim() === "";
   // A read that 404ed carries no sections and so no starters either: the
   // registry travels with the manifest payload, and there is no payload. That

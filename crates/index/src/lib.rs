@@ -38,7 +38,8 @@ pub use embed::{
     ModelDownload, SnapshotChoice, cached_model_dirs, choose_snapshot, chunk_engram,
     configured_model_id, download_local_model, hub_dir_name, local_model, lookup_local_model,
     older_snapshot_warning, order_jobs_for_batching, provider_from_config, prune_model_cache,
-    retire_older_snapshots, run_embedding_pass, run_embedding_pass_with_page, update_local_model,
+    remove_stale_model_lock_dirs, retire_older_snapshots, run_embedding_pass,
+    run_embedding_pass_with_page, stale_model_lock_dirs, update_local_model,
 };
 pub use error::{IndexError, Result, SCHEMA_TOO_NEW_OPENING, is_schema_too_new_text};
 pub use factory::{open_store, store_location};
@@ -54,7 +55,7 @@ pub use store::{
     StoredEngram, TagAlias, TagCount, Vocabulary, WorkClaim, is_current_status, is_retired_status,
     lookup_in_domain, merge_vocabularies, parse_metadata_filters, retired_factor, salience_prior,
 };
-/// The shared statement builders, reachable from `tests/plans.rs` and from
+/// The shared statement builders, reachable from `tests/it/plans.rs` and from
 /// nothing else.
 ///
 /// `mod store` is private, and the hot-statement registry lives in an
@@ -69,9 +70,10 @@ pub use store::{
 /// own argument type is crate-private.
 #[doc(hidden)]
 pub use store::{
-    count_references_to_sql, link_frontier_sql, referencing_domains_sql, relation_frontier_sql,
-    reset_spelled_references_sql, resolve_pending_sql, resolve_references_to_sql,
-    resolve_spelled_references_sql, spelled_references_sql,
+    count_references_to_sql, link_frontier_sql, meta_value_match_sql, meta_value_union_sql,
+    referencing_domains_sql, relation_frontier_sql, reset_spelled_references_sql,
+    resolve_pending_sql, resolve_references_to_sql, resolve_spelled_references_sql,
+    spelled_references_sql,
 };
 pub use sweep::{
     AckCounts, AckEntry, Class, EngramFacts, FactObservation, Family, Finding, MIN_CONTENT_LINES,

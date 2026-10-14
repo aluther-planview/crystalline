@@ -329,9 +329,15 @@ impl<'a> DomainView<'a> {
         name: &str,
         scope: &crate::scope::Scope,
     ) -> Result<DomainView<'a>> {
+        engine.refuse_shadowed(name)?;
         // A domain a rename has paused is waited for before anything is
         // decided about it, and this write is counted until the view goes.
         let ticket = engine.enter_write(name).await?;
+        // A read-only domain takes no write at all, screened so a domain this
+        // caller may not see answers as unregistered rather than as locked.
+        // After the ticket, so a domain a rename has paused is read once the
+        // rename is done with it.
+        engine.refuse_read_only_domain(name, scope).await?;
         let seen = |actor: Option<String>| DomainView {
             engine,
             domain: name.to_string(),
@@ -386,15 +392,36 @@ impl<'a> DomainView<'a> {
         scope: &crate::scope::Scope,
         join: Option<&crate::join::Join>,
     ) -> Result<DomainView<'a>> {
+        engine.refuse_shadowed(name)?;
         let joined = join.filter(|j| j.domain == name && engine.reviews_changes(name));
         let Some(join) = joined else {
             return DomainView::for_write(engine, name, scope).await;
         };
         let ticket = engine.enter_write(name).await?;
         engine.require_domain(name, scope).await?;
+        engine.refuse_read_only_domain(name, scope).await?;
         let mut view = DomainView::for_actor(engine, name, &HashSet::new(), &join.owner)?;
         view.joined = Some(join.owner.clone());
         view.writer = crate::scope::overlay_actor(scope);
+        view._writing = Some(ticket);
+        Ok(view)
+    }
+
+    /// The one write view that skips the read-only check: the owner switching
+    /// `read_only` back off, and nothing else (the guard
+    /// `only_edit_manifest_policies_reaches_the_unlock_view` names its one
+    /// caller, `Engine::edit_manifest_policies`).
+    ///
+    /// Always the base view, even in a domain that reviews changes: the flag
+    /// is read off the base MANIFEST, and a switch-off parked in a draft could
+    /// never land, since sharing is refused while the flag holds. A hidden
+    /// local domain is refused as `for_write` refuses it (0.23 D19). The
+    /// caller has already checked that the change is exactly the switch-off
+    /// and that the caller owns the domain.
+    pub(crate) async fn for_unlock(engine: &'a Engine, name: &str) -> Result<DomainView<'a>> {
+        engine.refuse_shadowed(name)?;
+        let ticket = engine.enter_write(name).await?;
+        let mut view = DomainView::base(engine, name, &HashSet::new())?;
         view._writing = Some(ticket);
         Ok(view)
     }
@@ -1977,9 +2004,8 @@ impl<'a> DomainView<'a> {
     /// **This one does read the file**, because a row carries a checksum and a
     /// checksum is a fact about bytes. It is the listing's builder for that
     /// reason and nothing else's: a read hashes the bytes it is about to return
-    /// ([`DomainView::own_attachment`]) and a size question is answered by a
-    /// stat ([`DomainView::attachment_delete_size`]), so neither of them comes
-    /// through here.
+    /// ([`DomainView::own_attachment`]) and the delete asks the file's
+    /// metadata, so neither of them comes through here.
     fn overlay_attachment_row(
         &self,
         state_dir: &Path,
@@ -2008,36 +2034,6 @@ impl<'a> DomainView<'a> {
             return Ok((bytes, row));
         }
         self.engine.attachment_read(&self.domain, path).await
-    }
-
-    /// What deleting one attachment would take away, for a preview that must
-    /// never be stricter than the act it previews.
-    ///
-    /// The same three-way answer [`DomainView::attachment_bytes`] gives, which
-    /// is what keeps that rule true in review mode: a draft-only file the
-    /// delete would remove has a size here rather than a miss, and a path this
-    /// actor has already deleted is a miss here rather than the folder's size.
-    pub(crate) async fn attachment_delete_size(&self, path: &str) -> Result<u64> {
-        match self.own_held(path)? {
-            Some(crate::overlay_files::Held::Bytes) => {
-                let state_dir = self.files_state_dir()?;
-                let actor = self.actor.as_deref().unwrap_or_default();
-                // A stat, never a read - see [`crate::overlay_files::size`].
-                // The path was there a moment ago and can be gone now, which is
-                // the race the folder arm answers by falling through to the
-                // recorded row; there is no row here, so a file that vanished
-                // under the preview is a miss.
-                crate::overlay_files::size(&state_dir, &self.domain, actor, path)
-                    .map_err(|e| self.files_io(path, e))?
-                    .ok_or_else(|| {
-                        EngineError::NotFound(crate::engine::missing_attachment(&self.domain, path))
-                    })
-            }
-            Some(crate::overlay_files::Held::Tombstone) => Err(EngineError::NotFound(
-                crate::engine::missing_attachment(&self.domain, path),
-            )),
-            _ => self.engine.attachment_delete_size(&self.domain, path).await,
-        }
     }
 
     /// What this actor holds at `path` in the files overlay, or [`None`] on the

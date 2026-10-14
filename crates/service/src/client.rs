@@ -213,6 +213,18 @@ pub async fn run_mcp(
     // re-sent on each daemon reconnect and never re-derived daemon-side.
     let harness_gate = resolve_harness_gate(harness);
 
+    // Inside an app package (Claude Desktop's MSIX package on Windows) this
+    // process is only a bridge to the daemon outside: every file it wrote
+    // under AppData would land in the package's private copy. So it never
+    // serves the embedded stack, not even when asked to.
+    let packaged = crate::runs_in::PackageContext::here().is_packaged();
+    if embedded && packaged {
+        tracing::warn!(
+            "--embedded is ignored inside an app package: this process only bridges to the daemon outside"
+        );
+    }
+    let embedded = embedded && !packaged;
+
     // Read the client's first line concurrently with daemon acquisition, so a
     // cold daemon spawns while the client is still composing its opener rather
     // than afterwards.
@@ -243,7 +255,7 @@ pub async fn run_mcp(
             let conn = ensure_daemon(true, db, config_path, read_only).await?;
             conn.into_mcp(harness_gate)
                 .await
-                .map_err(|e| anyhow::anyhow!("daemon MCP handshake failed ({e})"))
+                .map_err(|e| anyhow::Error::new(e).context("daemon MCP handshake failed"))
         });
         (opened, Some(daemon))
     };
@@ -267,7 +279,15 @@ pub async fn run_mcp(
             Ok(stream) => {
                 return pump_stdio(stream, primed, db, config_path, read_only, harness_gate).await;
             }
-            Err(e) => tracing::warn!("no daemon available ({e}); running embedded"),
+            Err(e) if packaged => {
+                let bridge = crate::daemon_task::BridgeFailure::of(&e);
+                tracing::warn!(
+                    "this process runs inside an app package and only bridges to the daemon: {bridge}"
+                );
+                let status = crate::stub::StubStatus::for_bridge(format!("{e:#}"), bridge);
+                return serve_degraded_stub(status, primed).await;
+            }
+            Err(e) => tracing::warn!("no daemon available ({e:#}); running embedded"),
         }
     }
 
@@ -288,7 +308,7 @@ pub async fn run_mcp(
             tracing::error!(
                 "crystalline mcp cannot start ({e:#}); serving a degraded status server"
             );
-            let status = crate::stub::StubStatus::gather(format!("{e:#}"));
+            let status = crate::stub::StubStatus::gather(format!("{e:#}")).await;
             match serve_degraded_stub(status, primed).await {
                 Ok(()) => Ok(()),
                 Err(stub_err) => {
@@ -600,6 +620,8 @@ struct EmbeddedStack {
     /// can take its store before the process leaves.
     engine: Arc<Engine>,
     ownership: crate::instance::Ownership,
+    /// Stops the source poller when the session ends.
+    stop_sources: tokio::sync::watch::Sender<bool>,
 }
 
 /// Build the full in-process stack: take the index lock (refused if held),
@@ -646,6 +668,29 @@ async fn build_embedded(
     // A rename a stopped daemon left half done is finished before the first
     // sync and before the routing cache reads a name, as the daemon does.
     engine.finish_leftover_rename().await;
+    // This machine's sources, once that rename is done (its recovery reads
+    // names the mount table could hide). An explicit --db or --config serves
+    // this machine's own index only.
+    //
+    // With them, the daemon's source poller, run here because this stack is
+    // the one serving the session: a `connect` or `disconnect` made while it
+    // runs, and a hand edit of sources.json or config.yaml, show within the
+    // look, and the routing caches refresh on the poll as they do in a
+    // daemon. Its own task, so the start never waits on a server.
+    let (stop_sources, stopped) = tokio::sync::watch::channel(false);
+    if use_daemon(db, config_path) {
+        crate::route::install_sources(&engine);
+        let e = engine.clone();
+        tokio::spawn(async move {
+            crate::daemon::run_source_poller(
+                e,
+                crate::daemon::SOURCE_POLL,
+                crate::daemon::SOURCE_LOOK,
+                stopped,
+            )
+            .await;
+        });
+    }
 
     let bg = engine.clone();
     let bg_config = loaded.effective.clone();
@@ -676,6 +721,7 @@ async fn build_embedded(
         server: McpServer::new(engine.clone()).with_harness_gate(harness_gate),
         engine,
         ownership,
+        stop_sources,
     })
 }
 
@@ -702,12 +748,17 @@ where
         "stopping (the client closed the session); exiting within {}s",
         SHUTDOWN_DEADLINE.as_secs()
     );
+    let _ = stack.stop_sources.send(true);
     let departure = Departure::begin(stack.ownership, SHUTDOWN_DEADLINE);
     // Held to the exit, as in the daemon: an operation already inside the
     // store finishes and no new one starts.
     departure.step("waiting for the store");
     let store = stack.engine.store();
     let _held = store.lock().await;
+    // Then a sign-in refresh a source call started, which runs as a task of
+    // its own, is waited for with what is left of the deadline, so a token
+    // pair the server rotated is saved.
+    departure.settle_sign_ins().await;
     departure.finish(None)
 }
 
@@ -774,6 +825,20 @@ async fn open_standalone_finishing(
     db: Option<&Path>,
     config_path: Option<&Path>,
 ) -> anyhow::Result<(Engine, Option<Value>)> {
+    open_standalone_noting(loaded, db_path, want_embeddings, db, config_path, true).await
+}
+
+/// [`open_standalone_finishing`], printing the bypass note only when `note`
+/// is set: a caller that opens a copy of an index on purpose has nothing to
+/// tell the person about the daemon.
+async fn open_standalone_noting(
+    loaded: overlay::LoadedConfig,
+    db_path: &Path,
+    want_embeddings: bool,
+    db: Option<&Path>,
+    config_path: Option<&Path>,
+    note: bool,
+) -> anyhow::Result<(Engine, Option<Value>)> {
     // Postgres has no local file, so naming one in a failure would point at a
     // path nothing lives at.
     let location = if loaded.effective.database().backend
@@ -796,7 +861,7 @@ async fn open_standalone_finishing(
             ))
         })?
         .with_machine_owner_lookup(machine_owner_for_engine());
-    if bypassed {
+    if bypassed && note {
         eprintln!("Daemon: {}", crate::instance::BYPASS_NOTE);
     }
     let finished = finish_leftover_rename_owned(&engine).await;
@@ -897,7 +962,27 @@ pub async fn run_tool(
     let want_embeddings = matches!(tool, "search_engrams");
     let engine =
         open_standalone_reporting(loaded, &db_path, want_embeddings, db, config_path).await?;
-    dispatch_engine(&engine, tool, args).await
+    // An explicit --db or --config keeps every verb on this machine's own
+    // index, as it keeps it off the daemon; otherwise the sources are this
+    // machine's, read from disk for this one command. The opener above has
+    // already finished any rename an earlier run left half done.
+    let engine = Arc::new(engine);
+    if use_daemon(db, config_path) {
+        crate::route::install_sources(&engine);
+    }
+    let answer = crate::route::run_tool_routed(
+        &engine,
+        tool,
+        args,
+        &crystalline_remote::ForwardedAgent::default(),
+        None,
+    )
+    .await;
+    // A refresh a source call started runs as a task of its own: this
+    // process waits for it before it leaves, so a token pair the server
+    // rotated is saved.
+    crystalline_remote::settle_refreshes(crystalline_remote::ONE_DOMAIN_LIMIT).await;
+    answer
 }
 
 /// Scaffold a virtual domain's MANIFEST from prebuilt markdown: over the daemon
@@ -1013,6 +1098,22 @@ pub async fn domain_export(
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
     let domain = localize_standalone(&engine, domain).await;
     Ok(engine.export_domain(&domain, dest, force, dry_run).await?)
+}
+
+/// [`domain_export`] from an index file that is not this machine's own (a
+/// copy taken on purpose), opened directly and never through the daemon,
+/// without the bypass note an explicit `--db` prints.
+pub async fn domain_export_from_copy(
+    domain: &str,
+    dest: &Path,
+    db: &Path,
+    config_path: &Path,
+) -> anyhow::Result<Value> {
+    let loaded = overlay::load(Some(config_path))?;
+    let (engine, _) =
+        open_standalone_noting(loaded, db, false, Some(db), Some(config_path), false).await?;
+    let domain = localize_standalone(&engine, domain).await;
+    Ok(engine.export_domain(&domain, dest, true, false).await?)
 }
 
 /// What the index still holds for domains nobody registers any more, and,
@@ -1193,6 +1294,11 @@ pub async fn domain_remove(
                 config_file.display()
             )
         })?;
+    // This machine's sources, as the daemon has them: a local copy a
+    // connected server hides is refused here too (decision D19).
+    if use_daemon(db, config_path) {
+        crate::route::install_sources(&engine);
+    }
     let name = localize_standalone(&engine, name).await;
     let name = name.as_str();
     if let Ok(auth_path) = crystalline_core::config::web_auth_db_path()
@@ -1261,6 +1367,13 @@ pub async fn domain_rename(
         && report["domain"] == new
     {
         return Ok(report);
+    }
+    // This machine's sources, as the daemon has them: a local copy a
+    // connected server hides is refused here too (decision D19). Installed
+    // only now, after the opener finished any rename an earlier run left
+    // half done, because that recovery reads names the table would hide.
+    if use_daemon(db, config_path) {
+        crate::route::install_sources(&engine);
     }
     // A rename runs only while this process holds the state directory, as a
     // daemon does; the engine refuses it otherwise, in words that name the
@@ -1613,22 +1726,26 @@ pub async fn origin_status(
 /// The standalone path shares as [`ShareActor::Owner`], as the three write
 /// verbs below do: a CLI invocation has no account behind it, so the machine
 /// owner is who it is, not a placeholder for one.
+#[allow(clippy::too_many_arguments)]
 pub async fn origin_share(
     domain: &str,
     title: Option<&str>,
     description: Option<&str>,
     proposal: Option<u64>,
     files: Option<&[String]>,
+    as_proposal: Option<bool>,
     db: Option<&Path>,
     config_path: Option<&Path>,
 ) -> anyhow::Result<Value> {
-    use serde_json::json;
     if use_daemon(db, config_path)
-        && let Some(data) = ctl_if_running(json!({
-            "v": 1, "cmd": "origin_share", "domain": domain,
-            "title": title, "description": description, "proposal": proposal,
-            "files": files,
-        }))
+        && let Some(data) = ctl_if_running(origin_share_request(
+            domain,
+            title,
+            description,
+            proposal,
+            files,
+            as_proposal,
+        ))
         .await?
     {
         return Ok(data);
@@ -1638,15 +1755,35 @@ pub async fn origin_share(
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
     let domain = localize_standalone(&engine, domain).await;
     Ok(engine
-        .origin_share(
+        .origin_share_with(
             &domain,
             title,
             description,
             proposal,
             files,
+            as_proposal,
             ShareActor::Owner,
         )
         .await?)
+}
+
+/// The control-socket request [`origin_share`] sends, built in one place so
+/// the daemon's reader (`control::share_request`) is tested against exactly
+/// these keys: a key spelled differently on one side would read as absent,
+/// and an absent `as_proposal` lets a share commit directly.
+pub(crate) fn origin_share_request(
+    domain: &str,
+    title: Option<&str>,
+    description: Option<&str>,
+    proposal: Option<u64>,
+    files: Option<&[String]>,
+    as_proposal: Option<bool>,
+) -> Value {
+    serde_json::json!({
+        "v": 1, "cmd": "origin_share", "domain": domain,
+        "title": title, "description": description, "proposal": proposal,
+        "files": files, "as_proposal": as_proposal,
+    })
 }
 
 /// Withdraw a share proposal for one team domain: over the daemon when one
@@ -1700,7 +1837,10 @@ pub async fn origin_changes(
     let db_path = resolve_db(db)?;
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
     let domain = localize_standalone(&engine, domain).await;
-    Ok(crate::control::origin_changes_inline(&engine, &domain, path, sides).await?)
+    Ok(
+        crate::control::origin_changes_inline(&engine, &domain, path, sides, &ShareActor::Owner)
+            .await?,
+    )
 }
 
 /// Put named paths of one team domain back the way the team has them, for
@@ -1819,7 +1959,7 @@ pub async fn configure(
             let key = key.ok_or_else(|| anyhow::anyhow!("configure set requires a key"))?;
             let value = value.ok_or_else(|| anyhow::anyhow!("configure set requires a value"))?;
             let mut file = loaded.file.clone();
-            crate::settings::apply(&mut file, key, value)?;
+            crate::settings::apply_checked(&mut file, &loaded.overlay, key, value)?;
             save_file(&loaded.path, &file)?;
             Ok(setting_view(&file, key, &loaded.overlay))
         }
@@ -1829,7 +1969,7 @@ pub async fn configure(
             }
             let key = key.ok_or_else(|| anyhow::anyhow!("configure unset requires a key"))?;
             let mut file = loaded.file.clone();
-            crate::settings::unset(&mut file, key)?;
+            crate::settings::unset_checked(&mut file, &loaded.overlay, key)?;
             save_file(&loaded.path, &file)?;
             Ok(setting_view(&file, key, &loaded.overlay))
         }

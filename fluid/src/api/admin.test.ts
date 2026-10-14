@@ -1043,6 +1043,10 @@ describe("the admin client layer", () => {
       sharing: "proposal",
       branch: null,
       title: null,
+      // A plan that names no owner reads as the caller's own, as from an older server.
+      own: true,
+      // No note: the plain share needs no sentence about how it will go.
+      note: null,
     });
     // And the key it is cached under, which is deliberately not one of the
     // `["domains", ...]` keys every other read of a domain is filed under:
