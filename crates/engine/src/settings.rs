@@ -258,6 +258,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: false,
             secret: true,
+            operator_only: true,
             apply: set_oauth_client_secret,
             clear: clear_oauth_client_secret,
             effective: oauth_client_secret_effective,
