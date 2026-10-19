@@ -2716,7 +2716,7 @@ mod tests {
     }
 
     /// The operator keys are the instance's network, database and sign-in:
-    /// every `auth.*`, `database.*` and `service.*` key plus the two GitHub
+    /// every `auth.*`, `database.*` and `service.*` key plus the three GitHub
     /// keys that decide which GitHub this instance talks to and as which app.
     /// No surface outside the CLI lists, reads back or sets one of these.
     #[test]
@@ -2731,6 +2731,7 @@ mod tests {
             vec![
                 "github.api_url",
                 "github.oauth_client_id",
+                "github.oauth_client_secret",
                 "service.read_only",
                 "service.http",
                 "service.ui",
@@ -2763,7 +2764,8 @@ mod tests {
                 || spec.key.starts_with("database.")
                 || (spec.key.starts_with("service.") && spec.key != "service.response_format")
                 || spec.key == "github.api_url"
-                || spec.key == "github.oauth_client_id";
+                || spec.key == "github.oauth_client_id"
+                || spec.key == "github.oauth_client_secret";
             assert_eq!(spec.operator_only, by_rule, "{}", spec.key);
             assert_eq!(is_operator_key(spec.key), by_rule, "{}", spec.key);
             assert!(is_known_key(spec.key), "{}", spec.key);
@@ -3414,7 +3416,7 @@ mod tests {
         apply(&mut cfg, "github.enabled", "true").unwrap();
 
         let views = snapshot(&cfg, &EnvOverlay::default());
-        assert_eq!(views.len(), 43);
+        assert_eq!(views.len(), 44);
         assert_eq!(
             views.iter().map(|v| v.key.as_str()).collect::<Vec<_>>(),
             vec![
@@ -3587,15 +3589,15 @@ mod tests {
         assert_eq!(recall_min_score.value, "0.69");
         assert_eq!(recall_min_score.source, SettingSource::Default);
 
-        let identity_actor = &views[27];
+        let identity_actor = &views[28];
         assert_eq!(identity_actor.value, "");
         assert_eq!(identity_actor.source, SettingSource::Default);
 
-        let trusted_header = &views[28];
+        let trusted_header = &views[29];
         assert_eq!(trusted_header.value, "");
         assert_eq!(trusted_header.source, SettingSource::Default);
 
-        let anonymous = &views[29];
+        let anonymous = &views[30];
         assert_eq!(anonymous.value, "false");
         assert_eq!(anonymous.source, SettingSource::Default);
     }
