@@ -20,6 +20,7 @@ mod engine_writes;
 mod file_stamps;
 mod graph;
 mod index_files;
+mod layout_guard;
 mod line_endings;
 mod model_upgrade;
 mod move_permalink;
@@ -27,6 +28,7 @@ mod name_report;
 mod orphaned_rows;
 mod overwrite_in_place;
 mod read_only_domains;
+mod search_coverage;
 mod similar;
 #[cfg(unix)]
 mod sync_denied;

@@ -13,8 +13,8 @@
 use std::path::Path;
 
 use crystalline_index::{
-    ChunkParams, DomainKind, PathChangeKind, SearchQuery, Store, TursoStore, apply_scan,
-    scan_paths, sync_domain_with,
+    ChunkParams, DomainKind, PathChangeKind, ReflectionPathChange, ReflectionPathKind, SearchQuery,
+    Store, TursoStore, apply_scan, scan_paths, sync_domain_with,
 };
 
 fn write(dir: &Path, rel: &str, content: &str) {
@@ -32,38 +32,6 @@ fn engram(title: &str, permalink: &str, body: &str) -> String {
     )
 }
 
-#[cfg(feature = "postgres")]
-fn pg_url() -> Option<String> {
-    use std::sync::Once;
-    static NOTE: Once = Once::new();
-    match std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") {
-        Ok(u) if !u.is_empty() => Some(u),
-        _ => {
-            NOTE.call_once(|| {
-                eprintln!(
-                    "note: skipping the postgres parity leg (CRYSTALLINE_TEST_POSTGRES_URL is unset); turso only"
-                )
-            });
-            None
-        }
-    }
-}
-
-/// A recycled pid must never adopt a schema a panicking run left behind.
-#[cfg(feature = "postgres")]
-fn unique_schema() -> String {
-    use std::hash::{BuildHasher, RandomState};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!(
-        "ct_{}_{}_{:x}",
-        std::process::id(),
-        n,
-        RandomState::new().hash_one(n)
-    )
-}
-
 /// Run a parity body against Turso (always) and Postgres (when configured).
 macro_rules! parity {
     ($name:ident, $body:path) => {
@@ -75,16 +43,14 @@ macro_rules! parity {
             }
             #[cfg(feature = "postgres")]
             {
-                if let Some(url) = pg_url() {
-                    let schema = unique_schema();
-                    let store = crystalline_index::PostgresStore::open_in_schema(&url, &schema)
-                        .await
-                        .expect("open the postgres test schema");
+                if let Some(scratch) = crate::pg::scratch("ct") {
+                    let store = crystalline_index::PostgresStore::open_in_schema(
+                        scratch.url(),
+                        scratch.name(),
+                    )
+                    .await
+                    .expect("open the postgres test schema");
                     $body(&store).await;
-                    store
-                        .drop_schema()
-                        .await
-                        .expect("drop the postgres test schema");
                 }
             }
         }
@@ -531,6 +497,139 @@ mod symlinked_asset {
     );
 }
 
+/// The engram rows and the attachment rows of domain `d`, each sorted.
+async fn rows(store: &dyn Store, root: &Path) -> (Vec<String>, Vec<String>) {
+    let domain = upsert_domain(store, "d", root).await;
+    let mut engrams: Vec<String> = store
+        .file_stamps(domain)
+        .await
+        .unwrap()
+        .into_keys()
+        .collect();
+    engrams.sort();
+    let mut assets: Vec<String> = store
+        .list_attachments(domain)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.path)
+        .collect();
+    assets.sort();
+    (engrams, assets)
+}
+
+/// The OKF reserved names under `assets/` are neither engrams nor attachments,
+/// for the full walk and for a targeted pass, present or vanished. The layout
+/// calls them reserved, not attachments; markdown was never attachable, so
+/// nothing about either pass moves.
+async fn reserved_names_under_assets_index_nothing(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "a.md", &engram("A", "a", "body token"));
+    write(root, "assets/index.md", "# Assets\n");
+    write(root, "assets/log.md", "# Log\n");
+    write_bytes(root, "assets/shot.png", PNG);
+    sync_domain_with(store, "d", root, &params()).await.unwrap();
+    let expected = (
+        vec!["a.md".to_string()],
+        vec!["assets/shot.png".to_string()],
+    );
+    assert_eq!(rows(store, root).await, expected, "the full walk");
+
+    let present = target(store, root, &["assets/index.md", "assets/log.md"]).await;
+    assert!(
+        present.changes.is_empty() && present.failed.is_empty(),
+        "present: {present:?}"
+    );
+    assert_eq!(
+        rows(store, root).await,
+        expected,
+        "a targeted pass, present"
+    );
+
+    std::fs::remove_file(root.join("assets/index.md")).unwrap();
+    std::fs::remove_file(root.join("assets/log.md")).unwrap();
+    let gone = target(store, root, &["assets/index.md", "assets/log.md"]).await;
+    assert!(
+        gone.changes.is_empty() && gone.failed.is_empty() && gone.deleted == 0,
+        "vanished: {gone:?}"
+    );
+    assert_eq!(
+        rows(store, root).await,
+        expected,
+        "a targeted pass, vanished"
+    );
+}
+parity!(
+    reserved_names_under_assets_index_nothing_on_either_pass,
+    reserved_names_under_assets_index_nothing
+);
+
+/// A vanished OKF reserved name outside `assets/` is a no-op for a targeted
+/// pass: it was never recorded, so it is no delete and no failure, and every
+/// row stays.
+async fn a_vanished_reserved_name_is_a_no_op(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "a.md", &engram("A", "a", "body token"));
+    write(root, "index.md", "# Index\n");
+    write(root, "sub/log.md", "# Log\n");
+    write(root, "sub/b.md", &engram("B", "sub/b", "body token"));
+    sync_domain_with(store, "d", root, &params()).await.unwrap();
+    let expected = (vec!["a.md".to_string(), "sub/b.md".to_string()], Vec::new());
+    assert_eq!(rows(store, root).await, expected, "the full walk");
+
+    std::fs::remove_file(root.join("index.md")).unwrap();
+    std::fs::remove_file(root.join("sub/log.md")).unwrap();
+    let report = target(store, root, &["index.md", "sub/log.md"]).await;
+    assert!(
+        report.changes.is_empty() && report.failed.is_empty() && report.deleted == 0,
+        "{report:?}"
+    );
+    assert_eq!(rows(store, root).await, expected, "every row stays");
+}
+parity!(
+    a_vanished_reserved_name_is_a_no_op_for_a_targeted_pass,
+    a_vanished_reserved_name_is_a_no_op
+);
+
+/// An attachment indexed before the MANIFEST declared an artifact folder around
+/// it keeps its row until the file goes; once it is gone, a targeted pass
+/// deletes the row at once, as it always did, rather than leaving it for the
+/// next full walk.
+async fn an_artifact_folder_under_assets_still_deletes(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "a.md", &engram("A", "a", "body token"));
+    write_bytes(root, "assets/deploy/x.png", PNG);
+    sync_domain_with(store, "d", root, &params()).await.unwrap();
+    assert_eq!(
+        rows(store, root).await.1,
+        ["assets/deploy/x.png"],
+        "indexed before the decl"
+    );
+
+    write(
+        root,
+        "MANIFEST.md",
+        "---\ntype: manifest\ntitle: KB\npermalink: manifest\ntags: [manifest]\nstatus: stable\n---\n\n## Scope\n\n- s\n\n## When to Use\n\n- w\n\n## Provisioning\n\n- skills: assets/deploy\n",
+    );
+    assert!(
+        !crystalline_core::in_root_artifact_dirs(root).is_empty(),
+        "the decl names an in-root artifact folder"
+    );
+    std::fs::remove_file(root.join("assets/deploy/x.png")).unwrap();
+    target(store, root, &["assets/deploy/x.png"]).await;
+    assert!(
+        rows(store, root).await.1.is_empty(),
+        "the vanished attachment's row is gone"
+    );
+}
+parity!(
+    a_vanished_attachment_in_an_artifact_folder_under_assets_is_deleted,
+    an_artifact_folder_under_assets_still_deletes
+);
+
 /// An unreadable targeted path is a reported failure, not a delete: a metadata
 /// error other than "not found" keeps the row in the index and surfaces the
 /// path in the report's `failed` list instead of dropping it.
@@ -578,4 +677,210 @@ mod unreadable_path {
             "the row survives an unreadable targeted path"
         );
     }
+}
+
+/// The probe that asks for a whole walk when a Reflection has no row
+/// applies the walk's own rules: a file the walk skips (here an attachment
+/// over the size cap) asks for nothing, or every check would walk again.
+#[test]
+fn the_reflection_disk_probe_skips_what_the_walk_skips() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("reflections/assets")).unwrap();
+    let big = std::fs::File::create(root.join("reflections/assets/huge.png")).unwrap();
+    big.set_len(crystalline_core::MAX_ATTACHMENT_BYTES + 1)
+        .unwrap();
+    assert!(
+        !crystalline_index::reflection_files_on_disk(root),
+        "an attachment over the cap gets no row"
+    );
+    std::fs::write(root.join("reflections/assets/small.png"), b"png").unwrap();
+    assert!(crystalline_index::reflection_files_on_disk(root));
+}
+
+// --- the Reflection's changes, named for the change bus ----------------------
+
+const MANIFEST_ON: &str = "---\ntype: manifest\ntitle: eng\npermalink: manifest\ntags: [manifest]\nstatus: stable\nreflection: on\n---\n\n## Scope\n\n- s\n\n## When to Use\n\n- w\n";
+
+/// A page carries a section marker, so the walk reads it as a page and the
+/// Reflection is in effect from the first sync.
+const PAGE_ONE: &str = "# A\n\n## One\n<!-- r:aaaa1111 -->\n\nfirst\n";
+const PAGE_TWO: &str = "# A\n\n## One\n<!-- r:aaaa1111 -->\n\nsecond, longer\n";
+
+fn sha(bytes: impl AsRef<[u8]>) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes.as_ref())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn change(path: &str, kind: ReflectionPathKind, checksum: Option<String>) -> ReflectionPathChange {
+    ReflectionPathChange {
+        path: path.to_string(),
+        kind,
+        checksum,
+    }
+}
+
+/// A threads file touched on disk is reported as its page, by the page's
+/// path inside `reflections/`, with the threads file's checksum; it gets no
+/// row. A page edited or deleted on disk is named with its own kind, and a
+/// file under `reflections/assets/` as a file.
+async fn reflection_changes_on_disk_are_named(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "MANIFEST.md", MANIFEST_ON);
+    write(root, "reflections/a.md", PAGE_ONE);
+    write(root, "reflections/a.threads.md", "# Threads\n");
+    let seeded = sync_domain_with(store, "d", root, &params()).await.unwrap();
+    assert_eq!(
+        seeded.reflection_changes,
+        vec![change(
+            "a.md",
+            ReflectionPathKind::Changed,
+            Some(sha(PAGE_ONE))
+        )],
+        "the walk names the page it indexed; the engine decides whether that is the switch"
+    );
+    let walk = seeded
+        .reflection_walk
+        .expect("a complete walk says what it saw");
+    assert!(walk.effective);
+    assert_eq!(
+        walk.threads.into_iter().collect::<Vec<_>>(),
+        vec![("a.md".to_string(), sha("# Threads\n"))],
+        "every threads file by its page, with its checksum"
+    );
+    assert_eq!(walk.pages.into_iter().collect::<Vec<_>>(), vec!["a.md"]);
+
+    let threads = "# Threads\n\n## t1\n\nA comment from outside.\n";
+    write(root, "reflections/a.threads.md", threads);
+    let report = target(store, root, &["reflections/a.threads.md"]).await;
+    assert_eq!(
+        report.reflection_changes,
+        vec![change(
+            "a.md",
+            ReflectionPathKind::Threads,
+            Some(sha(threads))
+        )]
+    );
+    assert_eq!(report.reflections_changed, 0, "a threads file is no row");
+    assert_eq!(
+        report.reflection_walk, None,
+        "a targeted pass walks nothing"
+    );
+    let domain = upsert_domain(store, "d", root).await;
+    let rows: Vec<String> = store
+        .list_reflection_stamps(domain)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.path)
+        .collect();
+    assert_eq!(
+        rows,
+        vec!["a.md".to_string()],
+        "no row for the threads file"
+    );
+
+    std::fs::remove_file(root.join("reflections/a.threads.md")).unwrap();
+    let report = target(store, root, &["reflections/a.threads.md"]).await;
+    assert_eq!(
+        report.reflection_changes,
+        vec![change("a.md", ReflectionPathKind::Threads, None)],
+        "threads removed by hand beside a page that stays"
+    );
+
+    write(root, "reflections/a.md", PAGE_TWO);
+    let report = target(store, root, &["reflections/a.md"]).await;
+    assert_eq!(
+        report.reflection_changes,
+        vec![change(
+            "a.md",
+            ReflectionPathKind::Changed,
+            Some(sha(PAGE_TWO))
+        )]
+    );
+
+    write(root, "reflections/b.md", PAGE_ONE);
+    let walked = sync_domain_with(store, "d", root, &params()).await.unwrap();
+    assert_eq!(
+        walked.reflection_changes,
+        vec![change(
+            "b.md",
+            ReflectionPathKind::Changed,
+            Some(sha(PAGE_ONE))
+        )],
+        "a full walk names the page it found and never a threads file"
+    );
+
+    write_bytes(root, "reflections/assets/p.png", b"png");
+    let report = target(store, root, &["reflections/assets/p.png"]).await;
+    assert_eq!(
+        report.reflection_changes,
+        vec![change(
+            "assets/p.png",
+            ReflectionPathKind::Files,
+            Some(sha(b"png"))
+        )]
+    );
+
+    write(root, "reflections/a.threads.md", threads);
+    std::fs::remove_file(root.join("reflections/a.md")).unwrap();
+    std::fs::remove_file(root.join("reflections/a.threads.md")).unwrap();
+    let report = target(
+        store,
+        root,
+        &["reflections/a.md", "reflections/a.threads.md"],
+    )
+    .await;
+    assert_eq!(
+        report.reflection_changes,
+        vec![change("a.md", ReflectionPathKind::Deleted, None)],
+        "a page that went with its threads is one deletion"
+    );
+}
+parity!(
+    reflection_changes_found_on_disk_are_named_for_the_bus,
+    reflection_changes_on_disk_are_named
+);
+
+/// A targeted pass reads a threads path only when it is a regular file, as
+/// the walk does: a link is not followed and a pipe is never opened (the
+/// read would block the pass).
+#[cfg(unix)]
+#[tokio::test]
+async fn a_threads_path_that_is_a_link_or_a_pipe_is_not_read() {
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "MANIFEST.md", MANIFEST_ON);
+    write(root, "reflections/a.md", PAGE_ONE);
+    write(root, "reflections/b.md", PAGE_ONE);
+    write(root, "outside.txt", "# Threads\n");
+    sync_domain_with(&store, "d", root, &params())
+        .await
+        .unwrap();
+    std::os::unix::fs::symlink(
+        root.join("outside.txt"),
+        root.join("reflections/a.threads.md"),
+    )
+    .unwrap();
+    let made = std::process::Command::new("mkfifo")
+        .arg(root.join("reflections/b.threads.md"))
+        .status()
+        .unwrap();
+    assert!(made.success());
+    let report = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        target(
+            &store,
+            root,
+            &["reflections/a.threads.md", "reflections/b.threads.md"],
+        ),
+    )
+    .await
+    .expect("the pass does not block on the pipe");
+    assert_eq!(report.reflection_changes, Vec::new());
 }

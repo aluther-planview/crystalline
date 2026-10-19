@@ -242,6 +242,27 @@ describe("the change stream in one tab", () => {
     expect(keys).toContain(JSON.stringify(["domain-tree", "eng"]));
   });
 
+  it("a reflection frame invalidates the Reflection of its domain", async () => {
+    await mount(client);
+    act(() => {
+      theSource().emit(
+        "reflection",
+        {
+          domain: "eng",
+          path: "guides/a.md",
+          kind: "changed",
+          from: null,
+          actor: null,
+        },
+        "1:1",
+      );
+    });
+    act(() => {
+      vi.advanceTimersByTime(250);
+    });
+    expect(invalidatedKeys()).toContain(JSON.stringify(["reflection", "eng"]));
+  });
+
   it("a reset flushes the pending set and invalidates everything at once", async () => {
     await mount(client);
     const source = theSource();
@@ -293,6 +314,51 @@ describe("the change stream in one tab", () => {
     ).toHaveBeenCalledTimes(1);
     expect(invalidate).not.toHaveBeenCalled();
     expect(FakeEventSource.instances).toHaveLength(1);
+  });
+
+  it("a browser reconnect with no event id to resume from resets once it opens", async () => {
+    // Only comments came on this source (the opening one, pings), so the
+    // browser has no `Last-Event-ID` to send and the daemon, perhaps
+    // restarted, cannot say what was missed: the reopen refetches.
+    const seen: string[] = [];
+    const hub = lone();
+    const unsubscribe = hub.subscribe((event) => seen.push(event.event));
+    client.setQueryData(ME_QUERY_KEY, { user: { name: "ada" } });
+    await mount(client, <div />, hub);
+    act(() => {
+      theSource().open();
+    });
+    await settle();
+    act(() => {
+      theSource().fail(0);
+    });
+    await settle();
+    act(() => {
+      theSource().open();
+    });
+    await settle();
+    expect(seen).toEqual(["reset"]);
+    expect(invalidate).toHaveBeenCalledWith();
+    expect(FakeEventSource.instances).toHaveLength(1);
+
+    // With an id the browser resumes, and the daemon replays or resets.
+    invalidate.mockClear();
+    act(() => {
+      theSource().emit("engram", engram("alpha"), "2:1");
+      vi.advanceTimersByTime(250);
+    });
+    invalidate.mockClear();
+    act(() => {
+      theSource().fail(0);
+    });
+    await settle();
+    act(() => {
+      theSource().open();
+    });
+    await settle();
+    expect(seen).toEqual(["reset", "engram"]);
+    expect(invalidate).not.toHaveBeenCalledWith();
+    unsubscribe();
   });
 
   it("a source closed by a 502 during a restart asks the probe and reopens with backoff, then resets", async () => {
@@ -1451,6 +1517,9 @@ describe("subscribeOn with options (M4 C10, C11)", () => {
     const followerView = await mount(follower.client, <div />, followerHub);
     act(() => {
       theSource().open();
+      // A frame with an id, so the browser's reopen resumes from it rather
+      // than resetting.
+      theSource().emit("engram", engram("alpha"), "9:0");
     });
     await settle();
     // In the follower's tab ada signs out and bob signs in.
@@ -1642,7 +1711,10 @@ describe("subscribeOn with options (M4 C10, C11)", () => {
     });
     await settle();
     expect(FakeEventSource.instances, "no reopen").toHaveLength(1);
+    // The reopen had no id to resume from, so it reset: bob's reset and
+    // bob's frame, both under bob's label.
     expect(other.accounts(), "bob's stream keeps bob's label").toEqual([
+      "user:bob",
       "user:bob",
     ]);
     leave();

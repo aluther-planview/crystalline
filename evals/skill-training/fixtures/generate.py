@@ -22,7 +22,11 @@ constant instead of the days since this script last ran (an engram may
 override it with its own `recorded` date), `manifest_verified` stamps
 each MANIFEST as verified so the aging rule never speaks about it, and
 `allow_verify_errors` lets a deliberately derelict workspace generate
-with verify errors standing rather than failing the build.
+with verify errors standing rather than failing the build. `reflection`
+maps a domain to its Reflection pages (path inside `reflections/` to
+text): the domain's MANIFEST gets `reflection: on` and the pages are
+written as plain files after the engrams, the way a person would add
+them.
 
 Regenerate after editing the content tables below (name workspaces to
 rebuild only those and leave the rest untouched):
@@ -31,11 +35,14 @@ rebuild only those and leave the rest untouched):
     bash fixtures/generate.sh aurora
     bash fixtures/generate.sh harbor
     bash fixtures/generate.sh derelict
+    bash fixtures/generate.sh lantern
+    bash fixtures/generate.sh beacon
 """
 from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -101,6 +108,48 @@ def control_room_log(nights: int = 64) -> str:
         )
     lines.append('- "relates to" [[Nightly calibration checklist]]')
     return "\n".join(lines)
+
+
+# The engrams both beacon domains share: a protocol with three parties and
+# ordered messages, an irreversible step with a risk, a comparison with
+# verdicts and a one-line how-to the presentation skill must leave plain.
+BEACON_ENGRAMS = [
+    engram(
+        "Relay handshake",
+        "How a client joins the relay.\n\n"
+        "- [fact] The client sends a hello to the relay and the relay asks the auth service to check the token #relay\n"
+        "- [fact] The auth service answers the relay with a verdict and the relay then sends the client a ready message #relay\n"
+        "- [convention] The client sends no data before it has received the ready message #relay",
+        tags="relay,protocol",
+        engram_type="runbook",
+    ),
+    engram(
+        "Tenant purge",
+        "Removing a tenant from the relay for good.\n\n"
+        "- [fact] The purge deletes the tenant, its queues and every backup of them #relay\n"
+        "- [risk] A purge cannot be undone and the backups are gone with it #relay\n"
+        "- [convention] Export the tenant before a purge #relay",
+        tags="relay,purge",
+        engram_type="runbook",
+    ),
+    engram(
+        "Transport options",
+        "The three ways to carry relay traffic.\n\n"
+        "- [fact] WebSocket keeps one open connection and is the default for browsers, verdict recommended #relay\n"
+        "- [fact] Long polling works behind every proxy but costs a request per message, verdict fallback only #relay\n"
+        "- [fact] gRPC streams are the fastest and need HTTP/2 end to end, verdict only inside the data centre #relay",
+        tags="relay,transport",
+        engram_type="reference",
+    ),
+    engram(
+        "Restart the relay",
+        "How to restart the relay.\n\n"
+        "- [convention] Restart the relay with the command relay restart #relay\n"
+        "- [fact] The restart takes a few seconds and clients reconnect on their own #relay",
+        tags="relay,restart",
+        engram_type="runbook",
+    ),
+]
 
 
 WORKSPACES: dict[str, dict] = {
@@ -1210,6 +1259,73 @@ WORKSPACES: dict[str, dict] = {
             ],
         },
     },
+    # The reflect benchmark's workspace: one domain that keeps a
+    # Reflection. No section cites the "Lamp lighting" engram, so the queue
+    # holds an `unreflected` update item for it, and `guides/lamp.md` has no
+    # baseline, so its section is a feedback item too. The page says the
+    # lamp is lit "at sunset" and the engram says thirty minutes before:
+    # the agent has to notice that itself, nothing compares the texts. Each
+    # `##` heading carries its hidden id line, the page marker: a page
+    # without one reads as an engram and holds the switch pending.
+    "lantern": {
+        "options": {
+            "reflection": {
+                "lighthouse": {
+                    "PACT.md": "# How we write about the lighthouse\n\n## Audience\n<!-- r:a1b2c3d4 -->\n\n- New keepers on their first week.\n\n## Structure\n<!-- r:b2c3d4e5 -->\n\n- guides/*.md\n",
+                    "guides/lamp.md": "# The lamp\n\n## Lighting up\n<!-- r:c3d4e5f6 -->\n\nThe lamp is lit at sunset by the keeper on watch, and the log is signed.\n",
+                },
+            },
+        },
+        "lighthouse": {
+            "scope": ["Running the lighthouse: the lamp, the fog signal and the watch"],
+            "when": ["Questions about how the lighthouse is kept"],
+            "notes": [],
+            "engrams": [
+                engram(
+                    "Lamp lighting",
+                    "When and how the lamp is lit.\n\n"
+                    "- [fact] The lamp is lit thirty minutes before sunset since the 2026 rule #lighthouse\n"
+                    "- [convention] The keeper on watch signs the log after lighting #lighthouse",
+                    tags="lighthouse,lamp",
+                    engram_type="runbook",
+                ),
+            ],
+        },
+    },
+    # The presentation benchmark's workspace: two domains that keep a
+    # Reflection and no page yet, so the queue holds an `unreflected` update
+    # item for every engram. `relay` has a plain PACT; `quiet` carries the
+    # same engrams and a PACT whose Presentation section says no diagrams,
+    # which has to win over the presentation skill's defaults. Each `##`
+    # heading carries its hidden id line (lantern's shape), because a page
+    # without one reads as an engram and holds the switch pending. Both PACT
+    # files ship a `.reflected` baseline so the queue holds `unreflected`
+    # items only and no `pact_changed` item invites a rewrite of the PACT.
+    "beacon": {
+        "options": {
+            "pact_reflected": ["relay", "quiet"],
+            "reflection": {
+                "relay": {
+                    "PACT.md": "# How we write about the relay\n\n## Audience\n<!-- r:d4e5f6a7 -->\n\n- Operators on their first week.\n\n## Structure\n<!-- r:e5f6a7b8 -->\n\n- guides/*.md\n",
+                },
+                "quiet": {
+                    "PACT.md": "# How we write about the quiet relay\n\n## Audience\n<!-- r:f6a7b8c9 -->\n\n- Operators on their first week.\n\n## Structure\n<!-- r:a7b8c9d0 -->\n\n- guides/*.md\n\n## Presentation\n<!-- r:b8c9d0e1 -->\n\n- No diagrams. Plain text and tables only.\n",
+                },
+            },
+        },
+        "relay": {
+            "scope": ["Running the relay: connections, purges, transports and restarts"],
+            "when": ["Questions about how the relay is operated"],
+            "notes": [],
+            "engrams": BEACON_ENGRAMS,
+        },
+        "quiet": {
+            "scope": ["Running the quiet relay: connections, purges, transports and restarts"],
+            "when": ["Questions about how the quiet relay is operated"],
+            "notes": [],
+            "engrams": BEACON_ENGRAMS,
+        },
+    },
 }
 
 
@@ -1362,6 +1478,20 @@ def build_domain_folder(
     verify_domain(domain_dir, label, env, bool(options.get("allow_verify_errors")))
 
 
+def pact_baseline(text: str) -> str:
+    """The `.reflected/PACT.md` the engine keeps for a PACT that has been
+    reflected: the top block, then every `##` section as heading, id line
+    and body, one blank line between (render_baseline in
+    crates/core/src/reflection/baseline.rs). A PACT without it is a
+    `pact_changed` item in every queue."""
+    top, *rest = re.split(r"(?m)^(?=## )", text)
+    out = "<!-- r:_top -->\n" + top.strip("\n") + "\n\n"
+    for block in rest:
+        heading, id_line, body = block.split("\n", 2)
+        out += f"{heading}\n{id_line}\n{body.rstrip(chr(10))}\n\n"
+    return out
+
+
 def build_workspace(name: str, workspace: dict, state_root: Path) -> None:
     ws_dir = WORKSPACES_ROOT / name
     build = state_root / name
@@ -1393,6 +1523,21 @@ def build_workspace(name: str, workspace: dict, state_root: Path) -> None:
             else "verify clean"
         )
         print(f"  {name}/{domain_name}: {len(spec['engrams'])} engrams, {state}")
+
+    for domain_name, pages in (options.get("reflection") or {}).items():
+        domain_dir = ws_dir / "domains" / domain_name
+        manifest = (domain_dir / "MANIFEST.md").read_text()
+        head, sep, rest = manifest.partition("\n---\n")
+        (domain_dir / "MANIFEST.md").write_text(f"{head}\nreflection: on{sep}{rest}")
+        for rel, text in pages.items():
+            path = domain_dir / "reflections" / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+            if rel == "PACT.md" and domain_name in (options.get("pact_reflected") or ()):
+                base = domain_dir / "reflections" / ".reflected" / "PACT.md"
+                base.parent.mkdir(parents=True, exist_ok=True)
+                base.write_text(pact_baseline(text))
+        print(f"  {name}/{domain_name}: Reflection on, {len(pages)} pages")
 
     for tree_name, tree_spec in origins.items():
         tree_dir = ws_dir / "origins" / tree_name

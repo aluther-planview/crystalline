@@ -191,9 +191,11 @@ pub struct TreeQuery {
                    `GET /domains/{domain}/engrams?path=...` counts the same \
                    folder recursively and reports the larger number. Neither \
                    is the other's approximation - a level states a fact about \
-                   the rows it drew, a folder listing promises the folder - so \
-                   a client that means to say \"N engrams in this folder\" \
-                   takes that number from the listing.\n\n`folders` \
+                   the rows it drew, a folder listing promises the folder. \
+                   `folder_counts` carries that recursive number for each of \
+                   `folders`, the reader's drafts included, so a tree can say \
+                   \"N engrams in this folder\" without one listing per \
+                   folder.\n\n`folders` \
                    is never cut, so a truncated level still names every folder \
                    a reader can descend into. A `glob` narrows the engrams \
                    this level returned, so on a truncated level it selects \
@@ -209,6 +211,7 @@ pub struct TreeQuery {
                 "domain": "eng",
                 "path": "/",
                 "folders": ["notes"],
+                "folder_counts": { "notes": 12 },
                 "engrams": [{
                     "permalink": "alpha",
                     "title": "Alpha",
@@ -983,7 +986,10 @@ pub struct SetPoliciesBody(pub std::collections::BTreeMap<String, String>);
         (
             status = 200,
             description = "The manifest as it now reads for this caller, mirroring the \
-                           GET shape, plus `draft: true` when it is the caller's draft.",
+                           GET shape, plus `draft: true` when it is the caller's draft, \
+                           and a `note` when the change switched the Reflection off on \
+                           a domain connected to GitHub: \"share changes\" then offers \
+                           the files in `reflections/` as engram changes.",
             body = ManifestResponse,
             headers(("etag" = String, description = "The quoted `\"{checksum}-{version}\"` of the manifest as it now reads.")),
             example = json!({
@@ -1077,8 +1083,16 @@ pub async fn set_domain_policies(
         .await?;
     let markdown = written["markdown"].as_str().unwrap_or_default().to_string();
     // Said only when it is true: an ordinary domain's answer is the GET shape
-    // exactly.
-    let extra = (written["draft"] == Value::Bool(true)).then_some(("draft", Value::Bool(true)));
+    // exactly. A draft and the switch-off note never come together, since
+    // the note is only said of a switch that is in effect.
+    let extra = if written["draft"] == Value::Bool(true) {
+        Some(("draft", Value::Bool(true)))
+    } else {
+        written
+            .get("note")
+            .filter(|note| note.is_string())
+            .map(|note| ("note", note.clone()))
+    };
     manifest_response(&domain, markdown, false, StatusCode::OK, extra)
 }
 
@@ -1099,7 +1113,8 @@ const STALE_EDIT: &str = "stale edit";
 ///
 /// `extra` is one more top-level key beside the documented shape, which only
 /// [`set_domain_policies`] passes: its `draft` says the write landed in the
-/// caller's own draft rather than in the domain. A key rather than a field of
+/// caller's own draft rather than in the domain, and its `note` what a
+/// Reflection switch-off on a domain connected to GitHub means for sharing. A key rather than a field of
 /// [`ManifestResponse`], because the other two answers have nothing to say
 /// about drafts and would carry it as noise.
 fn manifest_response(

@@ -33,7 +33,8 @@ use std::time::Duration;
 use crystalline_remote::{
     CTL_TIMEOUT, ForwardedAgent, MountTable, NameMap, ONE_DOMAIN_LIMIT, Part, RemoteFailure, Route,
     SourceSet, ToolShape, attach_row_urls, merge_evolve, merge_list_domains, merge_recent,
-    merge_search, missing_from, missing_from_evolve, part_request_limit, seconds, translate_answer,
+    merge_reflect, merge_search, missing_from, missing_from_evolve, part_request_limit, seconds,
+    translate_answer,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -44,17 +45,21 @@ use crate::engine::{
 };
 
 /// The tools that change content: refused on a read-only instance for a
-/// mounted domain too, as they are for a local one.
+/// mounted domain too, as they are for a local one (the two Reflection
+/// writers are hidden there).
 const WRITE_TOOLS: &[&str] = &[
     "write_engram",
     "edit_engram",
     "split_engram",
     "delete_engram",
     "move_engram",
+    "write_reflection",
+    "discuss",
 ];
 use crate::params::*;
 
-/// The tools a call can be forwarded with: the server's `REMOTE_TOOLS`.
+/// The tools a call can be forwarded with: the server's `REMOTE_TOOLS`, the
+/// fifteen engine verbs and the four Reflection tools.
 pub const FORWARDED_TOOLS: &[&str] = crate::remote_ctl::REMOTE_TOOLS;
 
 /// How a tool reaches domains, `None` for one the router leaves alone.
@@ -66,6 +71,8 @@ pub fn shape_of(tool: &str) -> Option<ToolShape> {
         }
         "search_engrams" | "recent_activity" | "list_domains" => ToolShape::AllDomains,
         t if t == crate::EVOLVE_TOOL_NAME => ToolShape::AllDomains,
+        "read_reflection" | "write_reflection" | "discuss" => ToolShape::OneDomain,
+        "reflect" => ToolShape::AllDomains,
         "build_context" => ToolShape::Anchored,
         "move_engram" => ToolShape::Move,
         "share_changes" | "update_domain" | "origin_status" | "resolve_conflict"
@@ -117,6 +124,10 @@ pub fn named_domains(tool: &str, args: &Value) -> anyhow::Result<Vec<String>> {
         "remove_domain" => names_of::<RemoveDomainParams>(args),
         "provision" => names_of::<ProvisionParams>(args),
         "configure" => names_of::<ConfigureParams>(args),
+        "reflect" => names_of::<ReflectParams>(args),
+        "read_reflection" => names_of::<ReadReflectionParams>(args),
+        "write_reflection" => names_of::<WriteReflectionParams>(args),
+        "discuss" => names_of::<DiscussParams>(args),
         _ => Ok(Vec::new()),
     }
 }
@@ -210,9 +221,9 @@ impl std::fmt::Display for RouteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RouteError::Refused(text) => f.write_str(text),
-            // The server's refusal, word for word.
+            // The server's refusal or argument error, word for word.
             RouteError::Source {
-                failure: RemoteFailure::Refused(text),
+                failure: RemoteFailure::Refused(text) | RemoteFailure::Invalid(text),
                 ..
             } => f.write_str(text),
             RouteError::Source {
@@ -451,6 +462,123 @@ pub async fn routed(
     }
 }
 
+/// One file of a mounted domain, as its server answered it.
+#[derive(Debug)]
+pub struct RoutedFile {
+    /// The file's bytes.
+    pub bytes: Vec<u8>,
+    /// Its MIME type, as the server resolved it.
+    pub mime: String,
+}
+
+/// Read one file of a mounted domain from the source that holds it: an
+/// engram attachment (`assets/...`) or a Reflection's file
+/// (`reflections/assets/...`), `path` domain-relative. `None` when no source
+/// mounts `domain`, and the caller reads its own file as before.
+///
+/// The server reads the file under the account's own right for its kind
+/// (engram rights for an attachment, the Reflection read right for a
+/// Reflection's file) and answers its own refusal, which comes back word for
+/// word. That includes a Reflection whose home is another instance on the
+/// server's shared database (`hosted_elsewhere`): the refusal names that
+/// instance, and this machine does not follow it there. A server older than
+/// 0.27.0 has no `file` command; that refusal is said in this machine's
+/// words and names the version.
+///
+/// Owner only, as [`routed`]: a stdio session asks, an HTTP session never
+/// does.
+pub async fn routed_file(
+    engine: &Arc<Engine>,
+    domain: &str,
+    path: &str,
+) -> Option<Result<RoutedFile, RouteError>> {
+    let sources = engine.sources()?;
+    if sources.is_empty() {
+        return None;
+    }
+    sync_local(engine, &sources).await;
+    let table = sources.routing_table();
+    let source = table.source_of(domain)?.to_string();
+    let names = table.names(&source);
+    let remote = names.to_remote.get(domain)?.clone();
+    // The mime is this machine's, from the file name, never the server's: it
+    // decides whether the bytes are served as text.
+    let Some(mime) = file_mime(path) else {
+        return Some(Err(RouteError::Refused(format!(
+            "'{path}' is not a file a domain keeps: a file lives under assets/ or \
+             reflections/assets/ and has a known file type"
+        ))));
+    };
+    // A file has the long limit: a large one over a slow link takes time,
+    // and the read runs as a cut that never marks the source down.
+    let answer = sources
+        .fetch_file(&source, &remote, path, CTL_TIMEOUT)
+        .await;
+    let failed = |failure: RemoteFailure| RouteError::Source {
+        source: source.clone(),
+        domain: domain.to_string(),
+        failure,
+    };
+    Some(match answer {
+        Ok(value) => {
+            decoded_file(&value, mime).map_err(|text| failed(RemoteFailure::Refused(text)))
+        }
+        Err(RemoteFailure::Refused(text)) if is_no_file_command(&text) => {
+            let url = sources.source_url(&source).unwrap_or_default();
+            Err(RouteError::Refused(format!(
+                "{source} at {url} cannot hand out files yet: reading a file of '{domain}' needs \
+                 Crystalline 0.27 or newer on that server"
+            )))
+        }
+        Err(failure) => Err(failed(within(failure, CTL_TIMEOUT))),
+    })
+}
+
+/// The MIME type of a file of a mounted domain, decided on this machine:
+/// `path` (domain-relative) must name a file of either kind
+/// (`assets/...` or `reflections/assets/...`) that a domain may hold, and
+/// the type comes from its name. `None` for anything else. A server's own
+/// word on either is never taken.
+pub fn file_mime(path: &str) -> Option<&'static str> {
+    let url = crystalline_core::CrystallineUrl {
+        domain: String::new(),
+        permalink: path.to_string(),
+        glob: false,
+    };
+    let (_, inner) = url.asset_ref()?;
+    crystalline_core::validate_asset_path(inner).ok()?;
+    crystalline_core::attachment_mime(inner.rsplit('/').next().unwrap_or(inner))
+}
+
+/// Whether a server's refusal is the one a server without the `file`
+/// command answers (0.26 and older): the allow-list's own sentence.
+fn is_no_file_command(text: &str) -> bool {
+    text == format!(
+        "'{}' {}",
+        crystalline_remote::FILE_COMMAND,
+        crate::remote_ctl::NOT_REMOTE
+    )
+}
+
+/// A `file` answer's bytes, checked against what it says about them: valid
+/// base64, the size it names, and never past the largest file a domain
+/// keeps. `mime` is this machine's ([`file_mime`]); the server's is ignored.
+fn decoded_file(value: &Value, mime: &'static str) -> Result<RoutedFile, String> {
+    use base64::Engine as _;
+    let broken = || "the server answered a file this machine cannot read".to_string();
+    let size = value["size"].as_u64().ok_or_else(broken)?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(value["base64"].as_str().ok_or_else(broken)?)
+        .map_err(|_| broken())?;
+    if bytes.len() as u64 != size || size > crystalline_core::MAX_ATTACHMENT_BYTES {
+        return Err(broken());
+    }
+    Ok(RoutedFile {
+        bytes,
+        mime: mime.to_string(),
+    })
+}
+
 /// Read this machine's domains again when the configuration file changed
 /// since the last look (a stat, no parse when it did not), on a blocking
 /// thread, and hand them to the sources.
@@ -513,7 +641,7 @@ async fn fan_out(
         .and_then(Value::as_u64)
         .map_or(limit_default, |l| l as usize)
         .clamp(1, limit_max);
-    let paged = tool == "search_engrams" || tool == crate::EVOLVE_TOOL_NAME;
+    let paged = tool == "search_engrams" || tool == crate::EVOLVE_TOOL_NAME || tool == "reflect";
     let part_args = |mut a: Value| {
         if paged && let Some(obj) = a.as_object_mut() {
             obj.insert("page".into(), json!(1));
@@ -531,9 +659,19 @@ async fn fan_out(
     for source in asked {
         let names = table.names(&source);
         // A part names its source's domains: the ones the filter asked for,
-        // or every one this source mounts here. `list_domains` has no filter
-        // to name them in; its rows are narrowed below instead.
-        let forwarded = part_args(forwarded_args(args, &names, tool != "list_domains"));
+        // or every one this source mounts here, so the source's counts and
+        // pages cover exactly the rows shown here. `list_domains` has no
+        // filter to name them in; its rows are narrowed below instead.
+        let mut forwarded = part_args(forwarded_args(args, &names, tool != "list_domains"));
+        // An unnamed `reflect` names the mounted domains only to scope the
+        // part: one whose Reflection is off there is left out, as an unnamed
+        // queue leaves it out, never refused.
+        if tool == "reflect"
+            && !named_filter
+            && let Some(obj) = forwarded.as_object_mut()
+        {
+            obj.insert("skip_unavailable".into(), json!(true));
+        }
         let set = set.clone();
         let tool = tool.to_string();
         let agent = agent.clone();
@@ -560,7 +698,7 @@ async fn fan_out(
             obj.insert("domains".into(), Value::Array(kept));
         }
         let local_args = localized_local(engine, tool, local_args).await?;
-        let mut value = crate::client::dispatch_engine(engine, tool, local_args)
+        let mut value = run_local_part(engine, tool, local_args)
             .await
             .map_err(RouteError::Local)?;
         crate::web_url::attach_template(&mut value, &engine.local_web_base());
@@ -641,8 +779,24 @@ async fn fan_out(
         "search_engrams" => merge_search(parts, page, limit, &missing),
         "recent_activity" => merge_recent(parts, &missing),
         "list_domains" => merge_list_domains(parts, &missing),
+        "reflect" => merge_reflect(parts, page, limit, &missing),
         _ => merge_evolve(parts, page, limit, &missing),
     })
+}
+
+/// The local part of a fan-out: the control socket's dispatcher for the
+/// fifteen engine verbs, and the engine's own `reflect` for the machine
+/// owner (only owner sessions route, decision D8; `dispatch_engine` serves
+/// no Reflection tool, and no CLI verb or hook calls one).
+async fn run_local_part(engine: &Arc<Engine>, tool: &str, args: Value) -> anyhow::Result<Value> {
+    if tool == "reflect" {
+        let p: ReflectParams =
+            serde_json::from_value(args).map_err(|e| anyhow::anyhow!("invalid arguments: {e}"))?;
+        return Ok(engine
+            .reflect(&p, &crate::ReflectionCaller::owner())
+            .await?);
+    }
+    crate::client::dispatch_engine(engine, tool, args).await
 }
 
 /// The local half of a sweep with every domain it names spelled as the
@@ -666,12 +820,15 @@ async fn localized_local(engine: &Engine, tool: &str, args: Value) -> Result<Val
         "search_engrams" => respelled::<SearchParams>(engine, args).await,
         "recent_activity" => respelled::<RecentParams>(engine, args).await,
         t if t == crate::EVOLVE_TOOL_NAME => respelled::<EvolveParams>(engine, args).await,
+        "reflect" => respelled::<ReflectParams>(engine, args).await,
         _ => Ok(args),
     }
 }
 
 /// The ctl `tool` command's whole answer, and the in-process CLI's: routed
-/// when the call names a mounted domain or all domains, local otherwise.
+/// when the call names a mounted domain or all domains, local otherwise. A
+/// routed read answers as a local one does: the server's `files` list,
+/// which only an MCP session turns into links, is left out.
 pub async fn run_tool_routed(
     engine: &Arc<Engine>,
     tool: &str,
@@ -680,7 +837,14 @@ pub async fn run_tool_routed(
     deadline: Option<Duration>,
 ) -> anyhow::Result<Value> {
     match routed(engine, tool, &args, agent, deadline).await {
-        Some(Ok(value)) => Ok(value),
+        Some(Ok(mut value)) => {
+            if matches!(tool, "read_engram" | "read_reflection")
+                && let Some(obj) = value.as_object_mut()
+            {
+                obj.remove("files");
+            }
+            Ok(value)
+        }
         Some(Err(e)) => Err(anyhow::anyhow!(e.to_string())),
         None => crate::client::dispatch_engine(engine, tool, args).await,
     }
@@ -689,6 +853,54 @@ pub async fn run_tool_routed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A 0.26 server's refusal of `file` is told apart from every other
+    /// refusal, and a file answer is checked against what it says.
+    #[test]
+    fn a_server_without_the_file_command_and_a_broken_file_answer_are_recognized() {
+        assert!(is_no_file_command(
+            "'file' is not available over a remote connection"
+        ));
+        assert!(!is_no_file_command(
+            "domain 'open' not registered; registered: [notes]"
+        ));
+        let file = decoded_file(
+            &json!({ "mime": "text/html", "size": 2, "base64": "aGk=" }),
+            "image/png",
+        )
+        .unwrap();
+        assert_eq!(file.bytes, b"hi");
+        assert_eq!(file.mime, "image/png", "the server's mime is ignored");
+        for broken in [
+            json!({ "size": 3, "base64": "aGk=" }),
+            json!({ "size": 2, "base64": "not base64!" }),
+            json!({ "base64": "aGk=" }),
+        ] {
+            assert!(decoded_file(&broken, "image/png").is_err(), "{broken}");
+        }
+    }
+
+    /// A file's mime is decided from its own name, for a path a domain may
+    /// hold, and nothing else gets one.
+    #[test]
+    fn a_mounted_files_mime_comes_from_its_name() {
+        assert_eq!(file_mime("assets/shot.png"), Some("image/png"));
+        assert_eq!(
+            file_mime("reflections/assets/deck.pdf"),
+            Some("application/pdf")
+        );
+        for refused in [
+            "MANIFEST.md",
+            "assets/../x.png",
+            "reflections/assets/../../assets/shot.png",
+            "../notes/assets/x.png",
+            "/etc/passwd",
+            "Assets/shot.png",
+            "assets/run.exe",
+        ] {
+            assert_eq!(file_mime(refused), None, "{refused}");
+        }
+    }
 
     /// A one-domain call whose source was not asked yet (this process was
     /// still starting) says so, and never reads as if the source had failed.

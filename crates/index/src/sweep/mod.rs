@@ -1070,7 +1070,7 @@ pub struct SweepInput {
     /// target domain apart from a target that simply does not exist.
     pub known_domains: Vec<String>,
     /// Every `(spelling, canonical name)` pair the engine's name table would
-    /// rewrite on write - the same set [`NameTable::normalize`] answers
+    /// rewrite on write - the same set [`crystalline_core::names::NameTable::normalize`] answers
     /// `Some` for, one entry per spelling. A spelling that is already
     /// canonical, resolves nowhere, or is shadowed or contested is never in
     /// here, and neither is one that resolves to a domain hidden from the
@@ -1128,6 +1128,11 @@ pub struct SweepInput {
     /// Related pairs the daemon has not scored yet; a non-zero count is a
     /// truncation line, so a quiet `V302` never reads as a clean domain.
     pub contradictions_pending: usize,
+    /// The domain's MANIFEST says `reflection: on`. While engrams still sit
+    /// under `reflections/` the switch is pending and `V112` leaves
+    /// that root folder out of every pair, so it never advises moving
+    /// engrams into the folder the switch waits on to empty.
+    pub reflection_pending: bool,
     /// The related pairs reached the per-domain cap, so the least related are
     /// never scored.
     pub contradiction_candidates_capped: bool,
@@ -1175,6 +1180,7 @@ impl SweepInput {
             contradiction_model_unavailable: false,
             contradiction_read_only: false,
             contradictions_pending: 0,
+            reflection_pending: false,
             contradiction_candidates_capped: false,
             contradiction_unembedded: 0,
             contradiction_vectors_capped: None,
@@ -2659,6 +2665,15 @@ fn detect_close_folders(input: &SweepInput, report: &mut SweepReport) {
     for siblings in by_parent.values() {
         for (i, &(a, a_count)) in siblings.iter().enumerate() {
             for &(b, b_count) in &siblings[i + 1..] {
+                if input.reflection_pending
+                    && [a, b].iter().any(|folder| {
+                        folder_parent(folder).is_empty()
+                            && folder
+                                .eq_ignore_ascii_case(crystalline_core::reflection::REFLECTIONS_DIR)
+                    })
+                {
+                    continue;
+                }
                 let Some(close) = closeness(a, b) else {
                     continue;
                 };
@@ -3490,61 +3505,19 @@ fn join_semis(items: impl Iterator<Item = impl std::fmt::Display>) -> String {
     items.map(|i| i.to_string()).collect::<Vec<_>>().join("; ")
 }
 
-/// The `Q001` predicate: non-blank body lines outside fenced code. The core
-/// parser's line walker is crate-private, so the fence tracking is mirrored
-/// here, including its rule that a closing fence must match the opening
-/// character, be at least as long and carry nothing after it.
+/// The `Q001` predicate: non-blank body lines outside fenced code, with the
+/// core parser's fence rule ([`crystalline_core::FenceTracker`]).
 ///
 /// Public because `V106` is not its only reader: `split_engram` refuses a
 /// selection that would leave the source below [`MIN_CONTENT_LINES`], and that
 /// refusal has to count lines exactly the way the rule that would flag the
 /// result counts them.
 pub fn content_line_count(body: &str) -> usize {
-    let mut fence: Option<(char, usize)> = None;
-    let mut count = 0usize;
-    for raw in body.split('\n') {
-        let text = raw.trim_end_matches('\r');
-        match fence {
-            None => match fence_marker(text) {
-                Some((c, n)) => fence = Some((c, n)),
-                None => {
-                    if !text.trim().is_empty() {
-                        count += 1;
-                    }
-                }
-            },
-            Some((fc, fcount)) => {
-                if let Some((c, n)) = fence_marker(text)
-                    && c == fc
-                    && n >= fcount
-                    && text.trim_start()[n..].trim().is_empty()
-                {
-                    fence = None;
-                }
-            }
-        }
-    }
-    count
-}
-
-/// A fence opener or closer: the marker character and its run length, for a
-/// line indented no more than three spaces.
-fn fence_marker(line: &str) -> Option<(char, usize)> {
-    let indent = line.len() - line.trim_start_matches(' ').len();
-    if indent > 3 {
-        return None;
-    }
-    let rest = &line[indent..];
-    let first = rest.chars().next()?;
-    if first != '`' && first != '~' {
-        return None;
-    }
-    let count = rest.chars().take_while(|c| *c == first).count();
-    if count < 3 {
-        None
-    } else {
-        Some((first, count))
-    }
+    let mut fence = crystalline_core::FenceTracker::new();
+    body.split('\n')
+        .map(|raw| raw.trim_end_matches('\r'))
+        .filter(|text| !fence.in_fence(text) && !text.trim().is_empty())
+        .count()
 }
 
 #[cfg(test)]

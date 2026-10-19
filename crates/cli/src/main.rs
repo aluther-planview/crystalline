@@ -24,6 +24,7 @@ mod hook;
 mod hook_dialect;
 mod install;
 mod install_profile;
+mod kept;
 mod mcp_json;
 mod members;
 mod recall;
@@ -132,6 +133,8 @@ enum Command {
         command: Option<ConnectCommand>,
         /// The Crystalline server to add, for example
         /// https://crystalline.acme.com. Signing in opens your browser.
+        // Help text, not rustdoc: clap prints it as written.
+        #[allow(rustdoc::bare_urls)]
         url: Option<String>,
         /// The source's short name on this machine, used in notes and in the
         /// names of its domains when one collides. Defaults to the most
@@ -172,7 +175,7 @@ enum Command {
     /// Wire a coding harness up to Crystalline in one idempotent step:
     /// register the MCP server, install the SessionStart routing hook, the
     /// Stop capture-nudge hook and the UserPromptSubmit recall hook, and
-    /// copy the five topical skills into place. Safe to re-run; a second run
+    /// copy the six topical skills into place. Safe to re-run; a second run
     /// that finds everything already in place writes nothing and reports it
     /// as already present. Static like `verify` and `prompt`: no database,
     /// service or network connection. A missing or failing harness CLI is
@@ -251,9 +254,15 @@ enum Command {
         embed: bool,
         /// Force the host-lock claim in a shared database, migrating hosting of
         /// the synced domain to this instance even when another holds a live
-        /// lock. Only meaningful when a daemon owns the shared index.
+        /// lock. Only meaningful on a shared database.
         #[arg(long)]
         take_over: bool,
+        /// After a host move on a shared database, delete the rows of the
+        /// files this disk does not have instead of keeping and reporting
+        /// them as only on the previous host. Drops only what a sync already
+        /// reported. Needs --domain.
+        #[arg(long)]
+        accept_disk: bool,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -478,6 +487,15 @@ enum Command {
     Users {
         #[command(subcommand)]
         command: UsersCommand,
+    },
+    /// Find and handle the texts this machine's server kept when a
+    /// co-editing room could not save: the last person left and the final
+    /// save was refused or ended in a conflict. They live in the state
+    /// directory's `kept` folder and are never deleted on their own. Copy a
+    /// text back into its page or engram, then drop it.
+    Kept {
+        #[command(subcommand)]
+        command: KeptCommand,
     },
     /// Capture a new engram into a domain (the body is read from --content or stdin).
     Write {
@@ -949,6 +967,10 @@ enum CtlCommand {
         /// this daemon in a shared database.
         #[arg(long)]
         take_over: bool,
+        /// After a host move on a shared database, delete the rows of the
+        /// files this disk does not have. Needs --domain.
+        #[arg(long)]
+        accept_disk: bool,
     },
     /// Ask the daemon to reindex. `--full` re-reads every file and destroys
     /// nothing; the wipe is a daemonless command (`crystalline reindex --wipe`),
@@ -963,6 +985,32 @@ enum CtlCommand {
     },
     /// Ask the daemon to shut down cleanly.
     Shutdown,
+}
+
+#[derive(Subcommand, Debug)]
+enum KeptCommand {
+    /// List every kept text with its id, domain, page or engram, when it
+    /// was kept, its size and the file it is in.
+    List {
+        /// Only the texts kept for this domain.
+        #[arg(long)]
+        domain: Option<String>,
+    },
+    /// Print one kept text as it was kept, so it can be redirected into a
+    /// file.
+    Show {
+        /// The id `kept list` shows.
+        id: String,
+    },
+    /// Delete one kept text. It may be the last copy of somebody's work, so
+    /// it asks first.
+    Drop {
+        /// The id `kept list` shows.
+        id: String,
+        /// Skip the confirmation prompt and delete.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1002,8 +1050,15 @@ enum UsersCommand {
         /// there. Change it later with `crystalline users writes`.
         #[arg(long, value_name = "DOMAINS")]
         writes: Option<String>,
+        /// The Reflection level beside the knowledge level. Only raises what
+        /// the knowledge level gives; editors and above always curate.
+        /// Without it a new account or member starts at default, and an
+        /// existing member keeps what it has.
+        #[arg(long, value_enum)]
+        reflection: Option<ReflectionArg>,
     },
-    /// List every account with its role and whether it is disabled.
+    /// List every account with its role, its Reflection level and whether it
+    /// is disabled.
     List,
     /// Replace an account's password.
     Passwd {
@@ -1021,6 +1076,15 @@ enum UsersCommand {
         /// The new role.
         #[arg(value_enum)]
         role: RoleArg,
+    },
+    /// Change an account's Reflection level on every shared domain: reader
+    /// reads and comments, contributor also edits, default follows the role.
+    Reflection {
+        /// The account to change.
+        name: String,
+        /// The new Reflection level.
+        #[arg(value_enum)]
+        level: ReflectionArg,
     },
     /// Turn an account off: it can neither sign in nor keep using a session it
     /// already holds. Its rows are kept, so `enable` brings it back. Disabling
@@ -1141,6 +1205,9 @@ enum UsersCommand {
 /// clap can validate the value and list it in `--help`.
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum RoleArg {
+    /// Sees no engram on a shared domain; its Reflection level decides what
+    /// it works on.
+    None,
     /// Read only: search, read, browse.
     Viewer,
     /// Everything a viewer may do, plus writing and editing engrams.
@@ -1152,9 +1219,32 @@ enum RoleArg {
 impl From<RoleArg> for crystalline_service::rest::Role {
     fn from(arg: RoleArg) -> crystalline_service::rest::Role {
         match arg {
+            RoleArg::None => crystalline_service::rest::Role::None,
             RoleArg::Viewer => crystalline_service::rest::Role::Viewer,
             RoleArg::Editor => crystalline_service::rest::Role::Editor,
             RoleArg::Admin => crystalline_service::rest::Role::Admin,
+        }
+    }
+}
+
+/// The Reflection levels `users` and `domain members` accept, mirroring
+/// `crystalline_service::rest::ReflectionLevel`.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ReflectionArg {
+    /// As the knowledge level gives: a viewer reads and comments.
+    Default,
+    /// Reads the Reflection and comments on it.
+    Reader,
+    /// Also edits reflection text and creates, moves and deletes reflections.
+    Contributor,
+}
+
+impl From<ReflectionArg> for crystalline_service::rest::ReflectionLevel {
+    fn from(arg: ReflectionArg) -> crystalline_service::rest::ReflectionLevel {
+        match arg {
+            ReflectionArg::Default => crystalline_service::rest::ReflectionLevel::Default,
+            ReflectionArg::Reader => crystalline_service::rest::ReflectionLevel::Reader,
+            ReflectionArg::Contributor => crystalline_service::rest::ReflectionLevel::Contributor,
         }
     }
 }
@@ -1190,7 +1280,9 @@ enum DomainCommand {
     /// same virtual domain) changes nothing and indexes it again, so the
     /// command is safe to repeat; a name registered at another folder or as
     /// the other kind is refused, naming what holds it. A new name uses
-    /// letters, digits, hyphens, underscores and dots, 64 characters at most.
+    /// letters, digits, hyphens, underscores and dots, 64 characters at most,
+    /// and must not differ from a registered domain's name only in letter
+    /// case.
     ///
     /// A lone positional argument is always the NAME, never a path - naming a
     /// file domain is optional, and pointing at its folder instead (the
@@ -1218,6 +1310,8 @@ enum DomainCommand {
         /// A lone argument on the command line is always the NAME: use
         /// `--path` instead of this position to point at a folder without
         /// naming it.
+        // Help text, not rustdoc: clap prints the placeholders as written.
+        #[allow(rustdoc::invalid_html_tags)]
         path: Option<PathBuf>,
         /// Point at the domain's folder instead of naming it positionally;
         /// the name then comes from the folder, as described above.
@@ -1430,6 +1524,12 @@ enum MembersCommand {
         /// What that account may do here. Defaults to viewer (read only).
         #[arg(long, value_enum, default_value_t = LevelArg::Viewer)]
         level: LevelArg,
+        /// The Reflection level beside the knowledge level. Only raises what
+        /// the knowledge level gives; editors and above always curate.
+        /// Without it a new account or member starts at default, and an
+        /// existing member keeps what it has.
+        #[arg(long, value_enum)]
+        reflection: Option<ReflectionArg>,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -1472,6 +1572,8 @@ enum VisibilityArg {
 /// lists it in `--help`.
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum LevelArg {
+    /// Sees no engram of this domain; give it a Reflection level.
+    None,
     /// Read only: the domain is visible and searchable, nothing more.
     Viewer,
     /// Everything a viewer may do, plus writing and editing its engrams.
@@ -1483,6 +1585,7 @@ enum LevelArg {
 impl From<LevelArg> for crystalline_service::rest::MemberLevel {
     fn from(arg: LevelArg) -> crystalline_service::rest::MemberLevel {
         match arg {
+            LevelArg::None => crystalline_service::rest::MemberLevel::None,
             LevelArg::Viewer => crystalline_service::rest::MemberLevel::Viewer,
             LevelArg::Editor => crystalline_service::rest::MemberLevel::Editor,
             LevelArg::Manager => crystalline_service::rest::MemberLevel::Manager,
@@ -1839,10 +1942,28 @@ impl std::fmt::Display for PrintedRefusal {
 
 impl std::error::Error for PrintedRefusal {}
 
+/// A command that has said everything it has to say and ends with this exit
+/// code. Returned rather than calling `std::process::exit` inside a command's
+/// future, so the runtime wrapper still runs what follows the command (the
+/// give-back of a command's host locks) before the process ends.
+#[derive(Debug)]
+struct ExitWith(u8);
+
+impl std::fmt::Display for ExitWith {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "exit code {}", self.0)
+    }
+}
+
+impl std::error::Error for ExitWith {}
+
 fn main() -> std::process::ExitCode {
     match run() {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) if e.is::<PrintedRefusal>() => std::process::ExitCode::from(1),
+        Err(e) if e.is::<ExitWith>() => {
+            std::process::ExitCode::from(e.downcast_ref::<ExitWith>().map_or(1, |exit| exit.0))
+        }
         // What `fn main() -> anyhow::Result<()>` printed, unchanged.
         Err(e) => {
             eprintln!("Error: {e:?}");
@@ -1979,8 +2100,21 @@ fn run() -> anyhow::Result<()> {
             domain,
             embed,
             take_over,
+            accept_disk,
             config,
-        }) => on_runtime(move || sync_dispatch(domain, embed, take_over, config, cli.db, cli.json)),
+        }) => on_runtime(move || {
+            sync_dispatch(
+                domain,
+                cmd::SyncFlags {
+                    embed,
+                    take_over,
+                    accept_disk,
+                },
+                config,
+                cli.db,
+                cli.json,
+            )
+        }),
         Some(Command::Reindex {
             full,
             wipe,
@@ -2103,6 +2237,7 @@ fn run() -> anyhow::Result<()> {
         }) => on_runtime(move || mcp_dispatch(embedded, read_only, harness, config, cli.db)),
         Some(Command::Ctl { command }) => on_runtime(move || run_ctl(command, cli.json)),
         Some(Command::Users { command }) => on_runtime(move || users::run(command, cli.json)),
+        Some(Command::Kept { command }) => kept::run(command, cli.json),
         Some(
             cmd @ (Command::Read { .. }
             | Command::Search { .. }
@@ -2318,6 +2453,7 @@ async fn status_dispatch(
                     "desktop_states".to_string(),
                     serde_json::to_value(desktop_state::scan_here())?,
                 );
+                insert_kept_count(map);
                 // Present only when something differs, as doctor --json does.
                 if !mismatches.is_empty() {
                     map.insert(
@@ -2343,6 +2479,9 @@ async fn status_dispatch(
                 format_uptime(data["uptime_secs"].as_u64().unwrap_or(0)),
             );
             if let Some(line) = desktop_state::status_line(&desktop_state::scan_here()) {
+                println!("{line}");
+            }
+            if let Some(line) = kept::status_line(&kept::scan_here()) {
                 println!("{line}");
             }
             sources::render_sources(&source_rows);
@@ -2415,6 +2554,15 @@ async fn status_dispatch(
     finish_status(route, &cfg, json, note, &source_rows).await
 }
 
+/// `kept_texts` in `status --json`: how many texts the server kept when a
+/// room could not save, present only when there are any.
+fn insert_kept_count(map: &mut serde_json::Map<String, serde_json::Value>) {
+    let count = kept::scan_here().len();
+    if count > 0 {
+        map.insert("kept_texts".to_string(), serde_json::json!(count));
+    }
+}
+
 /// A direct read's `status`: the index's report with the sources and any
 /// split Claude Desktop state added, both before the rest in the human form.
 async fn finish_status(
@@ -2432,10 +2580,14 @@ async fn finish_status(
                 "desktop_states".to_string(),
                 serde_json::to_value(desktop_state::scan_here())?,
             );
+            insert_kept_count(map);
         }
         println!("{value}");
     } else {
         if let Some(line) = desktop_state::status_line(&desktop_state::scan_here()) {
+            println!("{line}");
+        }
+        if let Some(line) = kept::status_line(&kept::scan_here()) {
             println!("{line}");
         }
         sources::render_sources(source_rows);
@@ -2459,24 +2611,37 @@ fn format_uptime(secs: u64) -> String {
 /// `--config`/`--db` override was given, else sync directly. An override names
 /// an exact config and index the running daemon may not serve, so it always
 /// takes the direct path (see [`crystalline_service::use_daemon`]).
-/// `take_over` forces the daemon's host-lock claim for a shared-database host
-/// migration; it is meaningless without a daemon (standalone sync holds no host
-/// lock), so the direct path ignores it.
+/// `take_over` forces the host-lock claim for a shared-database host
+/// migration and `accept_disk` ends an unresolved host move of the named
+/// domain; both work on either path, since the direct path claims the host
+/// lock on a shared database too (see [`cmd::sync`]).
 async fn sync_dispatch(
     domain: Option<String>,
-    embed: bool,
-    take_over: bool,
+    flags: cmd::SyncFlags,
     config: Option<PathBuf>,
     db: Option<PathBuf>,
     json: bool,
 ) -> anyhow::Result<()> {
     use serde_json::json;
+    let cmd::SyncFlags {
+        embed,
+        take_over,
+        accept_disk,
+    } = flags;
+    if accept_disk && domain.is_none() {
+        anyhow::bail!(crystalline_index::ACCEPT_DISK_NEEDS_DOMAIN);
+    }
     let loaded = cmd::load(config.as_deref())?;
     let cfg = &loaded.effective;
     let route = cmd::reach_index(
-        Some(
-            json!({ "v": 1, "cmd": "sync", "domain": domain, "embed": embed, "take_over": take_over }),
-        ),
+        Some(json!({
+            "v": 1,
+            "cmd": "sync",
+            "domain": domain,
+            "embed": embed,
+            "take_over": take_over,
+            "accept_disk": accept_disk,
+        })),
         cfg,
         config.as_deref(),
         db.as_deref(),
@@ -2504,6 +2669,15 @@ async fn sync_dispatch(
             .map(serde_json::from_value)
             .transpose()?
             .unwrap_or_default();
+        // What a host move left only on another instance, in the words the
+        // direct path prints, under the daemon's JSON.
+        if !json {
+            for report in &reports {
+                if let Some(elsewhere) = &report.only_elsewhere {
+                    println!("{}: {}", report.domain, elsewhere.line(&report.domain));
+                }
+            }
+        }
         let scan_failed: Vec<(String, String)> = data
             .get("failed")
             .and_then(serde_json::Value::as_array)
@@ -2533,7 +2707,7 @@ async fn sync_dispatch(
     let resolved_domain = domain
         .as_deref()
         .map(|d| loaded.name_table().resolve(d).unwrap_or(d).to_string());
-    cmd::sync(store.clone(), cfg, resolved_domain.as_deref(), embed, json).await?;
+    cmd::sync(store.clone(), cfg, resolved_domain.as_deref(), flags, json).await?;
     // Once the sync has returned cleanly, as the daemon's ctl `sync` does: a
     // synced MANIFEST may declare a new name. A sync that failed says so and
     // adopts nothing. The adoption cannot fail the sync that landed: its own
@@ -3038,7 +3212,7 @@ async fn run_origin(command: OriginCommand, db: Option<PathBuf>, json: bool) -> 
             )
             .await?;
             if !cmd::print_origin_discard(&data, json) {
-                std::process::exit(1);
+                return Err(ExitWith(1).into());
             }
             Ok(())
         }
@@ -3579,11 +3753,10 @@ async fn run_doctor(
     } else {
         print!("{}", doctor::render_human(&report));
     }
-    std::process::exit(if report.remaining_problems() > 0 {
-        1
-    } else {
-        0
-    });
+    if report.remaining_problems() > 0 {
+        return Err(ExitWith(1).into());
+    }
+    Ok(())
 }
 
 async fn run_ctl(command: CtlCommand, json: bool) -> anyhow::Result<()> {
@@ -3595,8 +3768,16 @@ async fn run_ctl(command: CtlCommand, json: bool) -> anyhow::Result<()> {
             domain,
             embed,
             take_over,
+            accept_disk,
         } => {
-            json!({ "v": 1, "cmd": "sync", "domain": domain, "embed": embed, "take_over": take_over })
+            json!({
+                "v": 1,
+                "cmd": "sync",
+                "domain": domain,
+                "embed": embed,
+                "take_over": take_over,
+                "accept_disk": accept_disk,
+            })
         }
         CtlCommand::Reindex { full, embed } => {
             json!({ "v": 1, "cmd": "reindex", "full": full, "embed": embed })
@@ -3890,7 +4071,14 @@ where
                 tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
                     .build()?
-                    .block_on(make()),
+                    .block_on(async {
+                        let out = make().await;
+                        // A command without a daemon gives back every host
+                        // lock it claimed on a shared database, on every
+                        // path it ends by.
+                        crystalline_service::engine::release_command_locks_everywhere().await;
+                        out
+                    }),
             )
         })?;
     match worker.join() {
@@ -3941,7 +4129,14 @@ where
                 tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?
-                    .block_on(make()),
+                    .block_on(async {
+                        let out = make().await;
+                        // A command without a daemon gives back every host
+                        // lock it claimed on a shared database, on every
+                        // path it ends by.
+                        crystalline_service::engine::release_command_locks_everywhere().await;
+                        out
+                    }),
             )
         })?;
     match worker.join() {
@@ -5112,6 +5307,16 @@ fn run_prompt(
             domain.read_only = true;
         }
     }
+    // A local Reflection with open items is named on its routing line, from
+    // the counts this machine's daemon recorded: one small file read, no
+    // socket. Before the mounted rows join, so the record only ever touches
+    // this machine's own rows (a mounted row carries its server's count). An
+    // explicit --config or --db names a registry the daemon did not count
+    // (and bypasses the mounted part too).
+    if config_path.is_none() && db.is_none() {
+        let counts = crystalline_service::maintenance::load().reflect_open;
+        crystalline_core::prompt::annotate_reflection(&mut output, &counts);
+    }
     // After the local rows, never sorted in among them (ruling F1): with
     // nothing mounted the block is byte-identical to one without sources.
     // `prompt.rules` names a lent domain by its local name like any other,
@@ -5225,11 +5430,13 @@ fn mounted_routing_request(cfg: &crystalline_core::config::GlobalConfig) -> serd
 /// [`crystalline_remote::ROUTING_BULLET_CHARS`], at most
 /// [`crystalline_remote::ROUTING_BULLETS_MAX`]); a name that could break the
 /// line is no row. `read_only` is the server's `domain_read_only` for this
-/// account; it only labels the row.
+/// account; it only labels the row. `reflect_open` is the server's count of
+/// open reflect items in a Reflection the account curates there.
 fn mounted_row(
     name: &str,
     bullets: &[String],
     read_only: bool,
+    reflect_open: u64,
 ) -> Option<crystalline_core::PromptDomain> {
     if name.is_empty() || name.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return None;
@@ -5239,6 +5446,7 @@ fn mounted_row(
         bullets: crystalline_remote::routing_bullets(bullets),
         preferred: false,
         read_only,
+        reflect_open,
     })
 }
 
@@ -5265,6 +5473,7 @@ fn mounted_rows_of(answer: &serde_json::Value) -> Vec<crystalline_core::PromptDo
                 d["name"].as_str()?,
                 &json_strings(&d["bullets"]),
                 d["domain_read_only"].as_bool().unwrap_or(false),
+                d["reflect_open"].as_u64().unwrap_or(0),
             )
         })
         .collect()
@@ -5338,7 +5547,7 @@ fn mounted_part(
         let rows = routing
             .domains
             .iter()
-            .filter_map(|m| mounted_row(&m.local, &m.bullets, m.domain_read_only))
+            .filter_map(|m| mounted_row(&m.local, &m.bullets, m.domain_read_only, m.reflect_open))
             .collect();
         (set.shadowed(), rows, routing.stale)
     };
@@ -5472,6 +5681,56 @@ fn to_core_format(f: OutputFormat) -> verify::Format {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A command that ends with an exit code still gives back the host locks
+    /// it claimed: the runtime wrapper runs the give-back after the command's
+    /// future, whatever it answered.
+    #[test]
+    fn a_command_ending_with_an_exit_code_still_gives_its_locks_back() {
+        use crystalline_index::Store as _;
+        let setup = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (store, domain, lease) = setup.block_on(async {
+            let store = crystalline_index::TursoStore::open_in_memory()
+                .await
+                .unwrap();
+            let domain = store
+                .upsert_domain("eng", Some("/tmp/eng"), crystalline_index::DomainKind::File)
+                .await
+                .unwrap();
+            let (now, stale) = crystalline_index::claim_window(90);
+            let token = match store
+                .claim_domain_host(domain, "this-machine", "this-machine", &now, &stale, false)
+                .await
+                .unwrap()
+            {
+                crystalline_index::HostClaim::Acquired { token } => token,
+                other => panic!("{other:?}"),
+            };
+            let store: std::sync::Arc<tokio::sync::Mutex<dyn crystalline_index::Store>> =
+                std::sync::Arc::new(tokio::sync::Mutex::new(store));
+            (
+                store,
+                domain,
+                crystalline_index::HostLease { token, over: None },
+            )
+        });
+        crystalline_service::engine::note_command_lock(
+            store.clone(),
+            domain,
+            "this-machine",
+            lease,
+        );
+        let ended = on_runtime(|| async { Err(ExitWith(3).into()) });
+        let code = ended.unwrap_err();
+        assert_eq!(code.downcast_ref::<ExitWith>().map(|e| e.0), Some(3));
+        assert_eq!(crystalline_service::engine::command_locks_pending(), 0);
+        let holder =
+            setup.block_on(async { store.lock().await.domain_host(domain).await.unwrap() });
+        assert!(holder.is_none(), "the lock was given back: {holder:?}");
+    }
     use serde_json::{Value, json};
 
     fn share_flags(args: &[&str]) -> (Option<Option<u64>>, bool) {
@@ -5596,6 +5855,7 @@ mod tests {
                 " \n ".to_string(),
             ],
             false,
+            0,
         )
         .unwrap();
         assert_eq!(row.bullets.len(), 2);
@@ -5604,14 +5864,14 @@ mod tests {
             row.bullets[1].chars().count(),
             crystalline_remote::ROUTING_BULLET_CHARS + 4
         );
-        assert!(mounted_row("open\nBehavior:", &[], false).is_none());
+        assert!(mounted_row("open\nBehavior:", &[], false, 0).is_none());
         let many: Vec<String> = (0..50).map(|i| format!("b{i}")).collect();
         assert_eq!(
-            mounted_row("open", &many, false).unwrap().bullets.len(),
+            mounted_row("open", &many, false, 0).unwrap().bullets.len(),
             crystalline_remote::ROUTING_BULLETS_MAX
         );
-        assert!(mounted_row("open", &[], true).unwrap().read_only);
-        assert!(!mounted_row("open", &[], false).unwrap().read_only);
+        assert!(mounted_row("open", &[], true, 0).unwrap().read_only);
+        assert!(!mounted_row("open", &[], false, 0).unwrap().read_only);
     }
 
     /// Review M5: the stale array is added after the last field, and every

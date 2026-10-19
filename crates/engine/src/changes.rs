@@ -19,6 +19,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use tokio::sync::broadcast;
 
+/// How long an answer read from records another instance may change is
+/// trusted before it is read again. The event stream re-resolves who may see
+/// a domain after it; the Reflection gate re-reads the engram rows it
+/// remembers after it on a database other instances share, whose writes this
+/// instance never hears announced. What can leak inside the window on the
+/// stream is a domain name and a path, never content.
+pub const VISIBILITY_TTL: Duration = Duration::from_secs(10);
+
 /// How many events the ring keeps for replay. A tab away for a larger burst
 /// gets a `reset` (one refetch of every active query), which is the soft
 /// failure this whole design prefers.
@@ -33,7 +41,10 @@ pub const COLLAPSE_THRESHOLD: usize = 32;
 
 /// An `engram` event equal to the previous one in domain, path, kind and
 /// checksum inside this window is dropped: a platform whose mtime granularity
-/// makes the watcher re-announce an engine write costs nobody a refetch.
+/// makes the watcher re-announce an engine write costs nobody a refetch. A
+/// `reflection` event equal to any one of this window in domain, path, kind
+/// and a checksum both carry is dropped too: a threads file has no stamp, so
+/// the watcher finds every engine write of one again a moment later.
 pub const DUPLICATE_WINDOW: Duration = Duration::from_secs(2);
 
 /// What happened to the engram: the four things the sync engine counts.
@@ -99,9 +110,12 @@ pub struct EngramChanged {
 /// moment of a change that takes the domain's name out of the privacy records
 /// (a removal, and the old name of a rename; ruled 2026-09-27).
 ///
-/// `Everyone` when the domain is not private. `Accounts` when it is, naming
-/// every account that may read it: its owner, every member at any level and
-/// every instance admin by the role the accounts store records, disabled
+/// `Everyone` when the domain is not private: every scope that reads shared
+/// domains, which leaves out an account whose instance knowledge level is
+/// `none` (a listener applies its own `DomainScreen::admits_shared` beside
+/// this). `Accounts` when it is, naming every account that may read it: its
+/// owner, every member who reads engrams there (not a member at knowledge
+/// `none`) and every instance admin by the role the accounts store records, disabled
 /// accounts left out. The names are the store's folded spelling (trimmed and
 /// lowercased), so a check folds `Scope::User.account` the same way, and a
 /// scope that carries `admin: true` reads too, since the surface's own admin
@@ -129,12 +143,73 @@ pub struct DomainChanged {
     pub audience: Option<DomainAudience>,
 }
 
-/// One announcement on the bus. The wire's third event, `reset`, is the
+/// What happened in a domain's Reflection, as the `reflection` event says it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReflectionChangeKind {
+    /// A page's text or bookkeeping changed: a write, a settle, a room's
+    /// save, or a link that followed another page or file.
+    Changed,
+    /// A page moved; `from` is where it was.
+    Moved,
+    Deleted,
+    /// A thread on the page was opened, answered, resolved or reopened.
+    Threads,
+    /// A file under `reflections/assets/` was added, replaced, removed or
+    /// moved; `path` is the file, `from` its old path on a move.
+    Files,
+    /// The switch moved, or on a shared database the instance that serves
+    /// the Reflection changed (its host lock moved); `path` is empty.
+    Switched,
+}
+
+impl From<crystalline_index::ReflectionPathKind> for ReflectionChangeKind {
+    fn from(kind: crystalline_index::ReflectionPathKind) -> ReflectionChangeKind {
+        use crystalline_index::ReflectionPathKind as K;
+        match kind {
+            K::Changed => ReflectionChangeKind::Changed,
+            K::Deleted => ReflectionChangeKind::Deleted,
+            K::Threads => ReflectionChangeKind::Threads,
+            K::Files => ReflectionChangeKind::Files,
+        }
+    }
+}
+
+/// One change in a domain's Reflection, as a session that may read it hears
+/// it. A path and a kind, never text and never an engram name, so a person
+/// with knowledge `none` may hear it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ReflectionChanged {
+    pub domain: String,
+    /// Inside `reflections/`, after the change; empty for `switched`, and
+    /// for `changed` when a sync found more paths than
+    /// [`COLLAPSE_THRESHOLD`] at once (the whole Reflection, then).
+    pub path: String,
+    pub kind: ReflectionChangeKind,
+    /// `moved`, and `files` on a move: the path before.
+    pub from: Option<String>,
+    /// Who made the change, as a display label; null for a link that
+    /// followed, a room save with no single typist, the machine owner and a
+    /// change found on disk.
+    pub actor: Option<String>,
+    /// The lowercase hex SHA-256 of the file the change left behind (the
+    /// threads file for `threads`), when the announcer knows it. The bus
+    /// compares it to drop the watcher's echo of an engine write; `None` is
+    /// never an echo. Never on the wire.
+    #[serde(skip)]
+    pub checksum: Option<String>,
+    /// As on [`EngramChanged::audience`]. Never on the wire.
+    #[serde(skip)]
+    pub audience: Option<DomainAudience>,
+}
+
+/// One announcement on the bus. The wire's fourth event, `reset`, is the
 /// route's own and never rides the bus.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Change {
     Engram(EngramChanged),
     Domain(DomainChanged),
+    Reflection(ReflectionChanged),
 }
 
 impl Change {
@@ -143,6 +218,7 @@ impl Change {
         match self {
             Change::Engram(_) => "engram",
             Change::Domain(_) => "domain",
+            Change::Reflection(_) => "reflection",
         }
     }
 
@@ -150,6 +226,7 @@ impl Change {
         match self {
             Change::Engram(change) => &change.domain,
             Change::Domain(change) => &change.domain,
+            Change::Reflection(change) => &change.domain,
         }
     }
 
@@ -158,6 +235,7 @@ impl Change {
         let slot = match self {
             Change::Engram(change) => &mut change.audience,
             Change::Domain(change) => &mut change.audience,
+            Change::Reflection(change) => &mut change.audience,
         };
         if slot.is_none() {
             *slot = Some(audience.clone());
@@ -167,7 +245,7 @@ impl Change {
     pub fn draft_of(&self) -> Option<&str> {
         match self {
             Change::Engram(change) => change.draft_of.as_deref(),
-            Change::Domain(_) => None,
+            Change::Domain(_) | Change::Reflection(_) => None,
         }
     }
 
@@ -177,6 +255,7 @@ impl Change {
         match self {
             Change::Engram(change) => change.audience.as_ref(),
             Change::Domain(change) => change.audience.as_ref(),
+            Change::Reflection(change) => change.audience.as_ref(),
         }
     }
 
@@ -186,6 +265,7 @@ impl Change {
         match self {
             Change::Engram(change) => serde_json::to_string(change),
             Change::Domain(change) => serde_json::to_string(change),
+            Change::Reflection(change) => serde_json::to_string(change),
         }
     }
 }
@@ -237,6 +317,10 @@ struct Ring {
     entries: VecDeque<Envelope>,
     /// The last `engram` announcement and when, for the duplicate window.
     last_engram: Option<(EngramChanged, Instant)>,
+    /// The `reflection` announcements with a checksum inside the duplicate
+    /// window, oldest first. One echo batch can name several pages, so this
+    /// keeps more than the last.
+    recent_reflections: VecDeque<(ReflectionChanged, Instant)>,
     /// The audiences captured for domain names being renamed or removed,
     /// stamped onto every event under that name until the capture ends.
     captured: HashMap<String, DomainAudience>,
@@ -270,6 +354,7 @@ impl ChangeBus {
             ring: Mutex::new(Ring {
                 entries: VecDeque::with_capacity(RING_CAPACITY),
                 last_engram: None,
+                recent_reflections: VecDeque::new(),
                 captured: HashMap::new(),
             }),
         }
@@ -300,6 +385,32 @@ impl ChangeBus {
                 return None;
             }
             ring.last_engram = Some((engram.clone(), now));
+        }
+        if let Change::Reflection(reflection) = &change
+            && reflection.checksum.is_some()
+        {
+            let now = Instant::now();
+            while ring
+                .recent_reflections
+                .front()
+                .is_some_and(|(_, at)| now.duration_since(*at) >= DUPLICATE_WINDOW)
+            {
+                ring.recent_reflections.pop_front();
+            }
+            // Only the latest event of this path and kind counts: a file that
+            // went A, B and back to A inside the window is a change again.
+            let latest = ring.recent_reflections.iter().rev().find(|(seen, _)| {
+                seen.domain == reflection.domain
+                    && seen.path == reflection.path
+                    && seen.kind == reflection.kind
+            });
+            if latest.is_some_and(|(seen, _)| seen.checksum == reflection.checksum) {
+                return None;
+            }
+            if ring.recent_reflections.len() == RING_CAPACITY {
+                ring.recent_reflections.pop_front();
+            }
+            ring.recent_reflections.push_back((reflection.clone(), now));
         }
         let seq = self.seq.fetch_add(1, Ordering::Relaxed).saturating_add(1);
         let id = EventId {
@@ -613,6 +724,105 @@ mod tests {
             panic!()
         };
         assert_eq!(events[0].change.audience(), None);
+    }
+
+    #[test]
+    fn a_reflection_event_is_named_reflection_and_carries_its_path() {
+        let change = Change::Reflection(ReflectionChanged {
+            domain: "eng".to_string(),
+            path: "ops/a.md".to_string(),
+            kind: ReflectionChangeKind::Moved,
+            from: Some("guides/a.md".to_string()),
+            actor: Some("jordi".to_string()),
+            checksum: Some("ab".to_string()),
+            audience: None,
+        });
+        assert_eq!(change.name(), "reflection");
+        assert_eq!(change.domain(), "eng");
+        assert_eq!(change.draft_of(), None);
+        let data: serde_json::Value = serde_json::from_str(&change.data().unwrap()).unwrap();
+        assert_eq!(
+            data,
+            serde_json::json!({ "domain": "eng", "path": "ops/a.md", "kind": "moved", "from": "guides/a.md", "actor": "jordi" })
+        );
+        let switched = Change::Reflection(ReflectionChanged {
+            domain: "eng".to_string(),
+            path: String::new(),
+            kind: ReflectionChangeKind::Switched,
+            from: None,
+            actor: None,
+            checksum: None,
+            audience: None,
+        });
+        let data: serde_json::Value = serde_json::from_str(&switched.data().unwrap()).unwrap();
+        // Fluid drops a frame whose path is not a string: an empty one it keeps.
+        assert_eq!(data["path"], "");
+        assert_eq!(data["kind"], "switched");
+    }
+
+    fn reflection(path: &str, kind: ReflectionChangeKind, checksum: Option<&str>) -> Change {
+        Change::Reflection(ReflectionChanged {
+            domain: "eng".to_string(),
+            path: path.to_string(),
+            kind,
+            from: None,
+            actor: None,
+            checksum: checksum.map(str::to_string),
+            audience: None,
+        })
+    }
+
+    /// The watcher's echo of an engine write (the same file, so the same
+    /// checksum, a moment later) is dropped; a second write of the same page
+    /// inside the window is new content and is heard, and an event that
+    /// carries no checksum is never taken for an echo.
+    #[test]
+    fn a_reflection_echo_inside_two_seconds_is_dropped_and_new_content_is_not() {
+        use ReflectionChangeKind::{Changed, Threads};
+        let bus = ChangeBus::new();
+        assert!(
+            bus.announce(reflection("a.md", Threads, Some("1")))
+                .is_some()
+        );
+        assert!(
+            bus.announce(reflection("b.md", Threads, Some("9")))
+                .is_some()
+        );
+        assert!(
+            bus.announce(reflection("a.md", Threads, Some("1")))
+                .is_none(),
+            "the echo of the first, behind another page's event"
+        );
+        assert!(
+            bus.announce(reflection("a.md", Threads, Some("2")))
+                .is_some()
+        );
+        assert!(
+            bus.announce(reflection("a.md", Changed, Some("2")))
+                .is_some()
+        );
+        assert!(bus.announce(reflection("a.md", Threads, None)).is_some());
+        assert!(bus.announce(reflection("a.md", Threads, None)).is_some());
+        assert_eq!(bus.ring_len(), 6);
+        // A, B and back to A: the last one is new content again.
+        assert!(
+            bus.announce(reflection("c.md", Threads, Some("A")))
+                .is_some()
+        );
+        assert!(
+            bus.announce(reflection("c.md", Threads, Some("B")))
+                .is_some()
+        );
+        assert!(
+            bus.announce(reflection("c.md", Threads, Some("A")))
+                .is_some()
+        );
+        assert!(
+            bus.announce(reflection("c.md", Threads, Some("A")))
+                .is_none()
+        );
+        let data = reflection("a.md", Threads, Some("1")).data().unwrap();
+        assert!(!data.contains("checksum"), "{data}");
     }
 
     #[test]

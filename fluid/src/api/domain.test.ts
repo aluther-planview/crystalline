@@ -69,6 +69,20 @@ describe("a browse payload", () => {
     expect(alpha.type).toBe("engram");
   });
 
+  it("reads each folder's recursive count, and none from an older server", () => {
+    expect(
+      readTree(
+        {
+          ...browsePayload(),
+          folder_counts: { notes: 12, broken: "x" },
+        },
+        "eng",
+        "",
+      ).folderCounts,
+    ).toEqual({ notes: 12 });
+    expect(readTree(browsePayload(), "eng", "").folderCounts).toEqual({});
+  });
+
   it("carries the level's bound: whether it was cut, and what it holds", () => {
     const tree = readTree(
       { ...browsePayload(), truncated: true, total: 501 },
@@ -165,9 +179,12 @@ describe("the manifest policies", () => {
         // key and what holds are what a card draws, and the rest has
         // defaults of its own.
         { key: "generated_indexes", effective: "local" },
-        // Neither of these is a row anything could be drawn from.
+        // A text key nothing has set holds an empty value, which is a value.
+        { key: "reflection_home", kind: "text", effective: "" },
+        // None of these is a row anything could be drawn from.
         { declared: "x", effective: "y" },
         { key: "orphan" },
+        { key: "blank_choice", effective: "" },
       ],
     });
 
@@ -194,6 +211,16 @@ describe("the manifest policies", () => {
         // No default on the wire reads as "what holds is the default", which
         // is true of every key nobody declared.
         default: "local",
+        meaning: "",
+        changedBy: "owner",
+      },
+      {
+        key: "reflection_home",
+        kind: "text",
+        declared: null,
+        effective: "",
+        values: [],
+        default: "",
         meaning: "",
         changedBy: "owner",
       },
@@ -240,6 +267,8 @@ describe("the manifest policies", () => {
     // The write landed in the caller's own draft, which is a different
     // sentence from the write landing in the domain.
     expect(written.draft).toBe(true);
+    // A draft and the switch-off note never come together.
+    expect(written.note).toBeNull();
     expect(written.checksum).toBe("def456");
     expect(written.sections?.policies[0]?.declared).toBe("direct");
   });

@@ -24,7 +24,7 @@
 //! file parses and carries the `SessionStart`, `Stop` and `UserPromptSubmit`
 //! hooks (Copilot's `UserPromptSubmit` copy is reported present but noted
 //! inert - a config-file prompt hook's output is dropped there) and how
-//! many of the five managed skills are installed or locally modified (against the
+//! many of the six managed skills are installed or locally modified (against the
 //! install receipt when one exists) and whether a receipt version skew or
 //! retired leftovers await the next session-start refresh - filesystem
 //! only, with no shell-out to the harness's own CLI, so this check stays
@@ -69,7 +69,7 @@ use crystalline_core::config::{self, DatabaseBackend, DomainEntry, GlobalConfig,
 use crystalline_core::provision;
 use crystalline_core::text::plural;
 use crystalline_core::verify::{self, VerifyOptions};
-use crystalline_core::{HarnessKind, harness_paths};
+use crystalline_core::{DomainLayout, HarnessKind, PathClass, harness_paths, slash_rel};
 use crystalline_index::{
     FileStamp, LocalModel, SnapshotChoice, Store, TagCluster, cached_model_dirs, choose_snapshot,
     configured_model_id, local_model, tag_clusters_with_aliases,
@@ -179,6 +179,10 @@ pub struct DomainDoctor {
     /// which never take a host lock).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_instance_id: Option<String>,
+    /// The host's name for people (its public URL's host or hostname, the
+    /// id for a lock written before labels), when hosted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_label: Option<String>,
     /// The host's last heartbeat, RFC 3339, when hosted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_heartbeat_at: Option<String>,
@@ -473,7 +477,7 @@ pub struct EnvironmentDoctor {
 /// One coding harness's onboarding trace: whether its settings/hooks file
 /// exists, parses, carries our managed hooks (three for the legacy harnesses,
 /// the session hook alone for a profile harness), what state its MCP entry
-/// is in (a profile harness) and how many of the five managed skills are
+/// is in (a profile harness) and how many of the six managed skills are
 /// installed at its skills folder. Checked purely from
 /// the filesystem, reusing `install`'s own presence predicate and skill
 /// list, with no shell-out to the harness's own CLI (`claude`, `codex` or
@@ -515,7 +519,7 @@ pub struct HarnessDoctor {
     /// `None` - a corrupt file is "checked, found absent (we could not read
     /// it)", not "nothing to check here".
     pub prompt_hook: Option<bool>,
-    /// How many of the five managed skills have a `SKILL.md` at this
+    /// How many of the six managed skills have a `SKILL.md` at this
     /// harness's skills folder, whether or not its content still matches the
     /// embedded copy.
     pub skills_installed: usize,
@@ -1399,6 +1403,117 @@ pub struct DoctorReport {
     /// Why `--merge-desktop-state` stopped, such as a daemon from the
     /// private folder that still runs.
     pub merge_error: Option<String>,
+    /// Registered domains whose names differ only in letter case, as
+    /// pairs. Each is a warning, never a counted problem: both keep
+    /// working, and the remedy is a rename the person chooses.
+    pub case_twins: Vec<[String; 2]>,
+    /// The texts the server kept when a co-editing room could not save,
+    /// oldest first; only the `--domain` one's on a `--domain` run. Never a
+    /// problem and never touched by `--fix`: each is the last copy of
+    /// somebody's work, and only a person drops one (`crystalline kept
+    /// drop`). One older than [`crate::kept::STALE_DAYS`] days is a warning.
+    pub kept: Vec<KeptDoctor>,
+}
+
+/// One kept text in the `doctor` report.
+#[derive(Debug, Clone, Serialize)]
+pub struct KeptDoctor {
+    /// The id `crystalline kept show` and `drop` take.
+    pub id: String,
+    /// The domain the room belonged to.
+    pub domain: String,
+    /// Whose review draft it was kept from, `None` for the domain's own text.
+    pub owner: Option<String>,
+    /// Whether its domain was removed from this machine since.
+    pub removed: bool,
+    /// Whether this is an unfinished keep: a temporary file a keep left
+    /// when its process stopped. It may be the only copy.
+    pub unfinished: bool,
+    /// `engram` or `reflection`.
+    pub kind: crystalline_core::kept::KeptKind,
+    /// The engram's file path in its domain, or the page's path inside
+    /// `reflections/`.
+    pub path: String,
+    /// When it was kept, RFC 3339.
+    pub kept_at: String,
+    /// Its size in bytes.
+    pub bytes: u64,
+    /// The file it is in.
+    pub file: String,
+    /// Kept more than [`crate::kept::STALE_DAYS`] days ago.
+    pub stale: bool,
+    /// The human line's wording of what and when, kept off the JSON.
+    #[serde(skip)]
+    pub line: String,
+}
+
+/// The kept texts on this machine (only `domain_filter`'s when given), each
+/// marked stale when it is older than [`crate::kept::STALE_DAYS`] days at
+/// `now`. Read-only, whatever `--fix` says.
+fn check_kept(
+    found: Vec<crystalline_core::kept::KeptText>,
+    domain_filter: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<KeptDoctor> {
+    found
+        .into_iter()
+        .filter(|k| domain_filter.is_none_or(|d| k.domain == d))
+        .map(|k| {
+            let stale = now - k.kept_at > chrono::Duration::days(crate::kept::STALE_DAYS);
+            KeptDoctor {
+                line: format!(
+                    "{} {}, kept {}, {}",
+                    k.id,
+                    crate::kept::what(&k),
+                    crate::kept::when(&k),
+                    cmd::human_size(k.bytes)
+                ),
+                id: k.id.clone(),
+                domain: k.domain.clone(),
+                owner: k.owner.clone(),
+                removed: k.removed,
+                unfinished: k.unfinished,
+                kind: k.kind,
+                path: k.path.clone(),
+                kept_at: k.kept_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                bytes: k.bytes,
+                file: k.file.display().to_string(),
+                stale,
+            }
+        })
+        .collect()
+}
+
+/// The kept texts section of the human report.
+fn render_kept(out: &mut String, kept: &[KeptDoctor]) {
+    use std::fmt::Write as _;
+    if kept.is_empty() {
+        return;
+    }
+    let _ = writeln!(out, "kept texts:");
+    for k in kept {
+        if k.unfinished {
+            let _ = writeln!(
+                out,
+                "  [warning] {}: a keep that never finished, perhaps the only copy of this text: {}",
+                k.line, k.file
+            );
+        } else if k.stale {
+            let _ = writeln!(
+                out,
+                "  [warning] {}, more than {} days ago: {}",
+                k.line,
+                crate::kept::STALE_DAYS,
+                k.file
+            );
+        } else {
+            let _ = writeln!(out, "  {}: {}", k.line, k.file);
+        }
+    }
+    let _ = writeln!(
+        out,
+        "  a room could not save these; show one with crystalline kept show <id>, copy it back into its page or engram, then crystalline kept drop <id> (doctor never deletes them)"
+    );
 }
 
 /// A rename journal waiting in the state directory: a domain rename an
@@ -1593,6 +1708,9 @@ impl DoctorReport {
             .as_ref()
             .map_or(0, |m| m.conflicts.len() + m.not_moved.len());
         n += usize::from(self.merge_error.is_some());
+        // Kept texts never count: no `--fix` resolves one, so counting them
+        // would fail doctor until a person drops each, and an old one is a
+        // warning in its section instead.
         n
     }
 }
@@ -1850,6 +1968,9 @@ pub async fn run(
 
     let daemon_task = check_task(fix);
 
+    let kept = check_kept(crate::kept::scan_here(), domain_filter, chrono::Utc::now());
+    let case_twins = check_case_twins(cfg);
+
     Ok(DoctorReport {
         index,
         domains,
@@ -1872,6 +1993,8 @@ pub async fn run(
         desktop_states,
         merge,
         merge_error,
+        kept,
+        case_twins,
     })
 }
 
@@ -2369,27 +2492,37 @@ fn policy_values(key: &str) -> &'static [&'static str] {
         .unwrap_or(&[])
 }
 
+/// What a declared value has to become, as a sentence: the values a key
+/// takes, or for a text key what that key holds.
+fn policy_expected(key: &str) -> String {
+    match policy_values(key) {
+        [] if key == crystalline_core::REFLECTION_HOME_KEY => {
+            "an http or https address with no trailing slash".to_string()
+        }
+        [] => "a valid domain name".to_string(),
+        values => join_or(values),
+    }
+}
+
 /// `a`, `a or b`, `a, b or c`: the values a key takes, read as a sentence
-/// rather than as a list a reader has to parse. A [`PolicyKind::Text`] key
-/// (`values` empty) has no enumerable list to join, so it reads as "a valid
-/// domain name" instead - the only free-text key today, and what an invalid
-/// declaration of it actually needs to become.
+/// rather than as a list a reader has to parse.
 fn join_or(values: &[&str]) -> String {
     match values {
-        [] => "a valid domain name".to_string(),
+        // Never reached: `policy_expected` answers a key with no values first.
+        [] => String::new(),
         [one] => one.to_string(),
         [rest @ .., last] => format!("{} or {last}", rest.join(", ")),
     }
 }
 
 /// What a domain reads a policy key as, for the printed line: the value
-/// itself, or - for a [`PolicyKind::Text`] key an invalid declaration leaves
-/// with nothing to fall back to - "ignored; the local name holds".
-fn policy_read_as(read_as: &str) -> &str {
-    if read_as.is_empty() {
-        "ignored; the local name holds"
-    } else {
-        read_as
+/// itself, or for a text key an invalid declaration leaves empty, what that
+/// means for the key.
+fn policy_read_as<'a>(key: &str, read_as: &'a str) -> &'a str {
+    match (read_as.is_empty(), key) {
+        (false, _) => read_as,
+        (true, crystalline_core::REFLECTION_HOME_KEY) => "ignored; the Reflection has no home",
+        (true, _) => "ignored; the local name holds",
     }
 }
 
@@ -2588,7 +2721,11 @@ async fn check_domain_checks(
     };
     if let Some(stamps) = stamps {
         d.index_checked = true;
-        let on_disk = markdown_rel_paths(&path);
+        // The mode in effect, from the stamps just read: an engram still
+        // waiting under a pending switch is an engram, and a page of an
+        // effective Reflection never is.
+        let reflection = crystalline_index::reflection_mode(&path, stamps.keys());
+        let on_disk = markdown_rel_paths(&path, &DomainLayout::at(&path, reflection));
         let disk_set: HashSet<&str> = on_disk.iter().map(String::as_str).collect();
         let db_set: HashSet<&str> = stamps.keys().map(String::as_str).collect();
 
@@ -2666,6 +2803,7 @@ async fn check_domain_checks(
             && let Ok(Some(host)) = store.domain_host(domain_id).await
         {
             d.host_instance_id = Some(host.instance_id);
+            d.host_label = Some(host.label);
             d.host_heartbeat_at = Some(host.heartbeat_at);
         }
     }
@@ -2758,7 +2896,14 @@ struct StrayPair {
 /// the permalink slugifies it. Neither side's index state is assumed.
 fn stray_pairs(root: &Path) -> Vec<StrayPair> {
     let mut by_key: BTreeMap<(String, String), Vec<StrayFile>> = BTreeMap::new();
-    for rel in markdown_rel_paths(root) {
+    // The mode in effect, as a share takes it. No index has been read yet,
+    // so it is asked of the files on disk: while a switch is pending, the
+    // engrams still under `reflections/` are engrams here too.
+    let layout = DomainLayout::at(
+        root,
+        crystalline_index::reflection_mode(root, std::iter::empty::<&str>()),
+    );
+    for rel in markdown_rel_paths(root, &layout) {
         let file = root.join(&rel);
         // The time is read before and after the text. A write in between
         // would pair one text with the other's time, so then the time counts
@@ -2942,29 +3087,37 @@ fn settle_stray(
 }
 
 /// Every `.md` file under `root`, relative and forward-slashed, skipping
-/// dot-directories, dot-files and the OKF reserved filenames. Mirrors the sync
-/// engine's own walk so orphan and unindexed detection line up with what a sync
-/// would compute.
-fn markdown_rel_paths(root: &Path) -> Vec<String> {
+/// dot-directories, dot-files, the OKF reserved filenames, the artifact
+/// folders the MANIFEST provisions from inside the root and the Reflection's
+/// folder while `layout` has it in effect. Mirrors the sync engine's own walk
+/// so orphan and unindexed detection line up with what a sync would compute.
+/// The caller builds `layout` with the Reflection mode it can know: the mode
+/// in effect where it has read the index, the declared switch where not.
+fn markdown_rel_paths(root: &Path, layout: &DomainLayout) -> Vec<String> {
     let mut out = Vec::new();
+    // The prune the sync and verify apply: hidden folders, artifact folders
+    // and an effective Reflection's folder are never entered.
     let walker = walkdir::WalkDir::new(root)
         .into_iter()
-        .filter_entry(|e| e.depth() == 0 || !is_hidden(&e.file_name().to_string_lossy()));
+        .filter_entry(|e| e.depth() == 0 || !layout.prunes_dir(&slash_rel(root, e.path())));
     for entry in walker.filter_map(|e| e.ok()) {
         if !entry.file_type().is_file() {
             continue;
         }
-        let fname = entry.file_name().to_string_lossy();
+        let rel = relative_slash_path(root, entry.path());
         // The OKF reserved names are never indexed (the sync walk skips them),
-        // so counting them here would report every generated index file as
-        // unindexed.
-        if is_hidden(&fname)
-            || crystalline_core::is_reserved_file(&fname)
-            || !fname.to_lowercase().ends_with(".md")
-        {
-            continue;
+        // so counting them would report every generated index file as
+        // unindexed. Markdown under assets/ is an attachment, never an
+        // engram, so it is left out too.
+        match layout.classify(&rel) {
+            PathClass::Engram => out.push(rel),
+            PathClass::Artifact
+            | PathClass::EngramAsset
+            | PathClass::Reserved
+            | PathClass::Hidden
+            | PathClass::Other
+            | PathClass::Reflection(_) => {}
         }
-        out.push(relative_slash_path(root, entry.path()));
     }
     out
 }
@@ -3025,17 +3178,7 @@ fn relative_slash_path(root: &Path, p: &Path) -> String {
 /// The literal, zero-cost half of [`relative_slash_path`]: `Some` only when
 /// `root` is exactly a component prefix of `p`.
 fn strip_to_slash(root: &Path, p: &Path) -> Option<String> {
-    let rel = p.strip_prefix(root).ok()?;
-    Some(
-        rel.components()
-            .map(|c| c.as_os_str().to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join("/"),
-    )
-}
-
-fn is_hidden(name: &str) -> bool {
-    name.starts_with('.') && name != "." && name != ".."
+    p.starts_with(root).then(|| slash_rel(root, p))
 }
 
 /// The report's words for who a stale lock used to belong to. A `lock_stale`
@@ -3256,7 +3399,7 @@ fn render_origin(origin: &OriginConfig) -> String {
 /// only when it leaves a trace): whether a settings/hooks file exists,
 /// whether it parses, whether it carries our managed hooks, the state of the
 /// MCP entry and pointer file where the profile has them, and how many of
-/// the five managed skills are present (a folder several harnesses write is
+/// the six managed skills are present (a folder several harnesses write is
 /// attributed to the rows that write it, a covered row shows its cover). No
 /// shell-out to any harness CLI, so this stays fast and works offline; user
 /// scope only, reusing `install`'s own presence predicate and skill list
@@ -3843,6 +3986,10 @@ async fn embedding_summary(store: &dyn Store, cfg: &GlobalConfig) -> Result<serd
         .embedding_coverage()
         .await
         .map_err(|e| anyhow!("could not read embedding coverage: {e}"))?;
+    let reflection = store
+        .embedding_coverage_of(crystalline_index::ChunkTable::Reflection)
+        .await
+        .map_err(|e| anyhow!("could not read reflection embedding coverage: {e}"))?;
     let configured = configured_model_id(cfg.embeddings.as_ref());
     let embedded_with_configured = coverage.embedded_for(&configured);
     let stale_chunks: usize = coverage
@@ -3896,7 +4043,7 @@ async fn embedding_summary(store: &dyn Store, cfg: &GlobalConfig) -> Result<serd
         }
         _ => None,
     };
-    Ok(serde_json::json!({
+    let mut summary = serde_json::json!({
         "configured_model": configured,
         "configured_repo": configured_repo,
         "model_snapshot": model_snapshot,
@@ -3906,7 +4053,22 @@ async fn embedding_summary(store: &dyn Store, cfg: &GlobalConfig) -> Result<serd
         "stale_chunks": stale_chunks,
         "models": coverage.models,
         "cached_models": cached_models,
-    }))
+    });
+    // Reflection chunks, only while there are any, so a report without a
+    // Reflection stays as it was.
+    if reflection.total_chunks > 0
+        && let Some(map) = summary.as_object_mut()
+    {
+        map.insert(
+            "reflection_chunks".to_string(),
+            serde_json::json!(reflection.total_chunks),
+        );
+        map.insert(
+            "reflection_embedded".to_string(),
+            serde_json::json!(reflection.embedded_for(&configured)),
+        );
+    }
+    Ok(summary)
 }
 
 /// Whether a cached repository belongs in the embedding listing: anything but
@@ -4321,13 +4483,14 @@ pub fn render_human(report: &DoctorReport) -> String {
         let _ = writeln!(out, "{} ({})", d.name, d.path);
         // Ownership in a shared database: who hosts this file domain. Unhosted
         // domains print nothing extra.
-        if let Some(host) = &d.host_instance_id {
+        if let Some(id) = &d.host_instance_id {
+            let host = d.host_label.as_ref().unwrap_or(id);
             let hb = d
                 .host_heartbeat_at
                 .as_deref()
                 .map(|h| format!(" (last heartbeat {h})"))
                 .unwrap_or_default();
-            let _ = writeln!(out, "  hosted by instance {host}{hb}");
+            let _ = writeln!(out, "  hosted by {host}{hb}");
         }
         // A rebuild that was stamped and never cleared. Nothing was destroyed -
         // the rows below are the complete ones from before it - so the finding
@@ -4392,8 +4555,8 @@ pub fn render_human(report: &DoctorReport) -> String {
                 "  [problem] MANIFEST {}: {} is not {}; read as {}",
                 p.key,
                 p.declared,
-                join_or(policy_values(&p.key)),
-                policy_read_as(&p.read_as)
+                policy_expected(&p.key),
+                policy_read_as(&p.key, &p.read_as)
             );
         }
         // Said once per domain so an empty orphan and unindexed list is never
@@ -4904,9 +5067,17 @@ pub fn render_human(report: &DoctorReport) -> String {
             (Some(r), None) => format!(" ({r}, not downloaded)"),
             _ => String::new(),
         };
+        let reflection = match e["reflection_chunks"].as_u64().filter(|n| *n > 0) {
+            Some(n) => format!(
+                ", {} ({} embedded)",
+                plural(n as usize, "reflection chunk", "reflection chunks"),
+                e["reflection_embedded"].as_u64().unwrap_or(0)
+            ),
+            None => String::new(),
+        };
         let _ = writeln!(
             out,
-            "embeddings: {}/{} chunks embedded with '{}'{named} ({} from a different model)",
+            "embeddings: {}/{} chunks embedded with '{}'{named} ({} from a different model){reflection}",
             e["embedded_with_configured_model"],
             e["total_chunks"],
             e["configured_model"].as_str().unwrap_or_default(),
@@ -5248,13 +5419,18 @@ pub fn render_human(report: &DoctorReport) -> String {
         }
     }
 
-    if let Some(names) = &report.names {
-        render_names(&mut out, names, report.fix);
-    }
+    render_names(
+        &mut out,
+        report.names.as_ref(),
+        &report.case_twins,
+        report.fix,
+    );
 
     if let Some(rename) = &report.rename {
         render_rename(&mut out, rename);
     }
+
+    render_kept(&mut out, &report.kept);
 
     // Advisory tag hygiene: near-duplicate clusters, never a counted problem.
     if let Some(t) = &report.tags
@@ -5426,9 +5602,15 @@ fn orphaned_domain_line(d: &OrphanedDomainDoctor) -> String {
 }
 
 /// The domain name section: nothing at all when there is nothing to say.
-fn render_names(out: &mut String, names: &NamesDoctor, fix: bool) {
+fn render_names(
+    out: &mut String,
+    names: Option<&NamesDoctor>,
+    case_twins: &[[String; 2]],
+    fix: bool,
+) {
     use std::fmt::Write as _;
-    let lines = name_lines(names, fix);
+    let mut lines = names.map(|n| name_lines(n, fix)).unwrap_or_default();
+    lines.extend(case_twins.iter().map(|[a, b]| case_twin_line(a, b)));
     if lines.is_empty() {
         return;
     }
@@ -5436,6 +5618,34 @@ fn render_names(out: &mut String, names: &NamesDoctor, fix: bool) {
     for line in lines {
         let _ = writeln!(out, "  {line}");
     }
+}
+
+/// The warning for two registered domains whose names differ only in
+/// letter case.
+fn case_twin_line(a: &str, b: &str) -> String {
+    format!(
+        "[warning] '{a}' and '{b}' differ only in letter case, so on a disk that ignores case \
+         they share one state folder (kept texts, drafts, origin state); rename one: \
+         crystalline domain rename {b} <new name>"
+    )
+}
+
+/// Every pair of registered domains whose names fold equal (see
+/// [`crystalline_core::config::registration::fold_domain_name`]), each pair
+/// in registration order. Registration refuses such a pair since 0.27.0;
+/// an older install may still hold one, and it keeps working.
+fn check_case_twins(cfg: &GlobalConfig) -> Vec<[String; 2]> {
+    use crystalline_core::config::registration::fold_domain_name;
+    let names: Vec<&String> = cfg.domains.keys().collect();
+    let mut pairs = Vec::new();
+    for (i, a) in names.iter().enumerate() {
+        for b in &names[i + 1..] {
+            if fold_domain_name(a) == fold_domain_name(b) {
+                pairs.push([a.to_string(), b.to_string()]);
+            }
+        }
+    }
+    pairs
 }
 
 /// One line per name finding, each naming its next step. Only the
@@ -5946,6 +6156,78 @@ mod tests {
         }
     }
 
+    /// The host line names the host by its label; a report with no label
+    /// (an older daemon's answer) names the instance id.
+    #[test]
+    fn the_host_line_names_the_label_else_the_id() {
+        let mut report = report_with_orphans(IndexAccess::default(), &[]);
+        report.domains[0].host_instance_id = Some("3f2a-alpha".to_string());
+        report.domains[0].host_label = Some("build-box (3f2a)".to_string());
+        report.domains[0].host_heartbeat_at = Some("2026-10-16T10:00:00+00:00".to_string());
+        let out = render_human(&report);
+        assert!(
+            out.contains("  hosted by build-box (3f2a) (last heartbeat 2026-10-16T10:00:00+00:00)"),
+            "{out}"
+        );
+        report.domains[0].host_label = None;
+        let out = render_human(&report);
+        assert!(
+            out.contains("  hosted by 3f2a-alpha (last heartbeat"),
+            "{out}"
+        );
+    }
+
+    /// A `--domain` run lists that domain's kept texts only; one kept more
+    /// than 30 days before `now` is stale and rendered as a warning; none of
+    /// them is a problem.
+    #[test]
+    fn kept_texts_follow_the_domain_filter_and_old_ones_warn() {
+        use crystalline_core::kept::{self, KeptKind};
+        let dir = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now();
+        kept::write(
+            dir.path(),
+            "eng",
+            None,
+            KeptKind::Reflection,
+            "a.md",
+            now,
+            "x",
+        )
+        .unwrap();
+        kept::write(
+            dir.path(),
+            "ops",
+            None,
+            KeptKind::Engram,
+            "b.md",
+            now - chrono::Duration::days(31),
+            "y",
+        )
+        .unwrap();
+        let all = check_kept(kept::scan(dir.path()), None, now);
+        assert_eq!(
+            all.iter()
+                .map(|k| (k.domain.as_str(), k.stale))
+                .collect::<Vec<_>>(),
+            vec![("ops", true), ("eng", false)]
+        );
+        let eng = check_kept(kept::scan(dir.path()), Some("eng"), now);
+        assert_eq!(eng.len(), 1);
+        assert_eq!(eng[0].path, "a.md");
+        let report = DoctorReport {
+            kept: all,
+            ..DoctorReport::default()
+        };
+        assert_eq!(report.remaining_problems(), 0);
+        let out = render_human(&report);
+        assert!(
+            out.contains("[warning]") && out.contains("ops engram b.md"),
+            "{out}"
+        );
+        assert!(out.contains("eng reflection a.md"), "{out}");
+    }
+
     /// A mismatch the daemon's facts show is a warning in the service
     /// section, never a problem, so doctor's exit code is unchanged.
     #[test]
@@ -6299,6 +6581,36 @@ mod tests {
         let out = render_human(&report);
         assert!(out.contains("10/20 chunks embedded with 'm'"), "{out}");
         assert!(!out.contains("cached models:"), "{out}");
+    }
+
+    /// The embeddings line names reflection chunks only while there are any,
+    /// so a report without a Reflection reads as it always did.
+    #[test]
+    fn the_embeddings_line_names_reflection_chunks_only_when_there_are_some() {
+        let mut report = report_with_orphans(IndexAccess::Direct, &[]);
+        report.embeddings = Some(serde_json::json!({
+            "embedded_with_configured_model": 10,
+            "total_chunks": 20,
+            "configured_model": "m",
+            "stale_chunks": 0,
+        }));
+        let without = render_human(&report);
+        assert!(!without.contains("reflection chunk"), "{without}");
+        report.embeddings = Some(serde_json::json!({
+            "embedded_with_configured_model": 10,
+            "total_chunks": 20,
+            "configured_model": "m",
+            "stale_chunks": 0,
+            "reflection_chunks": 3,
+            "reflection_embedded": 1,
+        }));
+        let with = render_human(&report);
+        assert!(
+            with.contains(
+                "(0 stale chunks from a different model), 3 reflection chunks (1 embedded)\n"
+            ),
+            "{with}"
+        );
     }
 
     /// Over a daemon the doctor reads the index through a read verb, so
@@ -7765,6 +8077,23 @@ mod tests {
     const NEWER: &str = "2026-09-20T10:00:00+00:00";
 
     #[tokio::test]
+    async fn markdown_under_assets_is_not_listed_as_an_unindexed_engram() {
+        // The sync keeps `assets/` for attachments: a Markdown file there is
+        // never an engram, so it must not show up as one waiting to be synced.
+        let files = vec![
+            (S_PATH, review_standards("The rule.", NEWER)),
+            (
+                "assets/notes.md",
+                "# Attached notes\n\nNot an engram.\n".to_string(),
+            ),
+        ];
+        let (_dir, d) = stray_doctor(&files, None, |_| {}, false, false).await;
+        assert!(d.index_checked);
+        assert!(d.unindexed.is_empty(), "{:?}", d.unindexed);
+        assert!(d.orphans.is_empty(), "{:?}", d.orphans);
+    }
+
+    #[tokio::test]
     async fn a_stray_copy_is_found_and_split_out_of_unindexed() {
         let (_dir, d) = stray_doctor(
             &pair(
@@ -8087,9 +8416,40 @@ mod tests {
         assert_eq!(std::fs::read_to_string(root.join(S_PATH)).unwrap(), stray);
     }
 
+    /// A pending switch keeps the engrams under `reflections/` engrams, as a
+    /// share takes them, so a stray pair there is found; once the switch is
+    /// in effect, the folder is the Reflection's and nothing there is.
+    #[test]
+    fn a_pending_switch_keeps_stray_copies_under_reflections_in_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("kb");
+        put(
+            &root,
+            "MANIFEST.md",
+            &MANIFEST_KB.replacen("---\n\n", "reflection: on\n---\n\n", 1),
+        );
+        let original = format!("reflections/{O_PATH}");
+        let stray = format!("reflections/{S_PATH}");
+        put(&root, &original, &review_standards("The old rule.", OLDER));
+        put(&root, &stray, &review_standards("The new rule.", NEWER));
+        let pairs = stray_pairs(&root);
+        assert_eq!(pairs.len(), 1, "{pairs:?}");
+        assert_eq!(pairs[0].stray.rel, stray);
+
+        // The engrams moved out and a page with an id line in their place:
+        // the switch is in effect, and the folder holds no engram.
+        std::fs::remove_dir_all(root.join("reflections")).unwrap();
+        put(
+            &root,
+            "reflections/guide.md",
+            "# Guide\n\n## One\n<!-- r:aaaa1111 -->\n\nText.\n",
+        );
+        assert!(stray_pairs(&root).is_empty());
+    }
+
     #[tokio::test]
     async fn fix_runs_in_a_team_domain_and_leaves_local_changes() {
-        use crystalline_remote::changes::{LocalChange, detect_local_changes};
+        use crystalline_remote::changes::{LocalChange, detect_local_changes_against};
         use crystalline_remote::state::BaseStamp;
         let newer = review_standards("The new rule.", NEWER);
         let older = review_standards("The old rule.", OLDER);
@@ -8121,16 +8481,20 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let mut changes: Vec<String> = detect_local_changes(&root, &base)
-            .unwrap()
-            .changes
-            .iter()
-            .map(|change| match change {
-                LocalChange::Modified { path, .. } => format!("modified {path}"),
-                LocalChange::Deleted { path } => format!("deleted {path}"),
-                LocalChange::Added { path, .. } => format!("added {path}"),
-            })
-            .collect();
+        // The mode in effect, as a share takes it.
+        let state = tempfile::tempdir().unwrap();
+        let mode = crystalline_index::reflection_mode(&root, std::iter::empty::<&str>());
+        let mut changes: Vec<String> =
+            detect_local_changes_against(&root, &base, state.path(), mode)
+                .unwrap()
+                .changes
+                .iter()
+                .map(|change| match change {
+                    LocalChange::Modified { path, .. } => format!("modified {path}"),
+                    LocalChange::Deleted { path } => format!("deleted {path}"),
+                    LocalChange::Added { path, .. } => format!("added {path}"),
+                })
+                .collect();
         changes.sort();
         assert_eq!(
             changes,

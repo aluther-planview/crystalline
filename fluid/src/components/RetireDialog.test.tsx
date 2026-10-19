@@ -9,12 +9,15 @@
  * retire status change lands optimistically, before any round trip answers.
  */
 
-import { QueryClient } from "@tanstack/react-query";
-import { screen, waitFor, within } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { MemoryRouter, useLocation } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import App from "../App";
 import { api } from "../api/client";
+import { RetireDialog } from "./RetireDialog";
 import { domainEngramsRoot, singlePage } from "../api/engrams";
 import {
   answersFor,
@@ -125,6 +128,7 @@ describe("the retire dialog", () => {
             kind: null,
             line: null,
             snippet: null,
+            recordedAt: null,
           },
         ]),
     });
@@ -173,6 +177,28 @@ describe("the retire dialog", () => {
     expect(within(banner).getByText(/superseded/i)).toBeInTheDocument();
   });
 
+  it("a dialog that may not delete draws no permanent delete", async () => {
+    serve();
+    render(
+      <MemoryRouter>
+        <QueryClientProvider client={new QueryClient()}>
+          <RetireDialog
+            engram={detailResponse() as never}
+            backlinks={[]}
+            canDelete={false}
+            onClose={vi.fn()}
+          />
+        </QueryClientProvider>
+      </MemoryRouter>,
+    );
+    const dialog = await screen.findByRole("dialog", { name: /retire/i });
+    expect(
+      within(dialog).queryByRole("button", {
+        name: "Delete permanently instead",
+      }),
+    ).toBeNull();
+  });
+
   it("delete hides behind retire and warns with who points here", async () => {
     const deleted = vi.fn(() => undefined);
     serve({
@@ -209,6 +235,50 @@ describe("the retire dialog", () => {
       ([, init]) => init?.method === "DELETE",
     );
     expect(call?.[1]?.headers).toEqual({ "If-Match": '"3f8a1c05e2"' });
+  });
+
+  it("a delete lands on the engram view, even when the domain opens on its Reflection", async () => {
+    serve({
+      "/domains/eng/engrams/alpha": (_path, init) =>
+        init?.method === "DELETE" ? undefined : detailResponse(),
+      "/domains/eng/reflection": () => ({
+        domain: "eng",
+        state: "on",
+        home: "local",
+        home_url: null,
+        right: "curate",
+        engrams_visible: true,
+        pending_engrams: [],
+      }),
+    });
+    function LocationProbe() {
+      const location = useLocation();
+      return <div data-testid="probe">{location.pathname}</div>;
+    }
+    render(
+      <MemoryRouter initialEntries={["/d/eng/e/alpha"]}>
+        <App />
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+    await userEvent.click(
+      await screen.findByRole("button", { name: "More actions" }),
+    );
+    await userEvent.click(
+      await screen.findByRole("menuitem", { name: "Retire" }),
+    );
+    const dialog = await screen.findByRole("dialog", { name: /retire/i });
+    await userEvent.click(
+      within(dialog).getByRole("button", {
+        name: "Delete permanently instead",
+      }),
+    );
+    await userEvent.click(
+      await within(dialog).findByRole("button", { name: "Delete permanently" }),
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId("probe")).toHaveTextContent("/d/eng/engrams");
+    });
   });
 
   it("moves the tree and the listings on, so nothing keeps showing what was retired", async () => {

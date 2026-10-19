@@ -144,9 +144,9 @@ A chat memory is a hidden blob. One vendor owns it, it is tied to one model, and
 
 ## Fluid
 
-The primary author in Crystalline is the agent. Fluid is how you take part: read what was learned, correct a fact, add knowledge of your own, in the browser, without spending a token. It is built into the binary and on by default at `http://localhost:7411`. An engram is a page, the editor previews live, everyone in the same engram sees each other's cursors, search is the same hybrid ranking the agents use and a maintenance page shows what the knowledge needs next. The full tour: [Fluid, the web UI](docs/fluid.md).
+The primary author in Crystalline is the agent. Fluid is how you take part: read what was learned, correct a fact, add knowledge of your own, in the browser, without spending a token. It is built into the binary and on by default at `http://localhost:7411`. An engram is a page, the editor previews live, everyone in the same engram sees each other's cursors, search is the same hybrid ranking the agents use and a maintenance page shows what the knowledge needs next. The full tour: [Fluid, the web UI](docs/fluid.md). Pages can use callouts, status labels, math, task lists, footnotes and diagrams, and pasting from a wiki or a browser becomes clean Markdown: [The Markdown Crystalline understands](docs/markdown.md).
 
-![An engram in Fluid: frontmatter details, observations, typed relations and the agent's-eye view](assets/fluid-engram.jpg)
+![An engram in Fluid in the light theme: the learn, evolve, remember lifecycle as a diagram, observations, typed relations and the details rail](assets/fluid-engram.jpg)
 
 ## Deployment
 
@@ -164,6 +164,7 @@ Crystalline runs the same way in every scenario: a daemon in the middle keeps on
 | [Air-gapped or egress-restricted](docs/deployment.md#air-gapped-or-egress-restricted) | The `with-model` image or a pre-fetched model directory; nothing at runtime needs the network (with `evolve.contradictions` off, or its checkpoint pre-fetched too) |
 | [Shared database collaboration](docs/deployment.md#shared-database-collaboration) | Several instances share one PostgreSQL index, so every capture is visible to all of them that registered the domain |
 | [Team knowledge on GitHub](docs/deployment.md#team-knowledge-on-github) | A domain tracks a GitHub repository; sharing goes through reviewed proposals, or straight to the branch where the domain says so |
+| [Reflection on a team server](docs/deployment.md#reflection-on-a-team-server) | People and agents work on a domain's Reflection on one home instance, backed up to its own branch |
 | [Authenticated agents](docs/deployment.md#authenticated-agents) | HTTP MCP requires a personal token per agent, issued in Fluid or from the CLI |
 | [MCP clients over OAuth](docs/deployment.md#mcp-clients-over-oauth) | A hosted client such as Claude.ai signs the person in and consents once; no token is pasted |
 | [A local Crystalline with domains from shared servers](docs/deployment.md#a-local-crystalline-with-domains-from-shared-servers) | `crystalline connect` adds a server as a source; your agent sees your local domains and every server's at once, through one registration |
@@ -174,7 +175,7 @@ Crystalline runs the same way in every scenario: a daemon in the middle keeps on
 ## Go deeper
 
 - The Crystalline Handbook is the book-length guide: the idea, the system, installation and the full working loop, written to be read in an evening or to run a training from. Read it online at https://jordiboehme.github.io/crystalline/, or download the [PDF](https://raw.githubusercontent.com/jordiboehme/crystalline/handbook-downloads/crystalline-handbook.pdf) or the [EPUB](https://raw.githubusercontent.com/jordiboehme/crystalline/handbook-downloads/crystalline-handbook.epub).
-- [The docs](docs/README.md): setup per harness, how an agent learns, teams, verify and evolve, virtual domains, architecture.
+- [The docs](docs/README.md): setup per harness, how an agent learns, teams, verify and evolve, the Reflection, virtual domains, architecture.
 - [FAQ](docs/faq.md): the short answers, and why not just a folder of files.
 - [Deployment](docs/deployment.md): every scenario from a laptop to an air-gapped server, one diagram each.
 - [Security](docs/security.md): what Crystalline reads, writes and sends, how to close the local listener, and how to verify a release.

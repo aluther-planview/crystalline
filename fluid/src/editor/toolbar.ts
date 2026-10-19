@@ -23,9 +23,10 @@ import { keymap } from "@codemirror/view";
 
 import { frontmatterHidden } from "./frontmatterFold";
 import { frontmatterRegion } from "./frontmatterRegion";
+import { isIdLineAt, joinSections, stepOffIdLines } from "./hiddenIdLines";
 
 /**
- * Keep a command off a frontmatter block that is currently folded away.
+ * Keep a command off a frontmatter block that is currently hidden.
  *
  * The fold is atomic, but atomicity constrains cursor MOTION only - it is read
  * by the movement commands and by pointer selection, never by a dispatched
@@ -34,8 +35,9 @@ import { frontmatterRegion } from "./frontmatterRegion";
  * freshly opened engram has its caret at position 0, inside the block. A
  * heading run before the author has clicked anywhere would turn the opening
  * fence into `## ---`, and a table would land between the fence and the first
- * key where the chip keeps it invisible - a button that looks like it did
- * nothing while the file stops parsing.
+ * key where nobody can see it - a button that looks like it did nothing while
+ * the file stops parsing. (The fold's own guard keeps typing out of the
+ * block; a command is a dispatch of its own and is answered here first.)
  *
  * Two cases, deliberately answered differently:
  *
@@ -49,16 +51,20 @@ import { frontmatterRegion } from "./frontmatterRegion";
  *   key unhandled, which is the honest answer for a command that declined.
  *
  * The question asked is the fold's own live state, never the mode: in Raw mode
- * the field is not installed, after the chip is clicked its set is empty, and
- * the MANIFEST surface never carries it. In all three the frontmatter is text
- * on screen like any other and formatting it is legitimate.
+ * the field is not installed, a document whose block lost its closing fence
+ * has an empty set, and the MANIFEST surface never carries it. In all three
+ * the frontmatter is text on screen like any other and formatting it is
+ * legitimate.
  *
  * Exported because it is the shared guard for the assist verbs too, not only
  * for the formatting commands in this file: `tableVerbs` opens every one of
  * its dispatches with it, so a table edit and a bold both refuse the same way
- * over a folded block rather than each having their own idea of the rule.
+ * over a hidden block rather than each having their own idea of the rule.
  */
 export function clearOfFoldedFrontmatter(view: EditorView): boolean {
+  // First off a Reflection's hidden id line, where a caret can stand at
+  // either end: a verb run from there would write into the id.
+  stepOffIdLines(view);
   const { state } = view;
   if (!frontmatterHidden(state)) {
     return true;
@@ -169,12 +175,37 @@ export function toggleInline(view: EditorView, marker: string): boolean {
 const HEADING = /^(#{1,6})[ \t]+/;
 
 /**
+ * The level line `lineNo` has once Heading `level` is picked on it: `level`,
+ * or 0 when the line already wears that level and the pick takes it off.
+ * What a document adapter is asked about before the change is made.
+ */
+export function headingLevelAfter(
+  state: EditorState,
+  lineNo: number,
+  level: number,
+): number {
+  const worn = HEADING.exec(state.doc.line(lineNo).text)?.[1]?.length ?? 0;
+  return worn === level ? 0 : level;
+}
+
+/**
  * Heading level on the MAIN selection's line only - deliberate scope, not an
  * oversight: a heading is a line property, and cycling it under every cursor
  * of a multi-cursor selection is more surprise than help. The inline
  * wrappers and the wiki link are the multi-range commands.
+ *
+ * `joinSections` is the confirmed form of a change the document adapter
+ * asked about first (`confirmHeadingChange`): a section heading of a
+ * Reflection that stops being one takes its hidden id line with it, in the
+ * same transaction, so one undo puts both back. Without it the id line stays
+ * where it is. In a Reflection every heading change goes through the
+ * adapter's `confirmHeadingChange` first; the format bar does that.
  */
-export function cycleHeading(view: EditorView, level: number): boolean {
+export function cycleHeading(
+  view: EditorView,
+  level: number,
+  options: { joinSections?: boolean } = {},
+): boolean {
   if (!clearOfFoldedFrontmatter(view)) {
     return false;
   }
@@ -187,13 +218,27 @@ export function cycleHeading(view: EditorView, level: number): boolean {
   // is "no heading here", which no `#{1,6}` match can otherwise produce.
   const worn = match?.[1]?.length ?? 0;
   const width = match?.[0]?.length ?? 0;
-  const changes =
+  const changes: { from: number; to?: number; insert: string }[] =
     worn === 0
       ? [{ from: line.from, insert: mark }]
       : worn === level
         ? [{ from: line.from, to: line.from + width, insert: "" }]
         : [{ from: line.from, to: line.from + width, insert: mark }];
-  view.dispatch({ changes, userEvent: "input" });
+  const joining =
+    options.joinSections === true && isIdLineAt(state, line.number + 1);
+  if (joining) {
+    // The id line and the line break in front of it.
+    changes.push({
+      from: line.to,
+      to: state.doc.line(line.number + 1).to,
+      insert: "",
+    });
+  }
+  view.dispatch({
+    changes,
+    userEvent: "input",
+    ...(joining ? { annotations: joinSections.of(true) } : {}),
+  });
   view.focus();
   return true;
 }
@@ -250,6 +295,12 @@ export function toggleLinePrefix(
     const last = state.doc.lineAt(range.to).number;
     for (let number = first; number <= last; number++) {
       const line = state.doc.line(number);
+      // A Reflection's hidden id line, and the section heading above it,
+      // stay as they are: a prefix on either parts the id from its heading,
+      // and the section would vanish into the one above without a word.
+      if (isIdLineAt(state, number) || isIdLineAt(state, number + 1)) {
+        continue;
+      }
       if (!seen.has(line.from)) {
         seen.add(line.from);
         lines.push(line);
@@ -378,6 +429,12 @@ export function tableSkeleton(columns: number, rows: number): string[] {
  */
 export const TABLE_SKELETON: readonly string[] = tableSkeleton(2, 2);
 
+/** A span of the document, in positions of the state it is read against. */
+export interface TextRange {
+  from: number;
+  to: number;
+}
+
 /**
  * Where the caret lands inside a freshly inserted block: an index into the
  * inserted line array plus a character range within that line.
@@ -467,11 +524,17 @@ export const MERMAID_SKELETON = [
  * off the end maps past the document and `dispatch` raises rather than editing
  * (atomically, so no half-insert lands). Build the two together, as
  * `selectToken` and `mermaidFence` do, and the pair cannot disagree.
+ *
+ * `replace` is a range on the cursor's line that goes in the same
+ * transaction: the `/query` the slash menu was opened with. The line is read
+ * as it will be without it, so a slash typed on an empty line leaves no blank
+ * line in front of the block, and one undo puts the typed text back.
  */
 export function insertBlock(
   view: EditorView,
   lines: readonly string[],
   select?: BlockSelection | null,
+  replace?: TextRange,
 ): boolean {
   if (!clearOfFoldedFrontmatter(view)) {
     return false;
@@ -480,11 +543,12 @@ export function insertBlock(
   const { state } = view;
   const separator = state.lineBreak;
   const line = state.doc.lineAt(state.selection.main.head);
-  const lead = line.length === 0 ? "" : separator + separator;
+  const removed = replace === undefined ? 0 : replace.to - replace.from;
+  const lead = line.length - removed === 0 ? "" : separator + separator;
   const block = `${lead}${lines.join(separator)}${separator}`;
   // Where the block's first line begins: past the cursor's line and past the
   // lead's breaks, which are two positions when the lead is there at all.
-  const start = line.to + (lead === "" ? 0 : 2);
+  const start = line.to - removed + (lead === "" ? 0 : 2);
   const startOf = (index: number) =>
     start +
     lines
@@ -498,7 +562,10 @@ export function insertBlock(
           head: startOf(select.line) + select.to,
         };
   view.dispatch({
-    changes: { from: line.to, insert: block },
+    changes: [
+      ...(replace === undefined ? [] : [{ ...replace, insert: "" }]),
+      { from: line.to, insert: block },
+    ],
     selection,
     userEvent: "input",
   });

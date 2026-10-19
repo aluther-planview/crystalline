@@ -24,9 +24,7 @@ impl Engine {
     /// [`Engine::attachment_list_as`], which lays that caller's own drafted
     /// files over it.
     pub async fn attachment_list(&self, domain: &str) -> Result<Vec<AttachmentRow>> {
-        let (domain_id, _) = self.domain_source(domain).await?;
-        let store = self.store.lock().await;
-        Ok(store.list_attachments(domain_id).await?)
+        self.asset_list_in(AssetHome::Engram, domain).await
     }
 
     /// [`Engine::attachment_list`] as this caller sees it.
@@ -67,77 +65,7 @@ impl Engine {
         domain: &str,
         path: &str,
     ) -> Result<(Vec<u8>, AttachmentRow)> {
-        validate_attachment_path(path)?;
-        let (domain_id, source) = self.domain_source(domain).await?;
-        match &source {
-            ContentSource::File { root } => {
-                let abs = contained_asset_path(root, path)?;
-                // The stat comes first so an over-cap file is refused without
-                // ever being read: the ceiling is enforced by the walker (which
-                // skips such a file, so it has no row) and by the write, and a
-                // read that hashed one anyway would both spend the memory and
-                // mint a row the next full scan deletes again.
-                let meta = match std::fs::metadata(&abs) {
-                    Ok(meta) => meta,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        return Err(EngineError::NotFound(missing_attachment(domain, path)));
-                    }
-                    Err(source) => {
-                        return Err(EngineError::Io {
-                            path: abs.display().to_string(),
-                            source,
-                        });
-                    }
-                };
-                if meta.len() > crystalline_core::MAX_ATTACHMENT_BYTES {
-                    return Err(EngineError::Invalid(over_cap_error(path, meta.len())));
-                }
-                let bytes = match std::fs::read(&abs) {
-                    Ok(bytes) => bytes,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        return Err(EngineError::NotFound(missing_attachment(domain, path)));
-                    }
-                    Err(source) => {
-                        return Err(EngineError::Io {
-                            path: abs.display().to_string(),
-                            source,
-                        });
-                    }
-                };
-                // The bytes that were actually read decide, like the walker's
-                // post-read check: a file that grew past the ceiling between
-                // the stat and the read is caught here rather than served.
-                if bytes.len() as u64 > crystalline_core::MAX_ATTACHMENT_BYTES {
-                    return Err(EngineError::Invalid(over_cap_error(
-                        path,
-                        bytes.len() as u64,
-                    )));
-                }
-                let modified = asset_modified(&abs);
-                let store = self.store.lock().await;
-                if let Some(row) = store.get_attachment(domain_id, path).await?
-                    && row.size == bytes.len() as u64
-                    && row.modified == modified
-                {
-                    return Ok((bytes, row));
-                }
-                let row = attachment_row(path, &bytes, modified)?;
-                store.upsert_attachment(domain_id, &row).await?;
-                Ok((bytes, row))
-            }
-            ContentSource::Virtual => {
-                let store = self.store.lock().await;
-                let row = store
-                    .get_attachment(domain_id, path)
-                    .await?
-                    .ok_or_else(|| EngineError::NotFound(missing_attachment(domain, path)))?;
-                let bytes = store
-                    .read_attachment_blob(domain_id, path)
-                    .await?
-                    .ok_or_else(|| EngineError::NotFound(missing_attachment(domain, path)))?;
-                Ok((bytes, row))
-            }
-        }
+        self.asset_read_in(AssetHome::Engram, domain, path).await
     }
 
     /// [`Engine::attachment_read`] as this caller sees it: their own bytes
@@ -180,75 +108,23 @@ impl Engine {
         path: &str,
         bytes: Vec<u8>,
     ) -> Result<AttachmentRow> {
-        if self.read_only {
-            return Err(EngineError::ReadOnly);
-        }
-        self.refuse_read_only_domain(domain, &crate::scope::Scope::Unrestricted)
-            .await?;
-        validate_attachment_path(path)?;
-        if bytes.len() as u64 > crystalline_core::MAX_ATTACHMENT_BYTES {
-            return Err(EngineError::Invalid(over_cap_error(
-                path,
-                bytes.len() as u64,
-            )));
-        }
-        let (domain_id, source) = self.domain_source(domain).await?;
-        let row = match &source {
-            ContentSource::File { root } => {
-                let abs = contained_asset_path(root, path)?;
-                // Held across the write and the row upsert, the file lock
-                // before the store lock like every other writer here. See
-                // `Engine::write_lock`.
-                let lock = self.write_lock(&abs);
-                let _guard = lock.lock().await;
-                write_bytes(&abs, &bytes)?;
-                // The modification instant is read back off the file rather
-                // than taken from the clock, so it is the same value the sync
-                // walker's stat prefilter compares against and an upload costs
-                // no re-hash on the next scan.
-                let row = attachment_row(path, &bytes, asset_modified(&abs))?;
-                let store = self.store.lock().await;
-                store.upsert_attachment(domain_id, &row).await?;
-                row
-            }
-            ContentSource::Virtual => {
-                let row = attachment_row(path, &bytes, Utc::now().to_rfc3339())?;
-                let store = self.store.lock().await;
-                // What was there before this write, so a failure can put it
-                // back rather than approximate it.
-                let previous = store.get_attachment(domain_id, path).await?;
-                store.upsert_attachment(domain_id, &row).await?;
-                // A failed blob write must leave the domain exactly as it found
-                // it, which is two different things depending on what was
-                // there. A replace: the upsert above moved the row's metadata
-                // only - the blob belongs to the row and still holds the older
-                // bytes - so restoring the recorded row restores the whole
-                // attachment, and deleting instead would destroy an attachment
-                // this write never got to replace. A create: nothing was there,
-                // so the row this write inserted goes with it, or a listing
-                // would advertise bytes that were never stored. Best effort
-                // either way (the next write, or a scan of the file domain's
-                // twin, reconciles), and the original error is what the caller
-                // sees. A file domain needs none of this: the temp file is
-                // renamed into place only on success, so a failed write leaves
-                // the old file untouched.
-                if let Err(e) = store.write_attachment_blob(domain_id, path, &bytes).await {
-                    let undone = match &previous {
-                        Some(prior) => store.upsert_attachment(domain_id, prior).await.err(),
-                        None => store.delete_attachment(domain_id, path).await.err(),
-                    };
-                    if let Some(failed) = undone {
-                        tracing::warn!(
-                            "attachment '{path}' in '{domain}' could not be rolled back after a failed blob write: {failed}"
-                        );
-                    }
-                    return Err(e.into());
-                }
-                row
-            }
-        };
-        crate::maintenance::record_pending(domain);
-        Ok(row)
+        self.attachment_write_ruled(domain, path, bytes, ReplaceRule::Allow)
+            .await
+    }
+
+    /// [`Engine::attachment_write`] under `replace`, which decides whether a
+    /// file already at the path may be replaced.
+    async fn attachment_write_ruled(
+        &self,
+        domain: &str,
+        path: &str,
+        bytes: Vec<u8>,
+        replace: ReplaceRule,
+    ) -> Result<AttachmentRow> {
+        Ok(self
+            .asset_write_in(AssetHome::Engram, domain, path, bytes, replace)
+            .await?
+            .row)
     }
 
     /// Remove one attachment: the file or the blob, and the row.
@@ -258,38 +134,7 @@ impl Engine {
     /// a hand-edited domain) still counts as a delete: whichever half existed
     /// is removed and the pair ends up consistent.
     pub async fn attachment_delete(&self, domain: &str, path: &str) -> Result<()> {
-        if self.read_only {
-            return Err(EngineError::ReadOnly);
-        }
-        self.refuse_read_only_domain(domain, &crate::scope::Scope::Unrestricted)
-            .await?;
-        validate_attachment_path(path)?;
-        let (domain_id, source) = self.domain_source(domain).await?;
-        let mut file_removed = false;
-        if let ContentSource::File { root } = &source {
-            let abs = contained_asset_path(root, path)?;
-            let lock = self.write_lock(&abs);
-            let _guard = lock.lock().await;
-            match std::fs::remove_file(&abs) {
-                Ok(()) => file_removed = true,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(source) => {
-                    return Err(EngineError::Io {
-                        path: abs.display().to_string(),
-                        source,
-                    });
-                }
-            }
-        }
-        let row_removed = {
-            let store = self.store.lock().await;
-            store.delete_attachment(domain_id, path).await?
-        };
-        if !file_removed && !row_removed {
-            return Err(EngineError::NotFound(missing_attachment(domain, path)));
-        }
-        crate::maintenance::record_pending(domain);
-        Ok(())
+        self.asset_delete_in(AssetHome::Engram, domain, path).await
     }
 
     /// What an attachment write landed as: the row that now describes it, and
@@ -312,11 +157,19 @@ impl Engine {
     /// is the same question: there is no identity for a draft to belong to.
     /// The surface gate in front of it (REST `require_domain_write`) still
     /// stands where it always did.
+    ///
+    /// `create_only` refuses a path that already holds a file with
+    /// [`EngineError::Conflict`] ending in [`crate::engine::ASSET_EXISTS`].
+    /// The check runs under the file's per-file lock either way: in the folder
+    /// the folder file's, in an overlay the overlay file's, where it asks what
+    /// this actor's view shows (its own bytes, or a reviewed file it has not
+    /// deleted).
     pub(crate) async fn attachment_write_in(
         &self,
         view: &DomainView<'_>,
         path: &str,
         bytes: Vec<u8>,
+        create_only: bool,
     ) -> Result<WrittenAttachment> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
@@ -331,7 +184,11 @@ impl Engine {
             )));
         }
         if let Some(actor) = view.actor() {
-            let row = view.put_file(path, &bytes).await?;
+            let row = if create_only {
+                view.put_file_if_absent(path, &bytes).await?
+            } else {
+                view.put_file(path, &bytes).await?
+            };
             // The write IS the resolution, for a file. A conflict resolution
             // settles an engram's markdown and `origin_resolve` says so to
             // anybody who names an attachment path; what settles a file is
@@ -343,7 +200,14 @@ impl Engine {
             crate::maintenance::record_pending(view.domain());
             return Ok(WrittenAttachment { row, draft: true });
         }
-        let row = self.attachment_write(view.domain(), path, bytes).await?;
+        let replace = if create_only {
+            ReplaceRule::CreateOnly
+        } else {
+            ReplaceRule::Allow
+        };
+        let row = self
+            .attachment_write_ruled(view.domain(), path, bytes, replace)
+            .await?;
         Ok(WrittenAttachment { row, draft: false })
     }
 
@@ -360,7 +224,7 @@ impl Engine {
             return Err(EngineError::ReadOnly);
         }
         self.refuse_read_only_domain(domain, scope).await?;
-        self.attachment_write_joined(domain, path, bytes, scope, None)
+        self.attachment_write_joined(domain, path, bytes, scope, None, false)
             .await
     }
 
@@ -378,6 +242,11 @@ impl Engine {
     /// The path screen is the save's, for the same reason and in the same
     /// words: a caller who can see a draft but has not joined it is told what
     /// their two ways forward are rather than having one chosen for them.
+    ///
+    /// `create_only` refuses a path that already holds a file with
+    /// [`EngineError::Conflict`] ending in [`crate::engine::ASSET_EXISTS`]
+    /// rather than replacing it: in the folder under the file's lock, in an
+    /// overlay against what this actor's view shows.
     pub async fn attachment_write_joined(
         &self,
         domain: &str,
@@ -385,6 +254,7 @@ impl Engine {
         bytes: Vec<u8>,
         scope: &crate::scope::Scope,
         join: Option<&crate::join::Join>,
+        create_only: bool,
     ) -> Result<WrittenAttachment> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
@@ -405,7 +275,8 @@ impl Engine {
             }
             _ => self.screen_granted_path(domain, path, scope, None).await?,
         }
-        self.attachment_write_in(&view, path, bytes).await
+        self.attachment_write_in(&view, path, bytes, create_only)
+            .await
     }
 
     /// Remove one attachment as this caller sees the domain, answering whether
@@ -1003,37 +874,35 @@ impl Engine {
             // The successor's side of the pair goes through the same one arm,
             // for the same reasons: in review mode nothing this verb writes
             // belongs in the folder the team reviewed, and a successor
-            // somebody has open is a document rather than a file. The text the
-            // "already said this" test reads is that same text, so a
-            // re-retirement appends nothing twice whichever of the three the
-            // successor is living in at that moment.
-            let current = match self.live_text_at(succ_desc, &view).await {
-                Some(live) => live.text,
-                None => match overlay {
-                    Some(_) => view.text_at(succ_source, succ_desc).await?.ok_or_else(|| {
-                        EngineError::NotFound(format!(
-                            "no engram '{}' in domain '{}'",
-                            succ_desc.permalink, succ_desc.domain
-                        ))
-                    })?,
-                    None => self.load_content(succ_source, succ_desc).await?,
-                },
-            };
-            if !already(&current) {
-                let succ_warning = self
-                    .apply_source_edit(
-                        succ_desc,
-                        succ_source,
-                        &view,
-                        None,
-                        &actor,
-                        None,
-                        scope,
-                        |c| Ok(append_body(c, &line)),
-                    )
-                    .await?;
-                warning = warning.or(succ_warning);
-            }
+            // somebody has open is a document rather than a file. The
+            // "already said this" test reads the very text the edit is applied
+            // to, whichever of the three the successor is living in at that
+            // moment, and an edit that then changes nothing writes nothing, so
+            // a re-retirement appends nothing twice and stamps nothing.
+            let succ_warning = self
+                .apply_source_edit_staged(
+                    succ_desc,
+                    succ_source,
+                    &view,
+                    None,
+                    &actor,
+                    None,
+                    scope,
+                    None,
+                    true,
+                    false,
+                    |c| {
+                        Ok(if already(c) {
+                            c.to_string()
+                        } else {
+                            append_body(c, &line)
+                        })
+                    },
+                )
+                .await
+                .map(|edited| edited.warning)
+                .map_err(|failure| failure.error)?;
+            warning = warning.or(succ_warning);
         }
         self.nudge_embed();
 
@@ -1311,6 +1180,7 @@ impl Engine {
                 None,
                 scope,
                 None,
+                false,
                 false,
                 |current| {
                     Self::replanned_split_source(&plan, current, p, &desc.permalink, &back_link)

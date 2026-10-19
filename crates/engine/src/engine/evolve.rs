@@ -1070,6 +1070,7 @@ impl Engine {
                     acting,
                     None,
                     false,
+                    false,
                     |current| {
                         let text = holder.pairs.iter().fold(current.to_string(), |text, pair| {
                             without_ack(&text, FOLDER_PAIR_RULE, Some(pair))
@@ -1432,6 +1433,8 @@ impl Engine {
             contradiction_model_unavailable: meaning.model_unavailable,
             contradiction_read_only: meaning.read_only,
             contradictions_pending: meaning.pending,
+            reflection_pending: self.reflection_switch(name)
+                == crystalline_core::ReflectionSwitch::On,
             contradiction_candidates_capped: meaning.capped,
             contradiction_unembedded: meaning.unembedded,
             contradiction_vectors_capped: meaning.vectors_capped,

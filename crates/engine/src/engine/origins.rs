@@ -167,7 +167,9 @@ impl Engine {
                     declared.as_deref(),
                     || origin::default_domain_name(repo),
                     |candidate| {
-                        entries.contains_key(candidate) || table.resolve(candidate).is_some()
+                        entries.contains_key(candidate)
+                            || table.resolve(candidate).is_some()
+                            || case_twin(candidate, None, entries.iter()).is_some()
                     },
                 );
                 let declared_by_manifest = declared
@@ -190,6 +192,7 @@ impl Engine {
         // or not, that validates); an explicit one may not.
         if self.domain_entry(&domain_name).is_err() {
             validate_domain_name(&domain_name).map_err(EngineError::Invalid)?;
+            self.refuse_case_twin(&domain_name, None, scope).await?;
         }
         // An explicit name and the repository default
         // keep adopting an origin-less domain that holds them in place, as
@@ -244,6 +247,9 @@ impl Engine {
         }
 
         let adopts_registered = existing.is_some();
+        if !adopts_registered {
+            self.set_aside_orphan_kept(&domain_name);
+        }
         let (root, adopted_entry) = match existing {
             Some((r, entry)) => (r, Some(entry)),
             None => (
@@ -274,9 +280,15 @@ impl Engine {
         };
         let state_dir = self.origin_state_dir(&domain_name)?;
         progress_at(1, &format!("downloading {repo}"));
-        let report = ops::subscribe(provider.as_ref(), &spec, &root, &state_dir)
-            .await
-            .inspect_err(|e| self.drop_github_credential_on_auth(e))?;
+        let report = ops::subscribe(
+            provider.as_ref(),
+            &spec,
+            &root,
+            &state_dir,
+            subscribed_reflection_mode,
+        )
+        .await
+        .inspect_err(|e| self.drop_github_credential_on_auth(e))?;
         progress_at(
             2,
             &format!(
@@ -685,6 +697,11 @@ impl Engine {
     pub(super) async fn origin_update_one(&self, name: &str, entry: &DomainEntry) -> Result<Value> {
         let lock = self.origin_lock(name);
         let _guard = lock.lock().await;
+        // A pull writes the domain's files: only its host pulls, before any
+        // file lands. A lock nobody holds, or whose holder went silent, is
+        // claimed as a sync claims it.
+        self.require_file_host(name, &crate::scope::Scope::Unrestricted)
+            .await?;
 
         let (spec, root, state_dir) = self.origin_spec_for(name, entry)?;
 
@@ -783,9 +800,15 @@ impl Engine {
                 root.display()
             ))
         })?;
-        let report = ops::subscribe(provider.as_ref(), spec, root, state_dir)
-            .await
-            .inspect_err(|e| self.drop_github_credential_on_auth(e))?;
+        let report = ops::subscribe(
+            provider.as_ref(),
+            spec,
+            root,
+            state_dir,
+            subscribed_reflection_mode,
+        )
+        .await
+        .inspect_err(|e| self.drop_github_credential_on_auth(e))?;
 
         // Tell a running daemon's watcher to start watching the freshly
         // bootstrapped root, the same signal `origin_add` sends.
@@ -852,6 +875,12 @@ impl Engine {
                 .flatten()
                 .is_some();
             if has_state {
+                continue;
+            }
+            if !self.writes_domain_here(&name, false).await {
+                tracing::debug!(
+                    "env-defined team domain '{name}' is hosted by another instance; it bootstraps there"
+                );
                 continue;
             }
             match self.origin_update_one(&name, &entry).await {
@@ -1065,6 +1094,9 @@ impl Engine {
         let lock = self.origin_lock(name);
         let _guard = lock.lock().await;
         let (spec, root, state_dir) = self.origin_spec_for(name, entry)?;
+        // The mode in effect, as share changes use it: the count and the
+        // detail below agree with the change list while a switch is pending.
+        let reflection = self.reflection_mode(name).await?;
         // A probe is best-effort: no connection, or a provider that fails to
         // build, must never turn a status call into a hard failure.
         let probe = self.resolve_origin_provider().ok();
@@ -1074,7 +1106,7 @@ impl Engine {
         };
         let change_detail = || {
             let mut block = detail
-                .then(|| origin::local_change_detail(&root, &state_dir))
+                .then(|| origin::local_change_detail(&root, &state_dir, reflection))
                 .flatten();
             // Both sides ride inside the same block the paths do, so a caller
             // that asked for them reads one thing rather than two. In a
@@ -1142,7 +1174,16 @@ impl Engine {
             }
             value
         };
-        match ops::status(&spec, &root, &state_dir, probe.as_deref(), settle_owed_link).await {
+        match ops::status(
+            &spec,
+            &root,
+            &state_dir,
+            probe.as_deref(),
+            settle_owed_link,
+            reflection,
+        )
+        .await
+        {
             Ok(report) => Ok(with_out_of_band(origin::status_report_json(
                 name,
                 &report,
@@ -1157,7 +1198,9 @@ impl Engine {
                 // credential here too; the retry below runs probe-free, so
                 // status still comes back offline.
                 self.drop_github_credential_on_auth(&e);
-                let report = ops::status(&spec, &root, &state_dir, None, settle_owed_link).await?;
+                let report =
+                    ops::status(&spec, &root, &state_dir, None, settle_owed_link, reflection)
+                        .await?;
                 Ok(with_out_of_band(origin::status_report_json(
                     name,
                     &report,
@@ -1250,6 +1293,12 @@ impl Engine {
             self.origin_poller
                 .schedule(&name, now + jitter, wall_now + jitter_chrono);
 
+            // A domain another live instance hosts is that instance's to
+            // pull: skipped quietly, never claimed from a live host.
+            if !self.writes_domain_here(&name, false).await {
+                tracing::debug!("origin poll: '{name}' is hosted by another instance; skipped");
+                continue;
+            }
             match self.origin_update_one(&name, &entry).await {
                 Ok(v) => {
                     let up_to_date = v["up_to_date"].as_bool().unwrap_or(false);
@@ -1376,10 +1425,12 @@ impl Engine {
             let Ok((spec, root, state_dir)) = self.origin_spec_for(&name, &entry) else {
                 continue;
             };
+            let reflection = self.reflection_mode(&name).await.unwrap_or_default();
             // No provider, so nothing here could settle an owed stack link
             // anyway; withholding the permission says so at the call rather
             // than leaving it to be inferred from the `None` beside it.
-            let Ok(report) = ops::status(&spec, &root, &state_dir, None, false).await else {
+            let Ok(report) = ops::status(&spec, &root, &state_dir, None, false, reflection).await
+            else {
                 continue;
             };
             let next_due = self.origin_poller.next_due_at(&name);
@@ -1650,6 +1701,9 @@ impl Engine {
                 author_login: login.as_deref(),
                 files,
                 sharing,
+                // The mode in effect: a pending switch keeps sharing the
+                // engrams still under `reflections/` until they move out.
+                reflection: self.reflection_mode(domain).await?,
             },
         )
         .await
@@ -1688,6 +1742,10 @@ impl Engine {
                     }
                     if let Err(e) = self.sync_paths(domain, paths.clone()).await {
                         tracing::warn!("indexing the direct commit's files in '{domain}': {e}");
+                        // The commit stands; the answer says why its files
+                        // are not indexed here (another instance hosts the
+                        // domain, for a command on a shared database).
+                        receipt["index_error"] = json!(e.to_string());
                     }
                     match self.converge_pulled_overlays(domain, &paths).await {
                         Ok(folded) => receipt["drafts_folded"] = json!(folded.cleared),
@@ -1889,7 +1947,9 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        self.refuse_read_only_domain(domain, &crate::scope::Scope::Unrestricted)
+        // A preview only reads: it meets the read-only check, never the host
+        // gate, which may claim a lock.
+        self.refuse_read_only_flag(domain, &crate::scope::Scope::Unrestricted)
             .await?;
         let lock = self.origin_lock_registered(domain)?;
         let _guard = lock.lock().await;
@@ -1958,6 +2018,9 @@ impl Engine {
                 author_login: login.as_deref(),
                 files,
                 sharing,
+                // The mode in effect: a pending switch keeps sharing the
+                // engrams still under `reflections/` until they move out.
+                reflection: self.reflection_mode(domain).await?,
             },
         )
         .await
@@ -2043,6 +2106,11 @@ impl Engine {
             // on disk is what the team reviewed and nobody withdrew.
             revert && drafting.is_none(),
             stacks_allowed,
+            // The mode in effect now, at the withdrawal: a layer shared while
+            // a switch was pending is reverted in full as long as the switch
+            // is still pending. Once it is in effect, the revert leaves the
+            // files under `reflections/` alone.
+            self.reflection_mode(domain).await?,
         )
         .await
         .inspect_err(|e| self.drop_github_credential_on_auth(e))
@@ -2248,7 +2316,13 @@ impl Engine {
     /// The team-domain walk every method below shares: the origin state, the
     /// base it detects against and the detected delta. Under no lock; a read
     /// a beat stale is the promise every offline read here makes.
-    pub(super) fn team_local_changes(&self, domain: &str) -> Result<TeamChanges> {
+    /// `reflection` is the domain's Reflection mode in effect
+    /// ([`Engine::reflection_mode`]), which a plain `fn` cannot read itself.
+    pub(super) fn team_local_changes(
+        &self,
+        domain: &str,
+        reflection: crystalline_core::ReflectionMode,
+    ) -> Result<TeamChanges> {
         #[cfg(any(test, feature = "testing"))]
         self.detection_walks
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2257,8 +2331,9 @@ impl Engine {
             EngineError::Invalid(format!("domain '{domain}' has no origin state"))
         })?;
         let base = ops::unshared_base(&state);
-        let local =
-            crystalline_remote::changes::detect_local_changes_against(&root, &base, &state_dir)?;
+        let local = crystalline_remote::changes::detect_local_changes_against(
+            &root, &base, &state_dir, reflection,
+        )?;
         Ok((root, state_dir, base, local))
     }
 
@@ -2337,7 +2412,8 @@ impl Engine {
                 json!({ "domain": domain, "mode": "review", "changes": changes, "skipped_large": [] }),
             );
         }
-        let (root, state_dir, _, local) = self.team_local_changes(domain)?;
+        let (root, state_dir, _, local) =
+            self.team_local_changes(domain, self.reflection_mode(domain).await?)?;
         let mut changes = Vec::new();
         for change in local.substantive() {
             let Some(found) = ops::local_change_sides(&root, &state_dir, &local, change.path())?
@@ -2406,7 +2482,8 @@ impl Engine {
             value["domain"] = json!(domain);
             return Ok(value);
         }
-        let (root, state_dir, _, local) = self.team_local_changes(domain)?;
+        let (root, state_dir, _, local) =
+            self.team_local_changes(domain, self.reflection_mode(domain).await?)?;
         let sides =
             ops::local_change_sides(&root, &state_dir, &local, path)?.ok_or_else(not_a_change)?;
         let mut value = origin::change_detail_json(
@@ -2443,11 +2520,16 @@ impl Engine {
         self.local_changes_need_an_origin(domain)?;
         let lock = self.origin_lock_registered(domain)?;
         let _guard = lock.lock().await;
+        // A discard puts the domain's files back: only its host does that,
+        // refused before any file is touched.
+        self.require_file_host(domain, &crate::scope::Scope::Unrestricted)
+            .await?;
         let drafting = self.overlay_share_identity(domain, actor)?;
         if let Some(who) = drafting {
             return self.discard_into_overlay(domain, &who, targets).await;
         }
-        let (root, state_dir, base, local) = self.team_local_changes(domain)?;
+        let (root, state_dir, base, local) =
+            self.team_local_changes(domain, self.reflection_mode(domain).await?)?;
         let targets = fill_unguarded(targets, &local);
         let report = ops::discard_local_files(&root, &state_dir, &base, &local, &targets)?;
         let touched: Vec<String> = report
@@ -3071,7 +3153,7 @@ impl Engine {
     ///
     /// **In-process only.** Two Crystalline processes over one domain root are
     /// not held apart by this; the host-lock machinery governs that.
-    pub(super) fn write_lock(&self, abs: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    pub(crate) fn write_lock(&self, abs: &Path) -> Arc<tokio::sync::Mutex<()>> {
         // Computed before the map-wide guard is taken: `canonicalize` is a
         // blocking stat, and every other file's lookup would otherwise queue
         // behind it while it resolves this one's path.
@@ -3197,7 +3279,7 @@ impl Engine {
     /// a machine that has not connected yet is never cached, so a later
     /// connect is seen too. Errors with `RemoteError::NotConnected` when no
     /// token has been saved and no test provider is injected.
-    fn resolve_origin_provider(&self) -> Result<Arc<dyn Provider>> {
+    pub(super) fn resolve_origin_provider(&self) -> Result<Arc<dyn Provider>> {
         if let Some(p) = &self.origin_provider_override {
             return Ok(p.clone());
         }
@@ -3685,4 +3767,12 @@ enum Holder {
     Connected(DomainEntry),
     /// An origin-less file domain rooted at this path, adoptable in place.
     Adopt(PathBuf, DomainEntry),
+}
+
+/// The Reflection mode in effect at the root of a domain being subscribed:
+/// the index holds no row of it yet, so the files under `reflections/`
+/// decide, the fallback [`crystalline_index::reflection_mode`] takes when
+/// nothing is recorded.
+fn subscribed_reflection_mode(root: &Path) -> crystalline_core::ReflectionMode {
+    crystalline_index::reflection_mode(root, std::iter::empty::<&str>())
 }

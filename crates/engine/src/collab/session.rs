@@ -40,7 +40,7 @@ use yrs::{ClientID, Doc, GetString, Options, ReadTxn, Text, Transact, Update};
 use super::control::{self, Control};
 use super::merge::{self, MergeOutcome};
 use crate::domain_view::DomainView;
-use crate::engine::{Engine, EngineError, EngramText};
+use crate::engine::{Engine, EngineError, EngramText, SectionAuthors};
 use crystalline_core::to_lf;
 
 /// The address a room reads and saves its engram at: the `crystalline://`
@@ -119,6 +119,22 @@ pub struct LiveText {
     /// or after it closes still holds even when the file is CRLF; the
     /// checksum of `text` once anything was typed.
     pub checksum: String,
+    /// Whether the room will save what it holds: its save state is ok and its
+    /// final save has not run yet. A room in conflict, with a failed save, or
+    /// whose final save ran, holds text that may never reach the file. Read
+    /// at the moment of the look; [`CollabSessions::compose_while_saving`]
+    /// decides it again under the compose's own lock.
+    pub saving: bool,
+    /// The checksum of the stored bytes the room last loaded or saved: the
+    /// file or row its text stands over. `checksum` equals it while the room
+    /// is clean. A token for the room's text says nothing about a file that
+    /// has moved past this base since.
+    pub base_checksum: String,
+    /// Whether the room is open with a conflict or a failed save of its own:
+    /// it holds text a person typed that cannot be saved until they settle
+    /// it. False for a saving room, and for one that has closed or whose
+    /// final save ran, which nobody is in any more.
+    pub waiting: bool,
 }
 
 /// Why a join did not produce a session.
@@ -130,7 +146,21 @@ pub enum JoinError {
     ServerFull,
     /// This document already holds [`MAX_PARTICIPANTS`] connections.
     SessionFull,
+    /// The document is not here any more because a move took it to the
+    /// address named, a short while ago ([`MOVED_MEMORY`]). The co-editing
+    /// surface answers it with the `moved` close a room open at the time of
+    /// the move got, so an editor that was still joining lands on the same
+    /// notice.
+    Moved(MovedTo),
 }
+
+/// How long the registry remembers where a moved document went, for a join
+/// that comes after the move ([`JoinError::Moved`]).
+pub const MOVED_MEMORY: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The words a join is refused with while a move holds the document. A
+/// surface answers it with 409: the request is fine, the document is busy.
+pub const BEING_MOVED: &str = "is being moved; open it again at its new place in a moment";
 
 impl std::fmt::Display for JoinError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -138,6 +168,7 @@ impl std::fmt::Display for JoinError {
             JoinError::Engine(err) => write!(f, "{err}"),
             JoinError::ServerFull => write!(f, "too many documents are open for co-editing"),
             JoinError::SessionFull => write!(f, "too many people are editing this engram"),
+            JoinError::Moved(to) => write!(f, "this document was moved to '{}'", to.path),
         }
     }
 }
@@ -185,6 +216,43 @@ pub struct LiveApplied {
     pub participants: Vec<String>,
 }
 
+/// What a room did with a change written to its file
+/// ([`CollabSessions::absorb_doc_change`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Absorbed {
+    /// The change is in the room's text: merged into it, or already there
+    /// because the room saved it in between.
+    Merged,
+    /// The change collides with text in the room nobody has saved: the room
+    /// raised its edit conflict, and a person chooses.
+    Conflict,
+    /// The room has a conflict or a failed save of its own, or the page is
+    /// gone: it meets the change when that is resolved.
+    Deferred,
+}
+
+/// [`Absorbed`] and who was in the room.
+#[derive(Debug, Clone)]
+pub struct AbsorbOutcome {
+    pub absorbed: Absorbed,
+    /// Who is in the room, as [`LiveApplied::participants`] names them.
+    pub participants: Vec<String>,
+}
+
+/// Why [`CollabSessions::compose_while_saving`] did not compose. Either way
+/// nothing reached the room, and the caller writes the file or the row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComposeRefused {
+    /// No room is open over the document any more, it closed, or it will
+    /// not save what it is given: its save is in conflict or failed, or its
+    /// final save has run. Text composed into it now could be lost without a
+    /// trace.
+    NotSaving,
+    /// The room's text is no longer the text the target was computed from:
+    /// somebody typed in between. Composing would undo their typing.
+    Moved,
+}
+
 /// An agent in a room, as the room shows it.
 ///
 /// Two halves because presence is per (account, label) rather than per
@@ -201,8 +269,8 @@ pub struct AgentPeer {
     /// The account the call authenticated as, or the identity a local session
     /// acts with. Half the presence key.
     pub account: String,
-    /// The name the participant strip shows, "<account> (agent)" or
-    /// "<account> (agent: <client>)".
+    /// The name the participant strip shows, `<account> (agent)` or
+    /// `<account> (agent: <client>)`.
     pub label: String,
 }
 
@@ -256,21 +324,244 @@ fn agent_state_json(label: &str) -> String {
     serde_json::json!({ "user": { "name": label, "agent": true } }).to_string()
 }
 
-/// Where one room is filed: the domain, the permalink it answers to, and the
+/// What a room is a room over. A closed enum: a room over one kind of
+/// document can never answer a lookup for another kind, whatever its name.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RoomDoc {
+    /// An engram, by the permalink it answers to.
+    Engram(String),
+    /// A reflection page, by its path inside `reflections/`. It saves
+    /// straight to its file, so it has no overlay and is never re-keyed.
+    Reflection(String),
+}
+
+impl RoomDoc {
+    /// The kind of document the room is over.
+    pub fn kind(&self) -> crystalline_core::ContentKind {
+        match self {
+            RoomDoc::Engram(_) => crystalline_core::ContentKind::Engram,
+            RoomDoc::Reflection(_) => crystalline_core::ContentKind::Reflection,
+        }
+    }
+
+    /// The name the room's controls carry: an engram's permalink, or a
+    /// reflection's path inside `reflections/`.
+    pub fn name(&self) -> &str {
+        match self {
+            RoomDoc::Engram(permalink) => permalink,
+            RoomDoc::Reflection(path) => path,
+        }
+    }
+}
+
+/// Where one room is filed: the domain, the document it is over, and the
 /// overlay owner whose document it is.
 ///
 /// `None` in the third slot is the document a domain that takes changes
 /// directly keeps - the folder's own text, which is what every room was before
 /// drafts existed. `Some(actor)` is that actor's draft of the page, which is
 /// the only kind of document a reviewing domain has.
-pub type RoomKey = (String, String, Option<String>);
+pub type RoomKey = (String, RoomDoc, Option<String>);
 
 /// The registry of open documents, keyed by [`RoomKey`].
 pub struct CollabSessions {
     engine: Arc<Engine>,
     sessions: Mutex<HashMap<RoomKey, Arc<CollabSession>>>,
+    /// The documents a move is moving right now, each with how many moves
+    /// hold it: a join over one of them is refused until the move is done
+    /// (see [`CollabSessions::close_for_move`]). A std mutex, read and
+    /// written only under the registry lock or in a fence's drop, and never
+    /// held across an await.
+    moving: std::sync::Mutex<HashMap<RoomKey, usize>>,
+    /// Where documents moved by a move of the last [`MOVED_MEMORY`] went,
+    /// by the address they left, for a join that comes after the move.
+    moved: std::sync::Mutex<HashMap<RoomKey, (MovedTo, Instant)>>,
     next_conn: AtomicU64,
     next_epoch: AtomicU64,
+}
+
+/// Where a moved document went, as the `moved` close names it to the room's
+/// sockets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MovedTo {
+    /// The domain it lives in now, when the move changed it.
+    pub domain: Option<String>,
+    /// Its new path: inside `reflections/` for a page, inside the domain for
+    /// an engram.
+    pub path: String,
+    /// The permalink an engram answers to now; `None` for a page.
+    pub permalink: Option<String>,
+}
+
+impl MovedTo {
+    /// The `Closed { reason: "moved" }` control naming this address.
+    pub fn control(&self) -> Control {
+        Control::Closed {
+            reason: "moved".to_string(),
+            domain: self.domain.clone(),
+            path: Some(self.path.clone()),
+            permalink: self.permalink.clone(),
+        }
+    }
+}
+
+/// A move's hold on one document: while it stands, no room opens over the
+/// document (a join is refused with a conflict). Taken by
+/// [`CollabSessions::close_for_move`] and lifted on drop, which every way
+/// out of a move reaches, an error included.
+#[must_use = "the fence lifts when it is dropped"]
+pub struct MoveFence {
+    registry: Weak<CollabSessions>,
+    key: RoomKey,
+}
+
+impl Drop for MoveFence {
+    fn drop(&mut self) {
+        let Some(registry) = self.registry.upgrade() else {
+            return;
+        };
+        let mut moving = registry
+            .moving
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = moving.get_mut(&self.key) {
+            *count -= 1;
+            if *count == 0 {
+                moving.remove(&self.key);
+            }
+        }
+    }
+}
+
+/// Rooms that were saved and ended but whose sockets are not told yet: a
+/// domain rename's sweep, or the room a move closed. The caller tells them
+/// where the document went once the move or the rename is done
+/// ([`SweptRooms::moved_to_domain`], [`MoveClose::moved`]); dropped untold,
+/// which a refused, stopped or cancelled move or rename does, they are told
+/// `internal`, as an unregistration tells them.
+#[must_use = "dropped untold, the rooms are told `internal`"]
+pub struct SweptRooms {
+    rooms: Vec<Arc<CollabSession>>,
+}
+
+impl SweptRooms {
+    /// How many rooms the sweep ended.
+    pub fn len(&self) -> usize {
+        self.rooms.len()
+    }
+
+    /// Whether the sweep ended no room.
+    pub fn is_empty(&self) -> bool {
+        self.rooms.is_empty()
+    }
+
+    /// Tell every swept room's sockets that the document moved with its
+    /// domain to `domain`: the same path, the same permalink, the new name.
+    pub async fn moved_to_domain(mut self, domain: &str) {
+        for session in std::mem::take(&mut self.rooms) {
+            let (path, permalink) = session.address().await;
+            let to = MovedTo {
+                domain: Some(domain.to_string()),
+                path,
+                permalink,
+            };
+            session.close_moved(&to).await;
+        }
+    }
+}
+
+impl Drop for SweptRooms {
+    fn drop(&mut self) {
+        for session in self.rooms.drain(..) {
+            session.close_with(Control::closed("internal"));
+        }
+    }
+}
+
+/// A move's hold on the document it moves ([`CollabSessions::close_for_move`]):
+/// the room over it, saved and ended but not told yet, and the fence that
+/// keeps a new room from opening. The move calls [`MoveClose::moved`] once it
+/// has committed; on any other way out the guard drops, the room is told
+/// `internal` (the document did not move) and the fence lifts.
+#[must_use = "dropped without `moved`, the room is told `internal`"]
+pub struct MoveClose {
+    // Field order is drop order: the room is told before the fence lifts.
+    room: SweptRooms,
+    to: MovedTo,
+    _fence: MoveFence,
+}
+
+/// Whether `scope` may see where `to` points: a move inside one domain names
+/// nothing new; a move into another domain names that domain, which `scope`
+/// must be able to see. A failed lookup answers no (fail closed).
+async fn sees_destination(engine: &Engine, to: &MovedTo, scope: &crate::scope::Scope) -> bool {
+    match to.domain.as_deref() {
+        None => true,
+        Some(domain) => engine
+            .hidden_for(scope)
+            .await
+            .is_ok_and(|hidden| !hidden.contains(domain)),
+    }
+}
+
+/// The saves and closes of a sweep, as a task of its own (see
+/// [`CollabSessions::sweep_domain_rooms`]). Boxed as a `Send` future so the
+/// task's type is named here and nowhere else: a room's last save can reach
+/// a sweep again (a MANIFEST that switches the Reflection off closes the
+/// reflection rooms), and an unnamed type would make that cycle one the
+/// compiler cannot prove `Send` through.
+fn sweep_task(
+    victims: Vec<Arc<CollabSession>>,
+    discarded: HashSet<String>,
+    reason: Option<String>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = SweptRooms> + Send>> {
+    Box::pin(async move {
+        let mut untold = SweptRooms { rooms: Vec::new() };
+        // Every victim not reached yet waits in a `SweptRooms` of its own,
+        // so a panic below (a yrs bug in a save) still disposes and tells
+        // each of them `internal` as the unwind drops it.
+        let mut waiting = SweptRooms { rooms: victims };
+        waiting.rooms.reverse();
+        while let Some(session) = waiting.rooms.pop() {
+            // The one in hand is guarded the same way until it is done.
+            let mut current = SweptRooms {
+                rooms: vec![session.clone()],
+            };
+            let discarding = session
+                .key()
+                .2
+                .is_some_and(|owner| discarded.contains(&owner));
+            // The save comes FIRST: poison disposes the session, and a
+            // disposed session's save paths are all no-ops. Which is exactly
+            // how a discarded actor's room is closed without one.
+            if !discarding {
+                session.final_save().await;
+            }
+            // Done without a panic: disarm the guard, the close below tells.
+            current.rooms.clear();
+            match &reason {
+                Some(reason) => session.close(reason).await,
+                None => {
+                    session.dispose();
+                    untold.rooms.push(session);
+                }
+            }
+        }
+        untold
+    })
+}
+
+impl MoveClose {
+    /// The move committed: tell the room's sockets the new address, then
+    /// lift the fence.
+    pub async fn moved(mut self) {
+        for session in std::mem::take(&mut self.room.rooms) {
+            session.close_moved(&self.to).await;
+        }
+        if let Some(registry) = self._fence.registry.upgrade() {
+            registry.note_moved(self._fence.key.clone(), self.to.clone());
+        }
+    }
 }
 
 impl CollabSessions {
@@ -279,6 +570,8 @@ impl CollabSessions {
         Arc::new(CollabSessions {
             engine,
             sessions: Mutex::new(HashMap::new()),
+            moving: std::sync::Mutex::new(HashMap::new()),
+            moved: std::sync::Mutex::new(HashMap::new()),
             next_conn: AtomicU64::new(1),
             next_epoch: AtomicU64::new(1),
         })
@@ -295,21 +588,120 @@ impl CollabSessions {
     /// keeps, `Some(actor)` for that actor's draft of the page. It is the
     /// caller's job to have decided that the caller may be in that document -
     /// see `super::ws::join`, which is the one surface that opens rooms.
+    ///
+    /// The connection is the machine owner's (an in-process caller); the
+    /// upgrade route names the signed-in caller with
+    /// [`CollabSessions::join_as`].
     pub async fn join(
         self: &Arc<Self>,
         domain: &str,
         permalink: &str,
         overlay: Option<&str>,
     ) -> Result<Joined, JoinError> {
-        let key = (
-            domain.to_string(),
-            permalink.to_string(),
-            overlay.map(str::to_string),
-        );
+        self.join_as(
+            domain,
+            permalink,
+            overlay,
+            crate::scope::Scope::Unrestricted,
+        )
+        .await
+    }
+
+    /// [`CollabSessions::join`] for the connection of `viewer`, as the
+    /// surface that opened it authenticated it: a `moved` close names to it
+    /// only what `viewer` may see.
+    pub async fn join_as(
+        self: &Arc<Self>,
+        domain: &str,
+        permalink: &str,
+        overlay: Option<&str>,
+        viewer: crate::scope::Scope,
+    ) -> Result<Joined, JoinError> {
+        self.join_doc(
+            domain,
+            RoomDoc::Engram(permalink.to_string()),
+            overlay,
+            None,
+            Some(viewer),
+        )
+        .await
+    }
+
+    /// Join the room over a reflection page, opening it from the file on the
+    /// first join. A read-only domain opens none. The caller decided that
+    /// the caller may edit the page (`super::ws::join_reflection`).
+    ///
+    /// `author` is the signed-in account the connection belongs to, as the
+    /// surface that opened it authenticated it. A save records it in the
+    /// page's bookkeeping when this connection sent an edit since the save
+    /// before; what a client puts into awareness is for display only.
+    ///
+    /// The connection is the machine owner's, as on [`CollabSessions::join`];
+    /// the upgrade route uses [`CollabSessions::join_reflection_as`].
+    pub async fn join_reflection(
+        self: &Arc<Self>,
+        domain: &str,
+        path: &str,
+        author: &str,
+    ) -> Result<Joined, JoinError> {
+        self.join_reflection_as(domain, path, author, crate::scope::Scope::Unrestricted)
+            .await
+    }
+
+    /// [`CollabSessions::join_reflection`] for the connection of `viewer`,
+    /// as on [`CollabSessions::join_as`].
+    pub async fn join_reflection_as(
+        self: &Arc<Self>,
+        domain: &str,
+        path: &str,
+        author: &str,
+        viewer: crate::scope::Scope,
+    ) -> Result<Joined, JoinError> {
+        crystalline_core::reflection::validate_reflection_path(path)
+            .map_err(|e| JoinError::Engine(EngineError::Invalid(e)))?;
+        self.engine
+            .refuse_read_only_domain(domain, &crate::scope::Scope::Unrestricted)
+            .await
+            .map_err(JoinError::Engine)?;
+        self.join_doc(
+            domain,
+            RoomDoc::Reflection(path.to_string()),
+            None,
+            Some(author),
+            Some(viewer),
+        )
+        .await
+    }
+
+    /// [`CollabSessions::join`] for a room over any kind of document.
+    /// `author` is the account the connection belongs to, where the room
+    /// records who changed what (a reflection room); `None` elsewhere.
+    /// `viewer` is who the connection is, recorded with the connection;
+    /// `None` is somebody unknown, who a `moved` close names no address.
+    pub async fn join_doc(
+        self: &Arc<Self>,
+        domain: &str,
+        doc: RoomDoc,
+        overlay: Option<&str>,
+        author: Option<&str>,
+        viewer: Option<crate::scope::Scope>,
+    ) -> Result<Joined, JoinError> {
+        let key = (domain.to_string(), doc, overlay.map(str::to_string));
         // The registry lock is held across open AND the membership check, so a
         // stampede of joins can neither open the same document twice nor
         // overshoot MAX_PARTICIPANTS between the check and the add.
         let mut sessions = self.sessions.lock().await;
+        // A move of this document is under way: its room was saved and
+        // closed, and a room opened now would load the old text and save it
+        // to an address the move is taking away. Checked under the registry
+        // lock, the one the move's fence is set under, so a join is either
+        // in the map before the fence (and closed by the move) or refused.
+        if self.is_moving(&key) {
+            return Err(JoinError::Engine(EngineError::Conflict(format!(
+                "'{}' {BEING_MOVED}",
+                key.1.name()
+            ))));
+        }
         // A disposed session still sitting in the map is a corpse: its saver
         // loop has ended, so a join that adopted it would edit a room nothing
         // ever writes back. Treated as absent and replaced.
@@ -325,20 +717,32 @@ impl CollabSessions {
                 if !sessions.contains_key(&key) && sessions.len() >= MAX_SESSIONS {
                     return Err(JoinError::ServerFull);
                 }
-                let opened = CollabSession::open(
+                let opened = match CollabSession::open(
                     self.engine.clone(),
                     key.clone(),
                     self.mint_epoch(),
                     Arc::downgrade(self),
                 )
-                .await?;
+                .await
+                {
+                    Ok(opened) => opened,
+                    // Nothing at this address any more: a move that took it
+                    // away a short while ago answers where it went.
+                    Err(JoinError::Engine(EngineError::NotFound(miss))) => {
+                        return Err(match self.moved_from(&key) {
+                            Some(to) => JoinError::Moved(to),
+                            None => JoinError::Engine(EngineError::NotFound(miss)),
+                        });
+                    }
+                    Err(err) => return Err(err),
+                };
                 sessions.insert(key.clone(), opened.clone());
                 tokio::spawn(run_saver(opened.clone()));
                 (opened, true)
             }
         };
         let conn = self.next_conn.fetch_add(1, Ordering::Relaxed);
-        match session.add_conn(conn).await {
+        match session.add_conn(conn, author, viewer).await {
             Ok((rx, greeting)) => Ok(Joined {
                 session,
                 conn,
@@ -423,9 +827,9 @@ impl CollabSessions {
     /// by the fence - no join is in flight across the sweep. If that lock is
     /// ever released around the open, this argument silently breaks.
     ///
-    /// Note that `poison` broadcasts `Closed { reason: "internal" }`, so a room
-    /// closed by an unregistration reads as an internal error on the client
-    /// side; the visible behavior (the editor closes, the room is unusable) is
+    /// Note that the sweep closes each room with `Closed { reason: "internal" }`,
+    /// so a room closed by an unregistration reads as an internal error on the
+    /// client side; the visible behavior (the editor closes, the room is unusable) is
     /// right either way.
     pub async fn dispose_domain(&self, domain: &str) -> usize {
         self.dispose_domain_discarding(domain, &HashSet::new())
@@ -456,6 +860,60 @@ impl CollabSessions {
         domain: &str,
         discarded: &HashSet<String>,
     ) -> usize {
+        self.sweep_domain(domain, None, discarded, "internal").await
+    }
+
+    /// Final-save every room over a document of `kind` in `domain`, then
+    /// close it, telling each socket `Closed { reason }`. Answers how many
+    /// rooms it closed.
+    ///
+    /// The switch-off of a Reflection calls this BEFORE the switch takes
+    /// effect, with `reason` `switched_off`: the state is still on, so each
+    /// room's last save lands in the page instead of being refused into a
+    /// room nobody can save any more. Rooms over other kinds of document
+    /// stay open.
+    pub async fn close_docs(
+        &self,
+        domain: &str,
+        kind: crystalline_core::ContentKind,
+        reason: &str,
+    ) -> usize {
+        self.sweep_domain(domain, Some(kind), &HashSet::new(), reason)
+            .await
+    }
+
+    /// The save-then-close sweep behind [`CollabSessions::dispose_domain`],
+    /// [`CollabSessions::dispose_domain_discarding`] and
+    /// [`CollabSessions::close_docs`]: every room of `domain`, or only those
+    /// over a document of `kind` when one is named.
+    async fn sweep_domain(
+        &self,
+        domain: &str,
+        kind: Option<crystalline_core::ContentKind>,
+        discarded: &HashSet<String>,
+        reason: &str,
+    ) -> usize {
+        self.sweep_domain_rooms(domain, kind, discarded, Some(reason))
+            .await
+            .0
+    }
+
+    /// The sweep itself: answers how many rooms it ended, and the rooms
+    /// themselves when no `reason` is given. With a `reason` each room is
+    /// told `Closed { reason }`; without one each is only disposed, and the
+    /// caller tells it (see [`SweptRooms`]).
+    ///
+    /// The saves run in a task of its own, so a caller that is cancelled
+    /// while they run (its future dropped) leaves no room half closed: the
+    /// task finishes every save and every close, and rooms nobody told are
+    /// told `internal` when the task's answer is dropped.
+    async fn sweep_domain_rooms(
+        &self,
+        domain: &str,
+        kind: Option<crystalline_core::ContentKind>,
+        discarded: &HashSet<String>,
+        reason: Option<&str>,
+    ) -> (usize, SweptRooms) {
         let victims: Vec<Arc<CollabSession>> = {
             let mut sessions = self.sessions.lock().await;
             // The DOMAIN component alone, whatever document each room is a
@@ -463,29 +921,170 @@ impl CollabSessions {
             // so a room over any of them is a room over nothing a moment
             // later. `rooms_closed` counts exactly what it always counted -
             // the rooms this domain had open - and the owner component neither
-            // hides one from the sweep nor adds one to it.
+            // hides one from the sweep nor adds one to it. `close_docs` narrows
+            // the sweep by the KIND of document only, never by owner.
             let keys: Vec<RoomKey> = sessions
                 .keys()
-                .filter(|key| key.0 == domain)
+                .filter(|key| key.0 == domain && kind.is_none_or(|kind| key.1.kind() == kind))
                 .cloned()
                 .collect();
             keys.iter().filter_map(|key| sessions.remove(key)).collect()
         };
         let closed = victims.len();
-        for session in victims {
-            let discarding = session
-                .key()
-                .2
-                .is_some_and(|owner| discarded.contains(&owner));
-            // The save comes FIRST: poison disposes the session, and a
-            // disposed session's save paths are all no-ops. Which is exactly
-            // how a discarded actor's room is closed without one.
-            if !discarding {
-                session.final_save().await;
+        let discarded = discarded.clone();
+        let reason = reason.map(str::to_string);
+        let sweeping = tokio::spawn(sweep_task(victims, discarded, reason));
+        let untold = match sweeping.await {
+            Ok(untold) => untold,
+            Err(err) => {
+                tracing::warn!(%err, domain, "a room sweep did not finish");
+                SweptRooms { rooms: Vec::new() }
             }
-            session.poison().await;
+        };
+        (closed, untold)
+    }
+
+    /// End the room over a document a move is about to move, and fence the
+    /// document so no room opens over it until the move is done.
+    ///
+    /// The room saves its text first by the rules every closing room follows
+    /// (`final_save`: a save that cannot land keeps the text in the kept
+    /// folder) and is then disposed, so nothing typed after it is saved; the
+    /// editor keeps that as a draft. A save already running finishes first:
+    /// the final save waits for the room's state, which a save holds. The
+    /// sockets are not told yet: the move tells them `moved` with the new
+    /// address once it has committed ([`MoveClose::moved`]), and a move that
+    /// fails after this point tells them `internal`, since the document did
+    /// not move.
+    ///
+    /// The save runs in a task of its own, so a move that is cancelled while
+    /// it runs (its future dropped) still lands the save, and the room is
+    /// told `internal` when the task's answer is dropped.
+    ///
+    /// **Why a fence.** The close has to run before the move takes the
+    /// page's file lock, because the final save takes that lock under the
+    /// room's state and the registry (lock order: registry, then session,
+    /// then file). Without the fence a join between this close and the
+    /// move's commit would open a fresh room on the old text: the window R81
+    /// named. The fence is set under the registry lock in the same step that
+    /// takes the room out of the map, and `join_doc` checks it under that
+    /// lock, so a join is either closed here or refused until the fence
+    /// drops with the returned guard.
+    ///
+    /// Only the document under `overlay` is closed: a draft of the same page
+    /// by somebody else is another document, and the move does not move it.
+    pub async fn close_for_move(
+        self: &Arc<Self>,
+        domain: &str,
+        doc: &RoomDoc,
+        overlay: Option<&str>,
+        to: MovedTo,
+    ) -> MoveClose {
+        let key: RoomKey = (domain.to_string(), doc.clone(), overlay.map(str::to_string));
+        let victim = {
+            let mut sessions = self.sessions.lock().await;
+            *self
+                .moving
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(key.clone())
+                .or_insert(0) += 1;
+            sessions.remove(&key)
+        };
+        let fence = MoveFence {
+            registry: Arc::downgrade(self),
+            key,
+        };
+        let Some(session) = victim else {
+            return MoveClose {
+                room: SweptRooms { rooms: Vec::new() },
+                to,
+                _fence: fence,
+            };
+        };
+        // The save comes first, as in every sweep: a disposed room's save
+        // paths are no-ops. The fence travels with the task, so a move
+        // cancelled while the save runs still keeps the document fenced until
+        // the save is done.
+        let saving = tokio::spawn(async move {
+            let room = sweep_task(vec![session], HashSet::new(), None).await;
+            (room, fence)
+        });
+        match saving.await {
+            Ok((room, fence)) => MoveClose {
+                room,
+                to,
+                _fence: fence,
+            },
+            // A panic below the save: the task's guards told the room
+            // `internal` and lifted the fence as it unwound.
+            Err(err) => {
+                tracing::warn!(%err, "a moved room's last save did not finish");
+                MoveClose {
+                    room: SweptRooms { rooms: Vec::new() },
+                    to,
+                    _fence: MoveFence {
+                        registry: Weak::new(),
+                        key: (String::new(), RoomDoc::Engram(String::new()), None),
+                    },
+                }
+            }
         }
-        closed
+    }
+
+    /// Remember that the document at `key` moved to `to`, for a join that
+    /// comes after the move. Forgets what is older than [`MOVED_MEMORY`].
+    fn note_moved(&self, key: RoomKey, to: MovedTo) {
+        let now = Instant::now();
+        let mut moved = self
+            .moved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        moved.retain(|_, (_, at)| now.saturating_duration_since(*at) < MOVED_MEMORY);
+        moved.insert(key, (to, now));
+    }
+
+    /// Where the document at (`domain`, `doc`, `overlay`) went, when a move
+    /// took it away in the last [`MOVED_MEMORY`]. Asked only once the address
+    /// answers nothing, so a page created at the old path since wins.
+    pub fn moved_from(&self, key: &RoomKey) -> Option<MovedTo> {
+        let moved = self
+            .moved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        moved
+            .get(key)
+            .filter(|(_, at)| at.elapsed() < MOVED_MEMORY)
+            .map(|(to, _)| to.clone())
+    }
+
+    /// Whether `scope` may be told where a move took a document: always for
+    /// a move inside one domain, and for a move into another domain only
+    /// when `scope` may see that domain. A join that comes after the move
+    /// asks this before it is told [`JoinError::Moved`]'s address, so the
+    /// name of a domain somebody may not see never reaches them.
+    pub async fn may_see_move(&self, to: &MovedTo, scope: &crate::scope::Scope) -> bool {
+        sees_destination(&self.engine, to, scope).await
+    }
+
+    /// Whether a move holds `key` right now.
+    fn is_moving(&self, key: &RoomKey) -> bool {
+        self.moving
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(key)
+    }
+
+    /// Save and end every room of `domain` for a domain rename, without
+    /// telling the sockets yet: the rename tells them where the domain went
+    /// once it is done, and a rename refused or stopped after the sweep
+    /// tells them `internal` instead (see [`SweptRooms`]). Until the
+    /// tell a room is disposed, so nothing typed into it is saved; the
+    /// client keeps that text as a draft when the close arrives.
+    pub async fn sweep_domain_for_rename(&self, domain: &str) -> SweptRooms {
+        self.sweep_domain_rooms(domain, None, &HashSet::new(), None)
+            .await
+            .1
     }
 
     /// Move a session's registry entry after a frontmatter rename, so the room
@@ -497,12 +1096,22 @@ impl CollabSessions {
     /// session, never the reverse. `epoch` identifies the session that renamed
     /// itself, so an entry that was replaced meanwhile is left alone.
     async fn rekey(&self, from: &RoomKey, to_permalink: &str, epoch: &str) {
-        if from.1 == to_permalink {
+        // A rename moves an engram's permalink, and only an engram room is
+        // ever re-keyed: a reflection's receipt names the same path.
+        let from_permalink = match &from.1 {
+            RoomDoc::Engram(permalink) => permalink.as_str(),
+            RoomDoc::Reflection(_) => return,
+        };
+        if from_permalink == to_permalink {
             return;
         }
         // The permalink moves and nothing else does: a rename is a new address
         // for the same document, and whose document it is has not changed.
-        let to = (from.0.clone(), to_permalink.to_string(), from.2.clone());
+        let to = (
+            from.0.clone(),
+            RoomDoc::Engram(to_permalink.to_string()),
+            from.2.clone(),
+        );
         let mut sessions = self.sessions.lock().await;
         if sessions.get(from).is_none_or(|held| held.epoch() != epoch) {
             return; // disposed or replaced meanwhile: not ours to move
@@ -516,7 +1125,7 @@ impl CollabSessions {
         {
             tracing::warn!(
                 domain = %to.0,
-                permalink = %to.1,
+                permalink = %to.1.name(),
                 "a rename collided with a live session; both rooms stand"
             );
             return;
@@ -551,7 +1160,9 @@ impl CollabSessions {
         permalink: &str,
         overlay: Option<&str>,
     ) -> Option<LiveText> {
-        let session = self.live_room(domain, permalink, overlay).await?;
+        let session = self
+            .live_room(domain, &RoomDoc::Engram(permalink.to_string()), overlay)
+            .await?;
         Some(session.live().await)
     }
 
@@ -591,10 +1202,98 @@ impl CollabSessions {
         agent_label: &str,
         peer: Option<&AgentPeer>,
     ) -> Result<LiveApplied, String> {
-        let Some(session) = self.live_room(domain, permalink, overlay).await else {
+        self.apply_doc_text(
+            domain,
+            &RoomDoc::Engram(permalink.to_string()),
+            overlay,
+            target,
+            agent_label,
+            peer,
+        )
+        .await
+    }
+
+    /// [`CollabSessions::apply_text`] for a write that has a source to fall
+    /// back on: it composes only while the room will save it, and only onto
+    /// the very text `target` was computed from.
+    ///
+    /// Both are decided under the room's state lock, the one the compose
+    /// itself holds, so neither can change between the check and the
+    /// compose. A room saves what it holds while its save state is ok and
+    /// its final save has not run; a compose after that final save would sit
+    /// in a room nobody saves again. Between the last connection leaving and
+    /// the final save it is still taken, and the final save writes it.
+    /// A room in conflict or with a failed save may never write it either.
+    /// `base` is the live text `target` was computed from: when it moved,
+    /// composing the diff to `target` would take back what was typed since.
+    /// `None` is a wholesale replacement, which was computed from no text
+    /// and so checks only that the room saves.
+    ///
+    /// `overlay` and `peer` are [`CollabSessions::apply_text`]'s: whose
+    /// document, and who the agent shows up as in its strip.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn compose_while_saving(
+        &self,
+        domain: &str,
+        permalink: &str,
+        overlay: Option<&str>,
+        base: Option<&str>,
+        target: String,
+        agent_label: &str,
+        peer: Option<&AgentPeer>,
+    ) -> Result<LiveApplied, ComposeRefused> {
+        let Some(session) = self
+            .live_room(domain, &RoomDoc::Engram(permalink.to_string()), overlay)
+            .await
+        else {
+            return Err(ComposeRefused::NotSaving);
+        };
+        session
+            .apply_agent_text_while_saving(base, &target, agent_label, peer)
+            .await
+    }
+
+    /// Have the room over `doc` take in a change an engine verb just wrote
+    /// to its file, now rather than on its next idle probe: a three-way merge
+    /// of the file into the room's own live text, against the text the room
+    /// last saw on disk, so typing nobody has saved yet stays. A collision
+    /// raises the room's edit conflict; nothing in the room is erased.
+    ///
+    /// Takes no target text, unlike [`CollabSessions::apply_doc_text`]: the
+    /// file is the change, so a caller that composed it from the file cannot
+    /// hand the room a target that was never computed from the room. The
+    /// caller holds no page lock, because a room's save takes that lock
+    /// under the room's own state.
+    pub async fn absorb_doc_change(
+        &self,
+        domain: &str,
+        doc: &RoomDoc,
+        overlay: Option<&str>,
+    ) -> Result<AbsorbOutcome, String> {
+        let Some(session) = self.live_room(domain, doc, overlay).await else {
             return Err(format!(
-                "the co-editing session over '{permalink}' in domain '{domain}' closed while this \
-                 write was being prepared; read it again and repeat the edit"
+                "the co-editing session over '{}' in domain '{domain}' closed",
+                doc.name()
+            ));
+        };
+        session.absorb_file_change().await
+    }
+
+    /// [`CollabSessions::apply_text`] for a room over any kind of document.
+    pub async fn apply_doc_text(
+        &self,
+        domain: &str,
+        doc: &RoomDoc,
+        overlay: Option<&str>,
+        target: String,
+        agent_label: &str,
+        peer: Option<&AgentPeer>,
+    ) -> Result<LiveApplied, String> {
+        let Some(session) = self.live_room(domain, doc, overlay).await else {
+            return Err(format!(
+                "the co-editing session over '{}' in domain '{domain}' closed while this \
+                 write was being prepared; read it again and repeat the edit",
+                doc.name()
             ));
         };
         session.apply_agent_text(&target, agent_label, peer).await
@@ -615,7 +1314,9 @@ impl CollabSessions {
         overlay: Option<&str>,
         peer: &AgentPeer,
     ) -> Option<ClientID> {
-        let session = self.live_room(domain, permalink, overlay).await?;
+        let session = self
+            .live_room(domain, &RoomDoc::Engram(permalink.to_string()), overlay)
+            .await?;
         session.touch_agent_presence(peer).await
     }
 
@@ -635,7 +1336,23 @@ impl CollabSessions {
         permalink: &str,
         overlay: Option<&str>,
     ) -> bool {
-        self.live_room(domain, permalink, overlay).await.is_some()
+        self.has_live_doc(domain, &RoomDoc::Engram(permalink.to_string()), overlay)
+            .await
+    }
+
+    /// Whether any room over an engram of `domain`'s own text (not a draft)
+    /// is registered. A cheap look at the registry alone, for a caller about
+    /// to ask the index which engram a path holds only when a room might be
+    /// open over it.
+    pub async fn has_engram_rooms_in(&self, domain: &str) -> bool {
+        self.sessions.lock().await.keys().any(|(d, doc, overlay)| {
+            d == domain && overlay.is_none() && matches!(doc, RoomDoc::Engram(_))
+        })
+    }
+
+    /// [`CollabSessions::has_live_room`] for a room over any kind of document.
+    pub async fn has_live_doc(&self, domain: &str, doc: &RoomDoc, overlay: Option<&str>) -> bool {
+        self.live_room(domain, doc, overlay).await.is_some()
     }
 
     /// Who is in the room over one document right now, or an empty list when
@@ -643,11 +1360,11 @@ impl CollabSessions {
     pub async fn participants(
         &self,
         domain: &str,
-        permalink: &str,
+        doc: &RoomDoc,
         overlay: Option<&str>,
         except: Option<ClientID>,
     ) -> Vec<String> {
-        match self.live_room(domain, permalink, overlay).await {
+        match self.live_room(domain, doc, overlay).await {
             Some(session) => session.participants(except).await,
             None => Vec::new(),
         }
@@ -664,14 +1381,10 @@ impl CollabSessions {
     async fn live_room(
         &self,
         domain: &str,
-        permalink: &str,
+        doc: &RoomDoc,
         overlay: Option<&str>,
     ) -> Option<Arc<CollabSession>> {
-        let key = (
-            domain.to_string(),
-            permalink.to_string(),
-            overlay.map(str::to_string),
-        );
+        let key = (domain.to_string(), doc.clone(), overlay.map(str::to_string));
         let session = self
             .sessions
             .lock()
@@ -707,11 +1420,11 @@ pub struct CollabSession {
     epoch: String,
     /// The domain this room's engram lives in; no edit ever moves it.
     domain: String,
-    /// The permalink this room is REGISTERED under. A frontmatter rename moves
-    /// it together with the registry entry, so `(domain, key_permalink)` is
-    /// always where the registry holds this session. A std mutex, never held
-    /// across an await.
-    key_permalink: std::sync::Mutex<String>,
+    /// The document this room is REGISTERED under. A frontmatter rename moves
+    /// it together with the registry entry, so `(domain, key_doc)` is always
+    /// where the registry holds this session. A std mutex, never held across
+    /// an await.
+    key_doc: std::sync::Mutex<RoomDoc>,
     /// Whose document this room is a room over: `Some(actor)` for that actor's
     /// draft of the page, `None` for the one a direct domain keeps. Fixed for
     /// the life of the room - a rename moves the permalink, never the owner -
@@ -760,6 +1473,11 @@ pub struct CollabSession {
     /// Ends the saver loop and makes every save path a no-op, so nothing can
     /// write through a session no one owns any more.
     disposed: AtomicBool,
+    /// The save under way is the room's last one (`last_save`). Set only
+    /// around that save and cleared after it, so a room saved on close and
+    /// kept open by a late joiner does not assign section ids under the next
+    /// cursor. Read by a reflection room, whose ids come with the close.
+    final_pass: AtomicBool,
     state: Mutex<SessionState>,
 }
 
@@ -779,6 +1497,36 @@ struct SessionState {
     last_saved_text: String,
     /// Awareness client ids seen per connection, nulled on its disconnect.
     conns: HashMap<ConnId, HashSet<ClientID>>,
+    /// Whether the room's final save has run (whatever it ended in) since the
+    /// last connection joined. Text composed in after it is saved by nobody,
+    /// so an engine write that has a source to fall back on is refused from
+    /// here on. Between the last connection leaving and the final save the
+    /// room still saves what it holds, which an empty `conns` cannot tell.
+    final_saved: bool,
+    /// The signed-in account each connection of a reflection room belongs
+    /// to, as the surface that opened it authenticated it. Never read from
+    /// awareness, which is whatever a client sends.
+    authors: HashMap<ConnId, String>,
+    /// Who each connection is, as the surface that opened it authenticated
+    /// it, recorded in the same step that adds the connection: what a
+    /// `moved` close may name to that connection is screened against it, so
+    /// a move into a domain somebody may not see does not tell them its name
+    /// ([`CollabSession::close_moved`]). A connection with no entry is told
+    /// no address at all (fail closed).
+    viewers: HashMap<ConnId, crate::scope::Scope>,
+    /// The accounts whose connections sent an edit since the last save
+    /// landed: the names that save records. Kept past a disconnect, so the
+    /// last person to leave is still named by the final save, and cleared
+    /// only when a save lands, so a refused save keeps them for its retry.
+    editors: std::collections::BTreeSet<String>,
+    /// The accounts that typed each heading of a reflection room that has
+    /// no id yet, gathered from `editors` as each save lands. A heading gets
+    /// its id only with the room's close, when its typists have usually
+    /// left and `editors` no longer names them; the close records these for
+    /// the section it mints, then they are dropped. Empty in an engram room.
+    /// Keyed as [`SectionAuthors::new_by_heading`] is.
+    new_heading_authors:
+        std::collections::BTreeMap<(String, usize), std::collections::BTreeSet<String>>,
     /// The agents standing in this room, keyed by (account, label).
     ///
     /// Beside `conns` and never in it, which is the whole shape of the
@@ -908,9 +1656,7 @@ impl CollabSession {
         // is a room over one, the text the team reviewed where it is not. The
         // domain was screened by the surface that asked for the room, and so
         // was the right to be in this document.
-        let loaded = room_view(&engine, &key.0, key.2.as_deref())
-            .map_err(JoinError::Engine)?
-            .engram_text(&room_address(&key.0, &key.1))
+        let loaded = Self::load_doc(&engine, &key)
             .await
             .map_err(JoinError::Engine)?;
         // The room's text is LF whatever the file holds; a CRLF or mixed
@@ -933,7 +1679,7 @@ impl CollabSession {
         Ok(Arc::new(CollabSession {
             epoch,
             domain: key.0,
-            key_permalink: std::sync::Mutex::new(key.1),
+            key_doc: std::sync::Mutex::new(key.1),
             pinned_path: key.2.is_some().then(|| loaded.path.clone()),
             overlay: key.2,
             registry,
@@ -942,6 +1688,7 @@ impl CollabSession {
             has_guests: AtomicBool::new(false),
             has_agents: AtomicBool::new(false),
             disposed: AtomicBool::new(false),
+            final_pass: AtomicBool::new(false),
             state: Mutex::new(SessionState {
                 awareness: Awareness::new(doc),
                 path: loaded.path,
@@ -949,6 +1696,11 @@ impl CollabSession {
                 checksum: loaded.checksum,
                 last_saved_text: lf_content,
                 conns: HashMap::new(),
+                final_saved: false,
+                authors: HashMap::new(),
+                viewers: HashMap::new(),
+                editors: std::collections::BTreeSet::new(),
+                new_heading_authors: std::collections::BTreeMap::new(),
                 agents: HashMap::new(),
                 guests: HashMap::new(),
                 dirty: false,
@@ -976,12 +1728,23 @@ impl CollabSession {
     async fn add_conn(
         &self,
         conn: ConnId,
+        author: Option<&str>,
+        viewer: Option<crate::scope::Scope>,
     ) -> Result<(broadcast::Receiver<Frame>, Vec<u8>), JoinError> {
         let mut state = self.state.lock().await;
         if state.conns.len() >= MAX_PARTICIPANTS {
             return Err(JoinError::SessionFull);
         }
         state.conns.insert(conn, HashSet::new());
+        // A join before the room was disposed revives it: its saver runs and
+        // a final save comes again when this connection leaves.
+        state.final_saved = false;
+        if let Some(author) = author {
+            state.authors.insert(conn, author.to_string());
+        }
+        if let Some(viewer) = viewer {
+            state.viewers.insert(conn, viewer);
+        }
         // The greeting: hello, then the server's SyncStep1, then the full
         // awareness picture - the DefaultProtocol::start choreography with our
         // control message in front. One buffer; concatenation is legal.
@@ -1045,11 +1808,21 @@ impl CollabSession {
                         tracing::debug!(conn, "dropping an undecodable collab update");
                         continue;
                     };
-                    let applied = {
+                    // Whether the update changed the document: a provider's
+                    // answer to the greeting is a SyncStep2 that applies
+                    // cleanly and carries nothing new, and its sender has
+                    // edited nothing.
+                    let (applied, edited) = {
                         let mut txn = state.awareness.doc().transact_mut();
-                        txn.apply_update(decoded)
+                        let before = txn.state_vector();
+                        let applied = txn.apply_update(decoded);
+                        let edited = txn.state_vector() != before || !txn.delete_set().is_empty();
+                        (applied, edited)
                     };
                     if applied.is_ok() {
+                        if edited && let Some(author) = state.authors.get(&conn).cloned() {
+                            state.editors.insert(author);
+                        }
                         let now = Instant::now();
                         state.dirty = true;
                         state.last_edit = Some(now);
@@ -1173,9 +1946,7 @@ impl CollabSession {
             let _ = self.tx.send(Frame {
                 from: None,
                 to: Some(conn),
-                bytes: Bytes::from(control::encode(&Control::Closed {
-                    reason: "left".to_string(),
-                })),
+                bytes: Bytes::from(control::encode(&Control::closed("left"))),
             });
         }
     }
@@ -1321,6 +2092,8 @@ impl CollabSession {
     pub async fn remove_conn(&self, conn: ConnId) -> bool {
         let mut state = self.state.lock().await;
         state.guests.remove(&conn);
+        state.authors.remove(&conn);
+        state.viewers.remove(&conn);
         self.has_guests
             .store(!state.guests.is_empty(), Ordering::Relaxed);
         let ids = state.conns.remove(&conn).unwrap_or_default();
@@ -1374,7 +2147,17 @@ impl CollabSession {
         } else {
             crate::engine::sha256_hex(text.as_bytes())
         };
-        LiveText { text, checksum }
+        let saving =
+            !state.closed && !state.final_saved && matches!(state.save_state, SaveStateTag::Ok);
+        let waiting =
+            !state.closed && !state.final_saved && !matches!(state.save_state, SaveStateTag::Ok);
+        LiveText {
+            text,
+            checksum,
+            saving,
+            base_checksum: state.checksum.clone(),
+            waiting,
+        }
     }
 
     /// The session text, and whether it differs from the last saved text.
@@ -1413,14 +2196,15 @@ impl CollabSession {
     }
 
     /// The registry key this room is filed under right now: the domain, the
-    /// permalink a frontmatter rename may have moved, and whose document it
-    /// is.
+    /// document (whose permalink a frontmatter rename may have moved), and
+    /// whose document it is.
     pub fn key(&self) -> RoomKey {
-        (
-            self.domain.clone(),
-            self.key_permalink.lock().expect("key mutex").clone(),
-            self.overlay.clone(),
-        )
+        (self.domain.clone(), self.doc(), self.overlay.clone())
+    }
+
+    /// The document this room is registered under right now.
+    fn doc(&self) -> RoomDoc {
+        self.key_doc.lock().expect("key mutex").clone()
     }
 
     /// The view this room reads and writes through, built fresh per use the
@@ -1432,7 +2216,7 @@ impl CollabSession {
 
     /// Record the permalink the registry just re-filed this room under.
     fn adopt_key(&self, permalink: &str) {
-        *self.key_permalink.lock().expect("key mutex") = permalink.to_string();
+        *self.key_doc.lock().expect("key mutex") = RoomDoc::Engram(permalink.to_string());
     }
 
     /// One saver pass at `now`: decides whether a save is due and runs it.
@@ -1488,6 +2272,8 @@ impl CollabSession {
             // Nothing effective is pending: disarm what a no-op update set, so
             // the next real edit starts both timers from scratch.
             state.dirty = false;
+            // The document is the saved text again: nobody's change is pending.
+            state.editors.clear();
             state.last_edit = None;
             state.oldest_unsaved = None;
             if matches!(state.save_state, SaveStateTag::Ok) {
@@ -1507,7 +2293,47 @@ impl CollabSession {
             // the Save button always retries at once.
             return None;
         }
+        if self.switches_reflection_off_locked(&state) {
+            state = match self.close_reflection_rooms_unlocked(state).await {
+                Some(state) => state,
+                None => return None,
+            };
+        }
         self.save_locked(&mut state, now).await
+    }
+
+    /// Whether this room's text, saved now, switches its domain's Reflection
+    /// off: an engram room over the folder's own MANIFEST (never a draft)
+    /// whose text does not say on while the switch is on. Read under the
+    /// guard; takes no other lock.
+    fn switches_reflection_off_locked(&self, state: &SessionState) -> bool {
+        matches!(self.doc(), RoomDoc::Engram(_))
+            && crate::engine::is_manifest_path(&state.path)
+            && self.view().is_ok_and(|view| view.actor().is_none())
+            && self
+                .engine
+                .switches_reflection_off(&self.domain, Some(&Self::file_text_locked(state)))
+    }
+
+    /// Close the domain's reflection rooms ahead of this room's save that
+    /// switches the Reflection off, then take the guard again. The close
+    /// takes the registry, and the lock order is registry, then session, so
+    /// the guard is dropped for it: a join holds the registry while it waits
+    /// for this room's guard. `None` when the room may not save any more
+    /// once the guard is back. A close that the text no longer needs (it
+    /// changed meanwhile) costs those rooms their sockets, never their text.
+    async fn close_reflection_rooms_unlocked(
+        &self,
+        state: tokio::sync::MutexGuard<'_, SessionState>,
+    ) -> Option<tokio::sync::MutexGuard<'_, SessionState>> {
+        drop(state);
+        self.engine.close_reflection_rooms(&self.domain).await;
+        let state = self.state.lock().await;
+        if self.is_disposed() || state.closed || matches!(state.save_state, SaveStateTag::Conflict)
+        {
+            return None;
+        }
+        Some(state)
     }
 
     /// The last participant left, or the daemon is shutting the session down:
@@ -1524,16 +2350,99 @@ impl CollabSession {
             return None; // a disposed or poisoned room never writes again
         }
         let mut state = self.state.lock().await;
+        // Marked on every way out below, under the lock a compose takes too:
+        // whatever lands after this is saved by nobody.
+        state.final_saved = true;
         if state.closed {
             // The room accepted an external deletion: a final save here would
             // resurrect the file the author agreed to let go.
             return None;
         }
         if matches!(state.save_state, SaveStateTag::Conflict) {
-            return None; // an unresolved conflict never saves; drafts hold the text
+            // An unresolved conflict never saves, and nobody is left to
+            // resolve it, so the server keeps the room's side of it.
+            self.keep_unsaved_text(&state);
+            return None;
+        }
+        if self.switches_reflection_off_locked(&state) {
+            state = match self.close_reflection_rooms_unlocked(state).await {
+                Some(state) => state,
+                None => {
+                    let state = self.state.lock().await;
+                    if matches!(state.save_state, SaveStateTag::Conflict) {
+                        self.keep_unsaved_text(&state);
+                    }
+                    return None;
+                }
+            };
         }
         // The last chance to land this text, so no retry backoff applies.
-        self.save_locked(&mut state, Instant::now()).await
+        self.final_pass.store(true, Ordering::Relaxed);
+        let renamed = self.save_locked(&mut state, Instant::now()).await;
+        self.final_pass.store(false, Ordering::Relaxed);
+        // The last chance was refused or ran into a conflict: nothing will
+        // ever save this text again, so the server keeps it rather than drop
+        // it.
+        if matches!(
+            state.save_state,
+            SaveStateTag::Failed | SaveStateTag::Conflict
+        ) {
+            self.keep_unsaved_text(&state);
+        }
+        renamed
+    }
+
+    /// [`CollabSession::keep_refused_text`] when the room holds text its
+    /// last save did not write. A reflection room's last pass runs even with
+    /// nothing typed (for its ids), and a refusal of THAT loses nothing, so
+    /// it keeps nothing.
+    fn keep_unsaved_text(&self, state: &SessionState) {
+        if Self::file_text_locked(state) != state.last_saved_text {
+            self.keep_refused_text(state);
+        }
+    }
+
+    /// Write a closing room's text that could not be saved to the kept
+    /// folder (layout in [`crystalline_core::kept`]) and log where. Best
+    /// effort: a failure to write it is a second warning, never a panic.
+    fn keep_refused_text(&self, state: &SessionState) {
+        use crystalline_core::kept::KeptKind;
+        let (kind, path) = match self.doc() {
+            RoomDoc::Engram(_) => (KeptKind::Engram, state.path.clone()),
+            RoomDoc::Reflection(path) => (KeptKind::Reflection, path),
+        };
+        let text = Self::file_text_locked(state);
+        let Some(kept) = self.engine.kept_dir() else {
+            tracing::warn!(
+                domain = %self.domain,
+                path = %path,
+                "a closing room's text could not be saved, and this process knows no state folder to keep it in"
+            );
+            return;
+        };
+        match crystalline_core::kept::write(
+            &kept,
+            &self.domain,
+            self.overlay.as_deref(),
+            kind,
+            &path,
+            chrono::Utc::now(),
+            &text,
+        ) {
+            Ok(file) => tracing::warn!(
+                domain = %self.domain,
+                path = %path,
+                kept = %file.display(),
+                "a closing room's text could not be saved and is kept here; crystalline kept list shows it"
+            ),
+            Err(err) => tracing::warn!(
+                domain = %self.domain,
+                path = %path,
+                kept = %kept.display(),
+                %err,
+                "a closing room's text could not be saved, and keeping it failed too"
+            ),
+        }
     }
 
     /// Move the registry entry after a rename, holding no session guard.
@@ -1552,14 +2461,92 @@ impl CollabSession {
     /// `Closed { reason: "internal" }` and closes with the permanent code, the
     /// session never saves again, and participants' drafts hold their text.
     pub async fn poison(&self) {
+        self.close("internal").await;
+    }
+
+    /// End the room and tell every socket why: `Closed { reason }`, after
+    /// which each socket closes with the permanent code and the room never
+    /// saves again.
+    pub async fn close(&self, reason: &str) {
+        self.close_with(Control::closed(reason));
+    }
+
+    /// [`CollabSession::close`] with the whole `Closed` control, for a close
+    /// that names more than its reason (`moved` names the new address).
+    fn close_with(&self, closed: Control) {
         self.dispose();
         let _ = self.tx.send(Frame {
             from: None,
             to: None,
-            bytes: Bytes::from(control::encode(&Control::Closed {
-                reason: "internal".to_string(),
-            })),
+            bytes: Bytes::from(control::encode(&closed)),
         });
+    }
+
+    /// Tell every connection that the document moved to `to`, each in what
+    /// it may see: a connection whose account cannot see the destination
+    /// domain is told only that the document moved (`Closed { reason:
+    /// "moved" }` with no address), so the name of a domain it may not see
+    /// never reaches it. A move inside one domain names nothing new, so
+    /// everybody is told the whole address.
+    pub async fn close_moved(&self, to: &MovedTo) {
+        let full = to.control();
+        if to.domain.is_none() {
+            self.close_with(full);
+            return;
+        }
+        // Every connection, with who it is where that is known: one with no
+        // entry is somebody unknown and is told no address (fail closed).
+        let viewers: Vec<(ConnId, Option<crate::scope::Scope>)> = {
+            let state = self.state.lock().await;
+            state
+                .conns
+                .keys()
+                .map(|conn| (*conn, state.viewers.get(conn).cloned()))
+                .collect()
+        };
+        let mut blind = HashSet::new();
+        for (conn, scope) in viewers {
+            let sees = match &scope {
+                Some(scope) => sees_destination(&self.engine, to, scope).await,
+                None => false,
+            };
+            if !sees {
+                blind.insert(conn);
+            }
+        }
+        if blind.is_empty() {
+            self.close_with(full);
+            return;
+        }
+        self.dispose();
+        let conns: Vec<ConnId> = self.state.lock().await.conns.keys().copied().collect();
+        for conn in conns {
+            let control = if blind.contains(&conn) {
+                Control::Closed {
+                    reason: "moved".to_string(),
+                    domain: None,
+                    path: None,
+                    permalink: None,
+                }
+            } else {
+                full.clone()
+            };
+            let _ = self.tx.send(Frame {
+                from: None,
+                to: Some(conn),
+                bytes: Bytes::from(control::encode(&control)),
+            });
+        }
+    }
+
+    /// The room's document as its last save left it: its path, and for an
+    /// engram the permalink it answers to.
+    async fn address(&self) -> (String, Option<String>) {
+        let state = self.state.lock().await;
+        match self.doc() {
+            RoomDoc::Engram(_) => (state.path.clone(), Some(state.permalink.clone())),
+            RoomDoc::Reflection(path) => (path, None),
+        }
     }
 
     /// The save pass over the locked state: one attempt, and - when the file
@@ -1588,10 +2575,7 @@ impl CollabSession {
                             return None;
                         }
                     };
-                    let theirs = match view
-                        .engram_text(&room_address(&self.domain, &state.permalink))
-                        .await
-                    {
+                    let theirs = match self.read_doc(&view, state).await {
                         Ok(theirs) => theirs,
                         // The engram the CAS refused is not there to read: the
                         // write and the delete raced, so this is the deletion.
@@ -1625,9 +2609,15 @@ impl CollabSession {
         }
         let file = Self::file_text_locked(state);
         state.flush_requested = false;
-        if file == state.last_saved_text {
+        // A reflection room's ids come with its last save, so that save runs
+        // even when nothing new was typed since the one before it.
+        let closing_reflection =
+            matches!(self.doc(), RoomDoc::Reflection(_)) && self.final_pass.load(Ordering::Relaxed);
+        if file == state.last_saved_text && !closing_reflection {
             // Nothing effective changed: never write, never touch the mtime.
             state.dirty = false;
+            // The document is the saved text again: nobody's change is pending.
+            state.editors.clear();
             state.oldest_unsaved = None;
             if !matches!(state.save_state, SaveStateTag::Ok) {
                 // The document matches the file again, so the standing save
@@ -1662,11 +2652,7 @@ impl CollabSession {
         // would leave that compare false forever, since the live text itself
         // never gained the respelling, and the room would save on every
         // debounce window for good.
-        let file = match self
-            .engine
-            .normalize_domain_spellings_for(&file, &crate::scope::Scope::Unrestricted)
-            .await
-        {
+        let file = match self.normalize_doc(&file).await {
             Ok((normalized, count)) => {
                 if count > 0 {
                     self.converge(state, &to_lf(&normalized));
@@ -1678,55 +2664,13 @@ impl CollabSession {
                 return SaveOutcome::Done(None);
             }
         };
-        if self.room_switches_read_only_on(&state.path, &file).await {
+        if self.doc_switches_read_only_on(state, &file).await {
             self.fail_save(state, ROOM_SWITCH_ON_REFUSAL.to_string());
             return SaveOutcome::Done(None);
         }
-        let params = crate::params::SaveParams {
-            domain: self.domain.clone(),
-            identifier: room_address(&self.domain, &state.permalink),
-            content: file.clone(),
-            expected_checksum: state.checksum.clone(),
-        };
-        // Whose save this is, which is whose document the room is over. A room
-        // over one actor's draft writes that actor's row and nothing else -
-        // not the folder the team reviewed, and not the draft of whoever
-        // happens to be typing. A room over the document a direct domain keeps
-        // saves as the machine owner, exactly as every room did before there
-        // was anything else to be: the surface that opened it is the gate, as
-        // it is for every other write on this instance.
-        let receipt = match self.view() {
-            // The VIEW decides, never the key on its own: a domain that has
-            // stopped reviewing changes has no draft left for this room to be
-            // over, and its text belongs in the folder (see `room_view`).
-            Ok(view) if view.actor().is_some() => {
-                // The path this room opened on, which is the only one it
-                // writes. Unreachable as a `None` here - an overlay room is
-                // the only kind whose view carries an actor - and answered
-                // with the room's current path rather than by unwrapping.
-                let pinned = self
-                    .pinned_path
-                    .clone()
-                    .unwrap_or_else(|| state.path.clone());
-                self.engine
-                    .save_engram_in_overlay(&view, &params, &pinned)
-                    .await
-            }
-            Ok(_) => {
-                self.engine
-                    .save_engram(&params, &crate::scope::Scope::Unrestricted)
-                    .await
-            }
-            Err(err) => Err(err),
-        };
+        let receipt = self.write_doc(state, &file).await;
         match receipt {
             Ok(receipt) => {
-                // A human just taught this domain something through the editor,
-                // which reaches the engine directly rather than through the
-                // REST write handler: the domain owes a consolidation sweep
-                // exactly as it would from a PUT, and this is the surface most
-                // human authoring actually comes through.
-                crate::maintenance::record_pending(&self.domain);
                 let checksum = receipt["checksum"].as_str().unwrap_or_default().to_string();
                 // The permalink the engram answers to AFTER the write: an
                 // author who edited the frontmatter line just moved the
@@ -1740,7 +2684,7 @@ impl CollabSession {
                 // token for exactly this text, and it is also what a
                 // reconnecting client is greeted with.
                 state.checksum = checksum.clone();
-                state.last_saved_text = file;
+                self.land_text(state, file, closing_reflection);
                 state.permalink = permalink.clone();
                 // The path a rename can move too (the receipt is the authority
                 // on where the engram now lives), so Task 7's idle probe never
@@ -1904,16 +2848,25 @@ impl CollabSession {
         let Ok(view) = self.view() else {
             return None;
         };
-        match view
-            .engram_text(&room_address(&self.domain, &state.permalink))
-            .await
-        {
+        match self.read_doc(&view, state).await {
             Ok(theirs) if theirs.checksum != state.checksum => {
                 let detail = format!(
                     "'{}' changed on disk while this session was idle",
                     state.permalink
                 );
                 if self.merge_external(state, theirs, detail).await {
+                    // Defensive, and not reached today: the probe runs only
+                    // while the room's text is the saved text, so a merge here
+                    // is the file's own text, which does not switch anything.
+                    // Should that change, a merged MANIFEST that switches the
+                    // Reflection off is left to the next tick, which closes the
+                    // reflection rooms with this guard dropped (see
+                    // `due_save`): the guard is held here, and the close takes
+                    // the registry.
+                    if self.switches_reflection_off_locked(state) {
+                        state.flush_requested = true;
+                        return None;
+                    }
                     // A clean merge over an unedited room IS their text, so
                     // this writes nothing; a room that edited between the last
                     // save and the probe has its merged text landed instead.
@@ -1995,9 +2948,7 @@ impl CollabSession {
                 let _ = self.tx.send(Frame {
                     from: None,
                     to: None,
-                    bytes: Bytes::from(control::encode(&Control::Closed {
-                        reason: "deleted".to_string(),
-                    })),
+                    bytes: Bytes::from(control::encode(&Control::closed("deleted"))),
                 });
                 None
             }
@@ -2023,7 +2974,7 @@ impl CollabSession {
         let Ok(view) = self.view() else {
             return None;
         };
-        match view.engram_text_at_path(&state.path).await {
+        match self.peek_doc(&view, state).await {
             Ok(Some(theirs)) if to_lf(&theirs.content) != state.last_saved_text => {
                 let detail = format!(
                     "'{}' is on disk again with somebody else's text, so restoring \
@@ -2055,11 +3006,7 @@ impl CollabSession {
         // document shows and what `last_saved_text` is set to below all agree
         // on the canonical spelling, rather than restoring - and then living
         // with - whatever the room typed before it ever saved.
-        let file = match self
-            .engine
-            .normalize_domain_spellings_for(&file, &crate::scope::Scope::Unrestricted)
-            .await
-        {
+        let file = match self.normalize_doc(&file).await {
             Ok((normalized, count)) => {
                 if count > 0 {
                     self.converge(state, &to_lf(&normalized));
@@ -2074,36 +3021,11 @@ impl CollabSession {
         // The restore writes as the machine owner too (base arm) or through
         // the room's view (draft arm), so the room is the only place that can
         // refuse a switch-on here.
-        if self.room_switches_read_only_on(&state.path, &file).await {
+        if self.doc_switches_read_only_on(state, &file).await {
             self.refuse_restore(state, ROOM_SWITCH_ON_REFUSAL.to_string());
             return None;
         }
-        // Through the room's own view when the room is over a draft - it puts
-        // its text back in that actor's draft - and through the scope its save
-        // uses otherwise. The two arms have to agree, and the save's `None`
-        // arm goes through `Scope::Unrestricted`: routing a base room's
-        // restore through the base view instead would write the folder of a
-        // domain that reviews changes, which is the one thing review mode
-        // exists to stop. Neither arm is reachable from the collab route in a
-        // reviewing domain, which always names an owner; the registry API can
-        // still ask for it, and this is the answer it gets.
-        let restored = match view.actor() {
-            Some(_) => {
-                self.engine
-                    .restore_engram_in_view(&view, &self.domain, &state.path, &file)
-                    .await
-            }
-            None => {
-                self.engine
-                    .restore_engram(
-                        &self.domain,
-                        &state.path,
-                        &file,
-                        &crate::scope::Scope::Unrestricted,
-                    )
-                    .await
-            }
-        };
+        let restored = self.restore_doc(&view, state, &file).await;
         match restored {
             Ok(receipt) => {
                 let checksum = receipt["checksum"].as_str().unwrap_or_default().to_string();
@@ -2113,7 +3035,8 @@ impl CollabSession {
                     .to_string();
                 let renamed = (permalink != state.permalink).then(|| permalink.clone());
                 state.checksum = checksum.clone();
-                state.last_saved_text = file;
+                // A restore never mints ids.
+                self.land_text(state, file, false);
                 state.permalink = permalink.clone();
                 if let Some(path) = receipt["path"].as_str() {
                     state.path = path.to_string();
@@ -2204,6 +3127,61 @@ impl CollabSession {
         });
     }
 
+    /// Take in a change written to the room's file by an engine verb (see
+    /// [`CollabSessions::absorb_doc_change`]). The idle probe's merge, run at
+    /// once: a file the room has already taken in (its checksum is the
+    /// room's, because the room saved in between) is left alone, a room with
+    /// a standing conflict or failure meets the file on its next save, and
+    /// otherwise the file is merged three ways into the live text. A merge
+    /// that kept unsaved typing arms the save timers, as typing does.
+    ///
+    /// A room whose final save has run is ended for this purpose: it saves
+    /// nothing again, so text merged into it would be reported as taken in
+    /// while it lands nowhere.
+    async fn absorb_file_change(&self) -> Result<AbsorbOutcome, String> {
+        if self.is_disposed() {
+            return Err("this co-editing session ended while the write was being prepared".into());
+        }
+        let mut state = self.state.lock().await;
+        if state.closed || state.final_saved {
+            return Err(
+                "this co-editing session ended while the write was being prepared".to_string(),
+            );
+        }
+        let absorbed = if !matches!(state.save_state, SaveStateTag::Ok) {
+            Absorbed::Deferred
+        } else {
+            let view = self.view().map_err(|e| e.to_string())?;
+            match self.read_doc(&view, &state).await {
+                Ok(theirs) if theirs.checksum != state.checksum => {
+                    let detail = format!(
+                        "'{}' was changed by an agent while this room was open",
+                        state.permalink
+                    );
+                    if self.merge_external(&mut state, theirs, detail).await {
+                        if Self::file_text_locked(&state) != state.last_saved_text {
+                            let now = Instant::now();
+                            state.dirty = true;
+                            state.last_edit = Some(now);
+                            state.oldest_unsaved.get_or_insert(now);
+                        }
+                        Absorbed::Merged
+                    } else {
+                        Absorbed::Conflict
+                    }
+                }
+                Ok(_) => Absorbed::Merged,
+                // Gone again already: the room's save or probe raises it.
+                Err(EngineError::NotFound(_)) => Absorbed::Deferred,
+                Err(err) => return Err(err.to_string()),
+            }
+        };
+        Ok(AbsorbOutcome {
+            absorbed,
+            participants: Self::participants_locked(&state, None),
+        })
+    }
+
     /// Compose an agent's text into this room's document.
     ///
     /// The engine computed `target` from this room's own live text a moment
@@ -2231,10 +3209,45 @@ impl CollabSession {
                 "this co-editing session ended while the write was being prepared".to_string(),
             );
         }
+        Ok(self.compose_locked(&mut state, target, origin, peer))
+    }
+
+    /// [`CollabSession::apply_agent_text`] for
+    /// [`CollabSessions::compose_while_saving`]: refused, with nothing
+    /// composed, unless the room will save the text and still holds `base`.
+    async fn apply_agent_text_while_saving(
+        &self,
+        base: Option<&str>,
+        target: &str,
+        origin: &str,
+        peer: Option<&AgentPeer>,
+    ) -> Result<LiveApplied, ComposeRefused> {
+        if self.is_disposed() {
+            return Err(ComposeRefused::NotSaving);
+        }
+        let mut state = self.state.lock().await;
+        if state.closed || state.final_saved || !matches!(state.save_state, SaveStateTag::Ok) {
+            return Err(ComposeRefused::NotSaving);
+        }
+        if base.is_some_and(|base| Self::file_text_locked(&state) != base) {
+            return Err(ComposeRefused::Moved);
+        }
+        Ok(self.compose_locked(&mut state, target, origin, peer))
+    }
+
+    /// The compose itself, over the locked state: converge the document to
+    /// `target`, arm the saver and stand the agent in the strip.
+    fn compose_locked(
+        &self,
+        state: &mut SessionState,
+        target: &str,
+        origin: &str,
+        peer: Option<&AgentPeer>,
+    ) -> LiveApplied {
         // The room's text is LF only, whatever line endings the engine verb's
         // text carried.
         let target = to_lf(target);
-        self.converge_with(&mut state, &target, Some(origin));
+        self.converge_with(state, &target, Some(origin));
         // Armed exactly as an update from a socket arms it (see
         // `CollabSession::handle_frame`), so the agent's text saves on the
         // same debounce a person's typing does. Forcing a flush instead would
@@ -2246,14 +3259,14 @@ impl CollabSession {
         state.oldest_unsaved.get_or_insert(now);
         // The agent joins the strip under the same guard its text landed
         // under, so a person sees the chip and the change together.
-        let mine = peer.and_then(|peer| self.touch_agent_locked(&mut state, peer));
-        Ok(LiveApplied {
+        let mine = peer.and_then(|peer| self.touch_agent_locked(state, peer));
+        LiveApplied {
             // Everybody in the room EXCEPT this agent. `present` is what the
             // agent is told about who is in there with it, and its own slot -
             // minted a line ago, or standing from a call a moment ago - is not
             // news to the one that put it there. Another agent's is.
-            participants: Self::participants_locked(&state, mine),
-        })
+            participants: Self::participants_locked(state, mine),
+        }
     }
 
     /// Who is in this room, by the name their client publishes in awareness.
@@ -2314,6 +3327,287 @@ enum SaveOutcome {
     Deleted(String),
 }
 
+/// The engine-bound steps of a room, each dispatched on the document the room
+/// is over. Every match is exhaustive, so a new kind of document names each
+/// step it has to answer.
+impl CollabSession {
+    /// The text a room opens over (`open`).
+    async fn load_doc(engine: &Engine, key: &RoomKey) -> Result<EngramText, EngineError> {
+        match &key.1 {
+            RoomDoc::Engram(permalink) => {
+                room_view(engine, &key.0, key.2.as_deref())?
+                    .engram_text(&room_address(&key.0, permalink))
+                    .await
+            }
+            RoomDoc::Reflection(path) => engine.reflection_room_text(&key.0, path).await,
+        }
+    }
+
+    /// The document as stored now, through the room's view (the external
+    /// change arm of `save_locked` and the idle probe).
+    async fn read_doc(
+        &self,
+        view: &DomainView<'_>,
+        state: &SessionState,
+    ) -> Result<EngramText, EngineError> {
+        match self.doc() {
+            RoomDoc::Engram(_) => {
+                view.engram_text(&room_address(&self.domain, &state.permalink))
+                    .await
+            }
+            // No overlay: the view is not consulted.
+            RoomDoc::Reflection(path) => {
+                self.engine.reflection_room_text(&self.domain, &path).await
+            }
+        }
+    }
+
+    /// What stands at the room's path before a restore writes it back.
+    async fn peek_doc(
+        &self,
+        view: &DomainView<'_>,
+        state: &SessionState,
+    ) -> Result<Option<EngramText>, EngineError> {
+        match self.doc() {
+            RoomDoc::Engram(_) => view.engram_text_at_path(&state.path).await,
+            RoomDoc::Reflection(path) => {
+                match self.engine.reflection_room_text(&self.domain, &path).await {
+                    Ok(text) => Ok(Some(text)),
+                    Err(EngineError::NotFound(_)) => Ok(None),
+                    Err(e) => Err(e),
+                }
+            }
+        }
+    }
+
+    /// The room's text with its cross-domain spellings made canonical.
+    async fn normalize_doc(&self, file: &str) -> Result<(String, usize), EngineError> {
+        match self.doc() {
+            RoomDoc::Engram(_) => {
+                self.engine
+                    .normalize_domain_spellings_for(file, &crate::scope::Scope::Unrestricted)
+                    .await
+            }
+            // A reflection is never parsed as an engram: the body gate splits
+            // off the frontmatter, as a reflection write's does.
+            RoomDoc::Reflection(_) => {
+                self.engine
+                    .normalize_domain_spellings_in(
+                        file,
+                        crystalline_core::relink::BodyGate::Split,
+                        &crate::scope::Scope::Unrestricted,
+                    )
+                    .await
+            }
+        }
+    }
+
+    /// Whether the save would switch the domain to read-only.
+    async fn doc_switches_read_only_on(&self, state: &SessionState, file: &str) -> bool {
+        match self.doc() {
+            RoomDoc::Engram(_) => self.room_switches_read_only_on(&state.path, file).await,
+            // A reflection is never the MANIFEST.
+            RoomDoc::Reflection(_) => false,
+        }
+    }
+
+    /// The save itself; answers the receipt a save reads its checksum,
+    /// permalink and path off.
+    async fn write_doc(
+        &self,
+        state: &SessionState,
+        file: &str,
+    ) -> Result<serde_json::Value, EngineError> {
+        match self.doc() {
+            RoomDoc::Engram(_) => {
+                let params = crate::params::SaveParams {
+                    domain: self.domain.clone(),
+                    identifier: room_address(&self.domain, &state.permalink),
+                    content: file.to_string(),
+                    expected_checksum: state.checksum.clone(),
+                };
+                // Whose save this is, which is whose document the room is over. A room
+                // over one actor's draft writes that actor's row and nothing else -
+                // not the folder the team reviewed, and not the draft of whoever
+                // happens to be typing. A room over the document a direct domain keeps
+                // saves as the machine owner, exactly as every room did before there
+                // was anything else to be: the surface that opened it is the gate, as
+                // it is for every other write on this instance.
+                let receipt = match self.view() {
+                    // The VIEW decides, never the key on its own: a domain that has
+                    // stopped reviewing changes has no draft left for this room to be
+                    // over, and its text belongs in the folder (see `room_view`).
+                    Ok(view) if view.actor().is_some() => {
+                        // The path this room opened on, which is the only one it
+                        // writes. Unreachable as a `None` here - an overlay room is
+                        // the only kind whose view carries an actor - and answered
+                        // with the room's current path rather than by unwrapping.
+                        let pinned = self
+                            .pinned_path
+                            .clone()
+                            .unwrap_or_else(|| state.path.clone());
+                        self.engine
+                            .save_engram_in_overlay(&view, &params, &pinned)
+                            .await
+                    }
+                    Ok(_) => self.engine.save_engram_from_room(&params).await,
+                    Err(err) => Err(err),
+                };
+                if receipt.is_ok() {
+                    // A human just taught this domain something through the
+                    // editor, which reaches the engine directly rather than
+                    // through the REST write handler: the domain owes a
+                    // consolidation sweep exactly as it would from a PUT, and
+                    // this is the surface most human authoring actually comes
+                    // through.
+                    crate::maintenance::record_pending(&self.domain);
+                }
+                receipt
+            }
+            // No `record_pending`: a Reflection edit owes no consolidation
+            // sweep.
+            RoomDoc::Reflection(path) => {
+                let authors = Self::reflection_authors_locked(state);
+                self.engine
+                    .save_reflection_room(
+                        &self.domain,
+                        &path,
+                        file,
+                        &state.checksum,
+                        &authors,
+                        self.final_pass.load(Ordering::Relaxed),
+                    )
+                    .await
+            }
+        }
+    }
+
+    /// Who a reflection room's save records as having changed a section:
+    /// the signed-in accounts whose connections sent an edit since the last
+    /// save landed, and for a section that gets its id in this save also
+    /// the accounts that typed its heading. Nobody else in the room, and no
+    /// name a client put into awareness. "someone" only for a section with
+    /// nobody named while nobody is connected, such as the close of a room
+    /// whose edits all landed before; a save with people connected and no
+    /// edit since the last one names nobody.
+    fn reflection_authors_locked(state: &SessionState) -> SectionAuthors {
+        SectionAuthors {
+            changed: state.editors.iter().cloned().collect(),
+            new_by_heading: state.new_heading_authors.clone(),
+            someone_if_empty: state.conns.is_empty(),
+        }
+    }
+
+    /// Record `file` as the text that just landed, by a save or a restore,
+    /// and clear `editors`, whose change it holds now. In a reflection room
+    /// the names of who typed a heading without an id are carried first
+    /// ([`CollabSession::carry_new_heading_authors`]), or dropped when this
+    /// landing `minted` the ids and so recorded them. One place for both
+    /// landings, so they cannot drift apart.
+    fn land_text(&self, state: &mut SessionState, file: String, minted: bool) {
+        let previous = std::mem::replace(&mut state.last_saved_text, file);
+        if matches!(self.doc(), RoomDoc::Reflection(_)) {
+            if minted {
+                state.new_heading_authors.clear();
+            } else {
+                Self::carry_new_heading_authors(state, &previous);
+            }
+        }
+        state.editors.clear();
+    }
+
+    /// After a reflection room's save landed and before `editors` is
+    /// cleared: every heading without an id whose section is new or changed
+    /// against `previous` (the text saved before) gains the names in
+    /// `editors`. Sections are matched by heading text and their place among
+    /// the id-less sections under that heading text. A key the saved text no
+    /// longer holds is dropped, so a name is never carried onto a later
+    /// heading of the same name that somebody else typed.
+    fn carry_new_heading_authors(state: &mut SessionState, previous: &str) {
+        use crystalline_core::reflection::split_sections;
+        let idless = |text: &str| -> std::collections::BTreeMap<(String, usize), String> {
+            let mut out = std::collections::BTreeMap::new();
+            let mut seen: HashMap<String, usize> = HashMap::new();
+            // The top section always has an id, so only headings get here.
+            for section in split_sections(text).into_iter().filter(|s| s.id.is_none()) {
+                let place = seen.entry(section.heading.clone()).or_default();
+                out.insert((section.heading, *place), section.text);
+                *place += 1;
+            }
+            out
+        };
+        let before = idless(previous);
+        let now = idless(&state.last_saved_text);
+        state
+            .new_heading_authors
+            .retain(|key, _| now.contains_key(key));
+        for (key, text) in &now {
+            if before.get(key) != Some(text) {
+                state
+                    .new_heading_authors
+                    .entry(key.clone())
+                    .or_default()
+                    .extend(state.editors.iter().cloned());
+            }
+        }
+    }
+
+    /// The restore of a deleted document from the room's text.
+    async fn restore_doc(
+        &self,
+        view: &DomainView<'_>,
+        state: &SessionState,
+        file: &str,
+    ) -> Result<serde_json::Value, EngineError> {
+        match self.doc() {
+            RoomDoc::Engram(_) => {
+                // Through the room's own view when the room is over a draft - it puts
+                // its text back in that actor's draft - and through the scope its save
+                // uses otherwise. The two arms have to agree, and the save's `None`
+                // arm goes through `Scope::Unrestricted`: routing a base room's
+                // restore through the base view instead would write the folder of a
+                // domain that reviews changes, which is the one thing review mode
+                // exists to stop. Neither arm is reachable from the collab route in a
+                // reviewing domain, which always names an owner; the registry API can
+                // still ask for it, and this is the answer it gets.
+                match view.actor() {
+                    Some(_) => {
+                        self.engine
+                            .restore_engram_in_view(
+                                view,
+                                &self.domain,
+                                &state.path,
+                                file,
+                                None,
+                                false,
+                            )
+                            .await
+                    }
+                    None => {
+                        self.engine
+                            .restore_engram_from_room(&self.domain, &state.path, file)
+                            .await
+                    }
+                }
+            }
+            RoomDoc::Reflection(path) => {
+                // The file is gone or holds exactly the room's last text
+                // (`restore_mine` checked); the save compares against what is
+                // there, or nothing.
+                let expected = match self.engine.reflection_room_text(&self.domain, &path).await {
+                    Ok(text) => text.checksum,
+                    Err(EngineError::NotFound(_)) => String::new(),
+                    Err(err) => return Err(err),
+                };
+                let authors = Self::reflection_authors_locked(state);
+                self.engine
+                    .save_reflection_room(&self.domain, &path, file, &expected, &authors, false)
+                    .await
+            }
+        }
+    }
+}
+
 /// The per-session saver, spawned by the registry when it opens a session:
 /// ticks [`CollabSession::tick_save`] until the session is disposed.
 ///
@@ -2339,5 +3633,24 @@ async fn run_saver(session: Arc<CollabSession>) {
             session.poison().await;
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_engram_room_is_keyed_by_its_permalink_as_a_room_doc() {
+        let doc = RoomDoc::Engram("runbooks/deploy".into());
+        assert_eq!(doc.name(), "runbooks/deploy");
+        let key: RoomKey = ("eng".into(), doc.clone(), None);
+        let mut keys = std::collections::HashSet::new();
+        keys.insert(key.clone());
+        assert!(keys.contains(&(
+            "eng".to_string(),
+            RoomDoc::Engram("runbooks/deploy".into()),
+            None
+        )));
     }
 }

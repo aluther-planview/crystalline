@@ -17,6 +17,8 @@ import { EditorState, Prec } from "@codemirror/state";
 import { EditorView, keymap } from "@codemirror/view";
 import { tags } from "@lezer/highlight";
 
+import { dialectGrammar } from "./dialectHighlight";
+
 /**
  * Round-trip the document's own line endings. CodeMirror splits an incoming
  * string on `/\r\n?|\n/` unless the state names a separator, and rebuilds it
@@ -160,12 +162,12 @@ export const editorHighlight = HighlightStyle.define([
   },
   {
     tag: tags.link,
-    color: "var(--color-sky-700)",
+    color: "var(--link)",
     textDecoration: "underline",
   },
-  { tag: tags.url, color: "var(--color-sky-700)" },
+  { tag: tags.url, color: "var(--link)" },
   { tag: tags.comment, color: "var(--color-slate-500)" },
-  { tag: tags.keyword, color: "var(--color-sky-700)" },
+  { tag: tags.keyword, color: "var(--link)" },
   // The accent, not a stock swatch - and scheme-aware despite this style
   // having no `dark` argument to switch on (unlike `editorTheme` below):
   // `--color-code-string` (index.css) resolves to the same value
@@ -250,6 +252,8 @@ export const RAW_MONO: Extension = Prec.high(
 export const documentLanguage: Extension = markdown({
   base: markdownLanguage,
   codeLanguages: languages,
+  // The callout marker and the status label, as marks rather than links.
+  extensions: dialectGrammar,
 });
 
 /**

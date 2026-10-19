@@ -2,8 +2,10 @@
 //! it is reading follows the knowledge.
 //!
 //! One subscriber per open response. Each is filtered by what its session
-//! may read - the same `hidden_domains` fold the domain listing goes through,
-//! re-resolved lazily so a revocation lands within ten seconds - except an
+//! may read - the same visibility fold the domain listing goes through, kept
+//! as a screen that fails closed (for an account at knowledge `none`, the
+//! private domains it reads and nothing else, so a shared domain registered
+//! after the screen was built stays out) and re-resolved lazily so a revocation lands within ten seconds - except an
 //! event that carries the audience the engine itself resolved eagerly, at the
 //! moment of the change (a domain's rename, under its old name, and its
 //! removal). That audience is checked directly against this session's
@@ -12,7 +14,9 @@
 //! altering (Jordi's ruling, 2026-09-27). Such an event also marks the
 //! cache stale, so the frame that follows it (a rename's new name) is checked
 //! against the records as they are after the change rather than a cache from
-//! before it. A draft event reaches the draft's owner alone. A client that
+//! before it. A draft event reaches the draft's owner alone. A `reflection`
+//! event is filtered by the session's reflection right on its domain
+//! instead: at least `read`. A client that
 //! presents the last id it saw is caught up from the engine's ring or told to
 //! `reset`; one that falls behind the channel is told to `reset` too. Every
 //! fifteen seconds a comment keeps the connection alive through proxies, and
@@ -27,7 +31,7 @@
 //! and is tried again on the next one; it never delivers on an old answer.
 //! The number of open streams is capped per account and in total.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -38,24 +42,24 @@ use axum::http::header::{CACHE_CONTROL, HeaderName, HeaderValue};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use futures::stream;
+use futures::{StreamExt, stream};
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::watch;
 
 use super::auth::Identity;
 use super::{ApiError, ProblemDetail, RestState};
-use crate::changes::{ChangeBus, DomainAudience, Envelope, EventId, Replay};
-use crate::scope::{Scope, overlay_actor};
+use crate::changes::{Change, ChangeBus, DomainAudience, Envelope, EventId, Replay};
+use crate::scope::{DomainScreen, ReflectionRight, Scope, overlay_actor};
 
 /// The keep-alive comment's cadence. Shorter than any idle timeout a proxy
 /// ships with by default, so a quiet stream is never cut for silence.
 pub const HEARTBEAT: Duration = Duration::from_secs(15);
 
 /// How long a resolved visibility answer is trusted before the next event
-/// re-resolves it. What can leak inside the window is a domain name and a
-/// path, never content.
-pub const VISIBILITY_TTL: Duration = Duration::from_secs(10);
+/// re-resolves it: the engine's constant, which the Reflection gate's
+/// remembered rows share.
+pub use crate::changes::VISIBILITY_TTL;
 
 /// How many streams one account may hold open at once: a tab keeps one, so
 /// this is a generous number of tabs and devices, and a runaway client is
@@ -74,16 +78,19 @@ const LAST_EVENT_ID: &str = "last-event-id";
 /// `GET /api/v1/events` - live changes to the knowledge, as a server-sent event
 /// stream the web UI keeps open for the life of a tab.
 ///
-/// Three events ride it. `engram` carries an `EngramChanged` body: one
+/// Four events ride it. `engram` carries an `EngramChanged` body: one
 /// engram, one kind (`added`, `modified`, `deleted`, `moved` with `from`),
 /// its checksum and who changed it. `domain` carries a `DomainChanged`
-/// body: a whole domain moved, refetch everything of it. `reset` carries
-/// `{}` and no id: the client lost the thread and refetches everything. A
-/// `: ping` comment arrives every fifteen seconds. `engram` and `domain`
-/// frames carry `id: <epoch>:<seq>`; a request with `Last-Event-ID` is
-/// caught up from the ring, or told `reset` when the id is another
-/// process's or older than the ring holds. The stream is filtered by what
-/// the session may read, and a draft's events reach its author alone.
+/// body: a whole domain moved, refetch everything of it. `reflection`
+/// carries a `ReflectionChanged` body: one path and one kind in a domain's
+/// Reflection, `switched` with an empty path. `reset` carries `{}` and no
+/// id: the client lost the thread and refetches everything. A `: ping`
+/// comment arrives every fifteen seconds. `engram`, `domain` and
+/// `reflection` frames carry `id: <epoch>:<seq>`; a request with
+/// `Last-Event-ID` is caught up from the ring, or told `reset` when the id
+/// is another process's or older than the ring holds. The stream is
+/// filtered by what the session may read, a `reflection` frame by the
+/// session's reflection right, and a draft's events reach its author alone.
 #[utoipa::path(
     get,
     path = "/api/v1/events",
@@ -92,17 +99,20 @@ const LAST_EVENT_ID: &str = "last-event-id";
     description = "A `text/event-stream` the web UI keeps open once per tab. \
                    Frames: `id: <epoch>:<seq>` + `event: engram` + `data: \
                    <EngramChanged>`; `id` + `event: domain` + `data: \
-                   <DomainChanged>`; `event: reset` + `data: {}` with no id \
+                   <DomainChanged>`; `id` + `event: reflection` + `data: \
+                   <ReflectionChanged>`; `event: reset` + `data: {}` with no id \
                    (invalidate everything and keep the connection); and a \
                    `: ping` comment every fifteen seconds. `Last-Event-ID` \
                    replays the ring after that id, or answers one `reset` \
                    when the epoch is not this process's or the id is older \
                    than the ring's oldest entry. Every frame is filtered by \
-                   what the session may read; a `draft_of` frame reaches \
+                   what the session may read, `reflection` frames by the \
+                   session's reflection right; a `draft_of` frame reaches \
                    the draft's owner alone. Served read-only. OpenAPI cannot \
                    type a stream, so the body below is described as text and \
-                   the schemas `EngramChanged`, `DomainChanged` and \
-                   `ChangeKind` carry the shapes.",
+                   the schemas `EngramChanged`, `DomainChanged`, \
+                   `ChangeKind`, `ReflectionChanged` and \
+                   `ReflectionChangeKind` carry the shapes.",
     params(
         (
             "Last-Event-ID" = Option<String>,
@@ -156,7 +166,7 @@ pub async fn stream_events(
         )
         .retry_after(STREAMS_RETRY_AFTER_SECS)
     })?;
-    let hidden = state.engine.hidden_domains(&scope).await?;
+    let screen = state.engine.domain_screen(&scope).await?;
     // Subscribe BEFORE the ring is read, so an event that lands between the
     // two is in the channel rather than lost; `last_sent` below drops the
     // one that is then in both.
@@ -168,15 +178,20 @@ pub async fn stream_events(
             Replay::Events(events) => (false, events),
         },
     };
-    let mut subscriber = Subscriber::new(state, headers, &identity, hidden, receiver, slot);
+    let mut subscriber = Subscriber::new(state, headers, &identity, screen, receiver, slot);
     subscriber.backlog = backlog.into();
     subscriber.reset_pending = reset_pending;
-    let events = stream::unfold(subscriber, |mut subscriber| async move {
+    // A comment first, written with the headers: a proxy or a dev server
+    // that holds the headers until the first body bytes would otherwise open
+    // the stream only at the first heartbeat. It carries no id, so a
+    // reconnect's `Last-Event-ID` is untouched by it.
+    let opened = stream::once(async { Ok::<Event, Infallible>(Event::default().comment("open")) });
+    let events = opened.chain(stream::unfold(subscriber, |mut subscriber| async move {
         subscriber
             .next()
             .await
             .map(|event| (Ok::<Event, Infallible>(event), subscriber))
-    });
+    }));
     let mut response = Sse::new(events)
         .keep_alive(KeepAlive::new().interval(HEARTBEAT).text("ping"))
         .into_response();
@@ -317,8 +332,12 @@ struct Subscriber {
     scope: Scope,
     /// Whose drafts this session may hear about: its own overlay actor.
     overlay: Option<String>,
-    /// `None` for a scope that hides nothing; the hidden names otherwise.
-    hidden: Option<HashSet<String>>,
+    /// Which domains this session may hear about (`Engine::domain_screen`).
+    screen: DomainScreen,
+    /// This session's reflection right per domain, as last asked. Cleared
+    /// whenever `refresh` re-resolves the screen, so it follows a revocation
+    /// within [`VISIBILITY_TTL`] exactly as the screen does.
+    rights: HashMap<String, ReflectionRight>,
     resolved_at: Instant,
     /// When the account behind the stream was last re-checked. An idle
     /// stream re-checks it every [`VISIBILITY_TTL`] on its own, so a logout
@@ -327,7 +346,7 @@ struct Subscriber {
     checked_at: Instant,
     /// Set by an event that carried a captured audience (the change it
     /// announced moved the privacy records), by a lag (such an event may be
-    /// among the ones lost) and by a failed re-resolution: `hidden` is
+    /// among the ones lost) and by a failed re-resolution: `screen` is
     /// re-resolved before the next ordinary check whatever its age.
     stale: bool,
     receiver: broadcast::Receiver<Envelope>,
@@ -392,7 +411,7 @@ impl Subscriber {
         state: RestState,
         headers: HeaderMap,
         identity: &Identity,
-        hidden: Option<HashSet<String>>,
+        screen: DomainScreen,
         receiver: broadcast::Receiver<Envelope>,
         slot: StreamSlot,
     ) -> Subscriber {
@@ -407,7 +426,8 @@ impl Subscriber {
                 .map(|user| user.name.trim().to_lowercase()),
             overlay: overlay_actor(&scope),
             scope,
-            hidden,
+            screen,
+            rights: HashMap::new(),
             resolved_at: Instant::now(),
             checked_at: Instant::now(),
             stale: false,
@@ -481,10 +501,12 @@ impl Subscriber {
         {
             return Step::Skip;
         }
-        match self
-            .may_see(envelope.change.domain(), envelope.change.audience())
-            .await
-        {
+        let (domain, audience) = (envelope.change.domain(), envelope.change.audience());
+        let seen = match &envelope.change {
+            Change::Reflection(_) => self.may_hear_reflection(domain, audience).await,
+            Change::Engram(_) | Change::Domain(_) => self.may_see(domain, audience).await,
+        };
+        match seen {
             Seen::Yes => {}
             Seen::No => return Step::Skip,
             Seen::Gone => return Step::End,
@@ -511,7 +533,7 @@ impl Subscriber {
     /// capture the bus holds for its domain right now, since it may have sat
     /// in the channel from before the capture began. A captured audience is
     /// checked directly, against this session's own identity, and neither
-    /// this subscriber's cache nor a fresh `hidden_domains` call is consulted
+    /// this subscriber's cache nor a fresh `domain_screen` call is consulted
     /// for it, since both could answer from a registry the change itself is
     /// emptying, or, symmetrically, still answer "member" a moment after that
     /// access was revoked. The same event marks the cache stale, because the
@@ -522,6 +544,30 @@ impl Subscriber {
     /// listening first (see [`Subscriber::refresh_identity`]). A refresh that
     /// fails drops the event and is tried again on the next one.
     async fn may_see(&mut self, domain: &str, audience: Option<&DomainAudience>) -> Seen {
+        let admitted = match self.audience_verdict(domain, audience).await {
+            Err(seen) => return seen,
+            // `Everyone` is every reader of a shared domain, which an account
+            // at knowledge `none` is not: its screen says so, whatever the
+            // capture.
+            Ok(Some((admitted, everyone))) => {
+                admitted && (self.screen.admits_shared() || !everyone)
+            }
+            Ok(None) => self.screen.admits(domain),
+        };
+        if admitted { Seen::Yes } else { Seen::No }
+    }
+
+    /// The part of an event check every kind shares: the event's captured
+    /// audience (its own, else the bus's), the identity refresh when it is
+    /// due, and the audience's verdict. `Err` ends the check with that
+    /// answer; `Ok(None)` means no audience was captured; `Ok(Some((admitted,
+    /// everyone)))` says whether the audience admits this session and whether
+    /// it was `Everyone`, which each kind of event weighs on its own.
+    async fn audience_verdict(
+        &mut self,
+        domain: &str,
+        audience: Option<&DomainAudience>,
+    ) -> Result<Option<(bool, bool)>, Seen> {
         let captured;
         let audience = match audience {
             Some(audience) => Some(audience),
@@ -533,22 +579,57 @@ impl Subscriber {
         let due = self.resolved_at.elapsed() > VISIBILITY_TTL;
         if due || (self.stale && audience.is_none()) {
             match self.refresh().await {
-                Refreshed::Gone => return Seen::Gone,
-                Refreshed::Unknown => return Seen::No,
+                Refreshed::Gone => return Err(Seen::Gone),
+                Refreshed::Unknown => return Err(Seen::No),
                 Refreshed::Same(_) => {}
             }
         }
-        let admitted = match audience {
-            Some(audience) => {
-                self.stale = true;
-                audience_admits(audience, &self.scope)
-            }
-            None => match &self.hidden {
-                None => true,
-                Some(hidden) => !hidden.contains(domain),
+        Ok(audience.map(|audience| {
+            self.stale = true;
+            (
+                audience_admits(audience, &self.scope),
+                matches!(audience, DomainAudience::Everyone),
+            )
+        }))
+    }
+
+    /// Whether this session may hear a reflection event: its reflection
+    /// right on the domain is at least `read` (R74). Not the engram screen: a
+    /// person with knowledge `none` cannot read the domain's engrams and must
+    /// hear it, and the anonymous viewer of a public domain reads both. The
+    /// right does not read the Reflection's state, so the switch going off is
+    /// heard too. A captured audience is checked first, as `may_see` checks it.
+    async fn may_hear_reflection(
+        &mut self,
+        domain: &str,
+        audience: Option<&DomainAudience>,
+    ) -> Seen {
+        match self.audience_verdict(domain, audience).await {
+            Err(seen) => return seen,
+            Ok(Some((false, _))) => return Seen::No,
+            Ok(_) => {}
+        }
+        let right = match self.rights.get(domain) {
+            Some(right) => *right,
+            None => match self
+                .state
+                .engine
+                .reflection_right(&self.scope, domain)
+                .await
+            {
+                Ok(right) => {
+                    self.rights.insert(domain.to_string(), right);
+                    right
+                }
+                // Unreadable records drop the event and ask again next time.
+                Err(_) => return Seen::No,
             },
         };
-        if admitted { Seen::Yes } else { Seen::No }
+        if right >= ReflectionRight::Read {
+            Seen::Yes
+        } else {
+            Seen::No
+        }
     }
 
     /// The idle re-check: whether the account behind the stream still holds
@@ -572,7 +653,7 @@ impl Subscriber {
     }
 
     /// Re-read who is listening, then what they may see. On success the
-    /// scope and the hidden set are current and the cache is fresh; on
+    /// scope and the screen are current and the cache is fresh; on
     /// failure the cache stays stale so the next event tries again.
     async fn refresh(&mut self) -> Refreshed {
         let refreshed = self.refresh_identity().await;
@@ -584,9 +665,10 @@ impl Subscriber {
                 return other;
             }
         };
-        match self.state.engine.hidden_domains(&scope).await {
-            Ok(hidden) => {
-                self.hidden = hidden;
+        match self.state.engine.domain_screen(&scope).await {
+            Ok(screen) => {
+                self.screen = screen;
+                self.rights.clear();
                 self.scope = scope.clone();
                 self.stale = false;
                 self.resolved_at = Instant::now();
@@ -662,6 +744,8 @@ async fn closed(shutdown: &mut Option<watch::Receiver<bool>>) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
     use crate::changes::{Change, ChangeKind, EngramChanged};
     use crate::engine::Engine;
@@ -718,6 +802,7 @@ mod tests {
                 role: crate::Role::Viewer,
                 disabled: false,
                 last_seen: None,
+                reflection: crate::ReflectionLevel::Default,
             }),
             csrf: None,
             anonymous: false,
@@ -738,7 +823,10 @@ mod tests {
             state.clone(),
             HeaderMap::new(),
             identity,
-            hidden,
+            match hidden {
+                None => DomainScreen::All,
+                Some(hidden) => DomainScreen::Except(hidden),
+            },
             receiver,
             slot,
         );
@@ -866,6 +954,40 @@ mod tests {
         bus.announce(modified("1")).unwrap();
         assert!(!hears(&mut fresh).await, "a fresh cache is trusted");
         assert!(hears(&mut aged).await, "an aged cache is re-resolved first");
+    }
+
+    fn reflection_changed() -> Change {
+        Change::Reflection(crate::changes::ReflectionChanged {
+            domain: "eng".to_string(),
+            path: "a.md".to_string(),
+            kind: crate::changes::ReflectionChangeKind::Changed,
+            from: None,
+            actor: None,
+            checksum: None,
+            audience: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_cached_reflection_right_is_asked_again_once_older_than_the_ttl() {
+        // Catches the rights cache kept across a refresh: a revoked
+        // contributor would go on hearing the pages, and a new one stay
+        // deaf, for the life of the stream. The engine has no resolver, so a
+        // right asked anew is curate; the cached `none` stands in for the
+        // answer before the change.
+        let (_dir, state) = state().await;
+        let bus = state.engine.changes();
+        let mut fresh = subscriber(&state, &anonymous(), None, bus.subscribe(), None);
+        let mut aged = subscriber(&state, &anonymous(), None, bus.subscribe(), None);
+        for subscriber in [&mut fresh, &mut aged] {
+            subscriber
+                .rights
+                .insert("eng".to_string(), ReflectionRight::None);
+        }
+        aged.resolved_at = Instant::now() - (VISIBILITY_TTL + Duration::from_secs(1));
+        bus.announce(reflection_changed()).unwrap();
+        assert!(!hears(&mut fresh).await, "a fresh right is trusted");
+        assert!(hears(&mut aged).await, "an aged right is asked again");
     }
 
     #[tokio::test]

@@ -13,7 +13,7 @@
  *
  * What points back is no longer among them. The graph is capped at a hundred
  * and fifty nodes, which is a cap on the backlinks drawn from it; the panel
- * counts and pages the whole index instead, and asks for nothing when the
+ * Linked from block reads and pages the whole index instead, and asks for nothing when the
  * detail payload's `inboundCount` is already zero. The graph's inbound edges
  * are still read here for the two things they are exact about: the supersedes
  * chain, whose other half only the linker wrote down, and the retire dialog's
@@ -40,18 +40,20 @@
  */
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import {
-  ChevronRight,
-  Download,
-  Link2,
-  MoreHorizontal,
-  Printer,
-} from "lucide-react";
+import { Archive, Download, FolderInput, Link2 } from "lucide-react";
 import { DropdownMenu } from "radix-ui";
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { Link, useLocation, useNavigate, useParams } from "react-router";
 
 import { discardChanges, refusalSentence } from "../api/admin";
+import { conflictOf, saveEngram } from "../api/writes";
 import { ApiProblem, problemDetail } from "../api/client";
 import { domainTreeKey } from "../api/domain";
 import { DOMAINS_QUERY_KEY, fetchDomains } from "../api/domains";
@@ -67,13 +69,12 @@ import {
 } from "../api/graph";
 import { useAuth } from "../auth/AuthContext";
 import { DomainLockChip } from "../components/DomainLockChip";
-import { useDomainWritable } from "../domainWritable";
+import { CHECKING_LOCK, useDomainWritable } from "../domainWritable";
 import { absoluteUrl } from "../base";
 import { NO_COMMANDS, useRegisterCommands } from "../commands";
 import type { PaletteCommand } from "../commands";
-import { AgentsEye } from "../components/AgentsEye";
+import { AGENTS_EYE_KEY, AgentsEye } from "../components/AgentsEye";
 import { AttachmentsSection } from "../components/AttachmentsSection";
-import { BacklinksPanel } from "../components/BacklinksPanel";
 import { Breadcrumbs, crumbsOf } from "../components/Breadcrumbs";
 import { ChangeDialog } from "../components/ChangeDialog";
 import { CopyAddress, DetailsPanel } from "../components/DetailsPanel";
@@ -83,19 +84,36 @@ import type { EngramActionHandlers } from "../components/EngramActions";
 import { LifecycleBanner } from "../components/LifecycleBanner";
 import type { LifecycleLink } from "../components/LifecycleBanner";
 import { Markdown } from "../components/Markdown";
-import { ITEM_CLASSES, MENU_CLASSES } from "../components/menu";
+import { ITEM_CLASSES, MENU_CLASSES, MENU_SEPARATOR } from "../components/menu";
 import { MoveDialog } from "../components/MoveDialog";
 import type { MovedState } from "../components/MoveDialog";
+import { ExploreBlock, GRAPH_PANEL_ID } from "../components/ExploreBlock";
+import { LinkedFrom } from "../components/LinkedFrom";
 import { NeighborhoodGraph } from "../components/NeighborhoodGraph";
 import {
-  BUTTON,
   CHIP_VARIANTS,
+  Chip,
   FOCUS_RING,
-  IconButton,
+  RAIL_LABEL,
+  statusVariant,
 } from "../components/primitives";
+import {
+  ActionItem,
+  ActionSeparator,
+  EditLink,
+  MoreActions,
+  PrintPageStyle,
+  PrintTitleBlock,
+  PrintViewItem,
+} from "../components/PageActions";
 import { RetireDialog } from "../components/RetireDialog";
 import { ShareDialog } from "../components/ShareDialog";
-import { Skeleton } from "../components/Skeleton";
+import { PrintRelated } from "../components/PrintRelated";
+import { Loading } from "../components/Loading";
+import { PageOutline } from "../components/PageOutline";
+import { OutlineSlotContext, useOutlineSlot } from "../components/outlineSlot";
+import { useBodyHeadings, worthAnOutline } from "../useBodyHeadings";
+import { useLarge } from "../useLarge";
 import { useRememberedDisclosure } from "../disclosure";
 import { domainSpellings } from "../domainNames";
 import type { RecentChange } from "../events/recent";
@@ -103,13 +121,27 @@ import { useRecentChange } from "../events/recent";
 import { useHoldPlace, useScrollKeeper } from "../events/useScrollKeeper";
 import { formatActor, plural } from "../format";
 import { useFullWidth } from "../layoutWidth";
-import { domainRoute, editRoute, engramRoute, graphRoute } from "../paths";
-import { prefetchEngramEditor } from "../prefetch";
+import { useWide } from "../useWide";
+import {
+  editRoute,
+  engramRoute,
+  engramsRoute,
+  graphRoute,
+  isDomainManifestPath,
+} from "../paths";
+import { PREFETCH, prefetchEngramEditor } from "../prefetch";
+import { engramFacts } from "../printSheet";
+import { tickAt } from "../taskTick";
 import type { WikilinkResolver } from "../wikilinks";
 import { buildWikilinkResolver, innerOf, referenceState } from "../wikilinks";
 
 /** Where the neighborhood section writes down whether it was left open. */
 const GRAPH_SECTION_KEY = "fluid.section.graph";
+/**
+ * What a tick says when the engram moved under it: the editor's own words
+ * for a conflict, which its dialog titles.
+ */
+const TICK_CONFLICT = "Someone else saved this engram first. Try again.";
 
 export default function EngramPage() {
   const params = useParams();
@@ -117,8 +149,11 @@ export default function EngramPage() {
   // A permalink is a path of its own, so it arrives through the splat.
   const permalink = params["*"] ?? "";
   const { capabilities } = useAuth();
-  const { canWrite, domainLocked } = useDomainWritable(domain);
+  const { canWrite, domainLocked, lockKnown } = useDomainWritable(domain);
   const { fullWidth } = useFullWidth();
+  // The two panels under the prose, switched from the Explore rows.
+  const [graphOpen, toggleGraph] = useRememberedDisclosure(GRAPH_SECTION_KEY);
+  const [eyeOpen, toggleEye] = useRememberedDisclosure(AGENTS_EYE_KEY);
   const navigate = useNavigate();
   /**
    * What the move that brought the reader here rewrote on the way: the move
@@ -254,6 +289,66 @@ export default function EngramPage() {
    */
   const loaded = detail.data;
   /*
+   * A task box ticked on this page: the whole file with three characters
+   * changed, saved like any engram save (If-Match on the checksum this page
+   * read), and it lands where that save lands, a review-mode draft
+   * included. The ticked text shows while the save is out; a refusal puts
+   * the stored text back, and a conflict reads the engram again.
+   */
+  const [tickProblem, setTickProblem] = useState<string | null>(null);
+  const tick = useMutation({
+    mutationFn: ({ content, at }: { content: string; at: EngramDetail }) =>
+      saveEngram(at.domain, at.permalink, content, at.checksum ?? ""),
+    onMutate: () => {
+      setTickProblem(null);
+    },
+    onSuccess: (saved) => {
+      queryClient.setQueryData(
+        engramDetailKey(saved.domain, saved.permalink),
+        saved,
+      );
+    },
+    onError: (error: Error, { at }) => {
+      if (conflictOf(error) !== null) {
+        setTickProblem(TICK_CONFLICT);
+        void queryClient.invalidateQueries({
+          queryKey: engramDetailKey(at.domain, at.permalink),
+        });
+        return;
+      }
+      setTickProblem(problemDetail(error));
+    },
+  });
+  const { mutate: saveTick } = tick;
+  const onTick = useCallback(
+    (offset: number, next: "[ ]" | "[x]") => {
+      if (loaded === undefined) {
+        return;
+      }
+      const content = tickAt(loaded.content, offset, next);
+      if (content === null) {
+        // The box is not where the page drew it: the text moved, which
+        // reads to the person as the same conflict a refused save is.
+        setTickProblem(TICK_CONFLICT);
+        void queryClient.invalidateQueries({
+          queryKey: engramDetailKey(loaded.domain, loaded.permalink),
+        });
+        return;
+      }
+      saveTick({ content, at: loaded });
+    },
+    [loaded, queryClient, saveTick],
+  );
+  const canTick: boolean | string = capabilities.anonymous
+    ? "Sign in to change this page"
+    : !canWrite
+      ? "You can read this page but not change it"
+      : !lockKnown
+        ? CHECKING_LOCK
+        : tick.isPending
+          ? "Saving the last change"
+          : true;
+  /*
    * What this copy holds that the team's copy does not, in the server's own
    * word. The detail payload carries it for a team domain, computed there
    * against the shared base; a review-mode draft is not a file the origin
@@ -284,6 +379,11 @@ export default function EngramPage() {
    * and, for a payload that names none, the permalink's own file.
    */
   const changePath = loaded?.path ?? `${permalink}.md`;
+  const domainRow = domains.data?.domains.find(
+    (entry) => entry.name === (loaded?.domain ?? domain),
+  );
+  const keepsManifest =
+    isDomainManifestPath(changePath) && domainRow?.kind !== "virtual";
   const commands = useMemo<readonly PaletteCommand[]>(() => {
     if (!loaded) {
       return NO_COMMANDS;
@@ -299,20 +399,24 @@ export default function EngramPage() {
               void navigate(editRoute(loaded.domain, loaded.permalink));
             },
           },
-          {
-            id: "retire",
-            title: "Retire engram",
-            run: () => {
-              setRetiring(true);
-            },
-          },
-          {
-            id: "move",
-            title: "Move engram",
-            run: () => {
-              setMoving(true);
-            },
-          },
+          ...(keepsManifest
+            ? []
+            : [
+                {
+                  id: "retire",
+                  title: "Retire engram",
+                  run: () => {
+                    setRetiring(true);
+                  },
+                },
+                {
+                  id: "move",
+                  title: "Move engram",
+                  run: () => {
+                    setMoving(true);
+                  },
+                },
+              ]),
         ]
       : [];
     // Looking at what changed is a palette row; discarding it is not. A loss
@@ -354,7 +458,7 @@ export default function EngramPage() {
         },
       },
     ];
-  }, [canWrite, chipWord, loaded, navigate]);
+  }, [canWrite, chipWord, keepsManifest, loaded, navigate]);
   useRegisterCommands(commands);
 
   /*
@@ -397,7 +501,10 @@ export default function EngramPage() {
         void queryClient.invalidateQueries({
           queryKey: domainEngramsRoot(domain),
         });
-        void navigate(domainRoute(domain), {
+        // The engram view, not the domain's address: that may open on the
+        // Reflection, and the note about the discarded change is the engram
+        // view's to show.
+        void navigate(engramsRoute(domain), {
           state: { discarded: changePath },
         });
         return;
@@ -410,6 +517,25 @@ export default function EngramPage() {
       setDiscardProblem(problemDetail(error));
     },
   });
+
+  // The outline of a long page. The rail is a column only from `lg` and not
+  // at full width: there it leads the aside. Below `md` it leads the phone
+  // drawer. Between, and at full width, a collapsed disclosure over the body.
+  const wide = useWide();
+  const large = useLarge();
+  const closeDrawer = useContext(OutlineSlotContext)?.close;
+  const bodyRef = useRef<HTMLElement>(null);
+  const outline = useBodyHeadings(bodyRef, detail.data?.content ?? "");
+  const outlineNode = useMemo(
+    () =>
+      worthAnOutline(outline) ? (
+        <PageOutline headings={outline} onNavigate={closeDrawer} />
+      ) : null,
+    [outline, closeDrawer],
+  );
+  useOutlineSlot(wide ? null : outlineNode);
+  const inRail = wide && large && !fullWidth;
+  const inDisclosure = wide && !inRail && outlineNode !== null;
 
   if (isMissing(detail.error)) {
     return <EngramNotFound domain={domain} permalink={permalink} />;
@@ -425,24 +551,74 @@ export default function EngramPage() {
     );
   }
   if (!detail.data || !wikilinks) {
-    return <Skeleton label="Loading the engram" rows={6} />;
+    return <Loading label="Loading the engram" subject={permalink} />;
   }
 
   const engram = detail.data;
   const backlinks = backlinksTo(graph.data, engram.domain, engram.permalink);
+  const description = engram.frontmatter.description;
+  /**
+   * The Explore rows. Opening a panel brings it into view: it stands under
+   * the prose, which may be a long way from the rail the reader clicked in.
+   */
+  const reveal = (id: string) => {
+    requestAnimationFrame(() => {
+      document.getElementById(id)?.scrollIntoView({ block: "nearest" });
+    });
+  };
+  const explore = (
+    <ExploreBlock
+      graphOpen={graphOpen}
+      onGraph={() => {
+        toggleGraph();
+        if (!graphOpen) reveal("engram-graph");
+      }}
+      eyeOpen={eyeOpen}
+      onEye={() => {
+        toggleEye();
+        if (!eyeOpen) reveal("engram-agents-eye");
+      }}
+    />
+  );
   return (
     <div className="flex flex-col gap-6">
-      <header className="flex flex-col gap-2">
+      {/*
+        On paper the header gives way to a title block of its own, with the
+        facts the rail holds on screen, and the page margins carry the
+        domain, the title and the address.
+      */}
+      <PrintPageStyle
+        source={engram.domain}
+        title={engram.title}
+        address={engram.url}
+      />
+      <PrintTitleBlock
+        trail={[engram.domain, ...engram.permalink.split("/").slice(0, -1)]}
+        title={engram.title}
+        lead={description}
+        facts={engramFacts({
+          status: engram.frontmatter.status,
+          type: engram.frontmatter.type,
+          tags: engram.frontmatter.tags,
+          recordedAt: engram.frontmatter.recordedAt,
+          content: engram.content,
+        })}
+        address={engram.url}
+        webAddress={
+          engram.webUrl ??
+          absoluteUrl(engramRoute(engram.domain, engram.permalink))
+        }
+      />
+      <header className="flex flex-col gap-2 print:hidden">
         {/*
           Where this engram lives, and what can be done with it: the address on
           the left, the controls on the right, the title alone on the line
           below with nothing competing for it.
 
-          The trail prints: the details panel and the controls beside it are
-          chrome and stay off the page, so this line is what says on paper
-          which domain and which folders this document came out of.
+          None of it prints: the title block above says on paper which
+          domain and which folders this document came out of.
         */}
-        <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center justify-between gap-2">
           <Breadcrumbs
             crumbs={crumbsOf(engram.domain, engram.permalink, engram.title)}
           />
@@ -462,83 +638,71 @@ export default function EngramPage() {
             `EngramActions` builds the three and hands them over through that
             ref; it draws nothing here but the region that announces a copy.
           */}
-          <div className="flex flex-wrap items-center gap-2 print:hidden">
+          <div className="flex shrink-0 items-center gap-2 print:hidden">
             {/*
               At full width there is no details column to hold it, and this
               is the only control on the screen that copies the engram's
-              `crystalline://` name - "Share link" beside it copies the
+              `crystalline://` name - "Share link" in the menu copies the
               browser's URL, which is a different string for a different
               purpose. So it stands here instead of going with the column.
             */}
             {fullWidth && <CopyAddress address={engram.url} />}
-            <IconButton
-              label="Share link"
-              icon={Link2}
-              onClick={() => {
-                utilities.current?.share();
-              }}
-            />
-            <IconButton
-              label="Download as Markdown"
-              icon={Download}
-              onClick={() => {
-                utilities.current?.download();
-              }}
-            />
-            <IconButton
-              label="Print view"
-              icon={Printer}
-              onClick={() => {
-                utilities.current?.print();
-              }}
-            />
-            {/*
-              Both halves of the write surface hang off one gate: a reader who
-              may not write has nothing left for the menu to hold, and an
-              ellipsis that opens onto an empty panel is worse than no ellipsis.
-            */}
             {canWrite && (
-              <>
-                <Link
-                  to={editRoute(engram.domain, engram.permalink)}
-                  onPointerEnter={prefetchEngramEditor}
-                  onFocus={prefetchEngramEditor}
-                  className={BUTTON.primary}
-                >
-                  Edit
-                </Link>
-                <DropdownMenu.Root>
-                  <DropdownMenu.Trigger asChild>
-                    <IconButton label="More actions" icon={MoreHorizontal} />
-                  </DropdownMenu.Trigger>
-                  <DropdownMenu.Portal>
-                    <DropdownMenu.Content
-                      align="end"
-                      sideOffset={6}
-                      className={MENU_CLASSES}
-                    >
-                      <DropdownMenu.Item
-                        className={ITEM_CLASSES}
-                        onSelect={() => {
-                          setMoving(true);
-                        }}
-                      >
-                        Move
-                      </DropdownMenu.Item>
-                      <DropdownMenu.Separator className="my-1 h-px bg-slate-200 dark:bg-slate-700" />
-                      <DropdownMenu.Item
-                        className={`${ITEM_CLASSES} text-red-700 dark:text-red-300`}
-                        onSelect={() => {
-                          setRetiring(true);
-                        }}
-                      >
-                        Retire
-                      </DropdownMenu.Item>
-                    </DropdownMenu.Content>
-                  </DropdownMenu.Portal>
-                </DropdownMenu.Root>
-              </>
+              <EditLink
+                to={editRoute(engram.domain, engram.permalink)}
+                onPointerEnter={prefetchEngramEditor}
+                onFocus={prefetchEngramEditor}
+              />
             )}
+            {/*
+              One menu for everybody: the three utilities a reader reaches for
+              rarely, then - for somebody who may write - Move and Retire under
+              a rule. Each row carries EXACTLY the name its icon button carried,
+              and the palette runs the same three through the same ref. A file
+              domain's MANIFEST can be neither moved nor retired, so it gets
+              the utilities only.
+            */}
+            <MoreActions>
+              <ActionItem
+                label="Share link"
+                icon={Link2}
+                onSelect={() => {
+                  utilities.current?.share();
+                }}
+              />
+              <ActionItem
+                label="Download as Markdown"
+                icon={Download}
+                onSelect={() => {
+                  utilities.current?.download();
+                }}
+              />
+              <PrintViewItem
+                onSelect={() => {
+                  utilities.current?.print();
+                }}
+              />
+              {canWrite && !keepsManifest && (
+                <>
+                  <ActionSeparator />
+                  <ActionItem
+                    label="Move"
+                    icon={FolderInput}
+                    onSelect={() => {
+                      setMoving(true);
+                    }}
+                  />
+                  <ActionItem
+                    label="Retire"
+                    icon={Archive}
+                    destructive
+                    onSelect={() => {
+                      setRetiring(true);
+                    }}
+                  />
+                </>
+              )}
+            </MoreActions>
             <EngramActions engram={engram} handlers={utilities} />
           </div>
         </div>
@@ -597,7 +761,7 @@ export default function EngramPage() {
                   )}
                   {canWrite && !capabilities.readOnly && (
                     <>
-                      <DropdownMenu.Separator className="my-1 h-px bg-slate-200 dark:bg-slate-700" />
+                      <DropdownMenu.Separator className={MENU_SEPARATOR} />
                       <DropdownMenu.Item
                         className={`${ITEM_CLASSES} text-red-700 dark:text-red-300`}
                         onSelect={() => {
@@ -613,6 +777,28 @@ export default function EngramPage() {
             </DropdownMenu.Root>
           )}
         </div>
+        {(engram.frontmatter.status !== null ||
+          engram.frontmatter.type !== null ||
+          description !== null) && (
+          <p
+            aria-label="About this engram"
+            className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-ink-3"
+          >
+            {engram.frontmatter.status !== null && (
+              <Chip variant={statusVariant(engram.frontmatter.status)}>
+                {engram.frontmatter.status}
+              </Chip>
+            )}
+            {engram.frontmatter.type !== null && (
+              <Chip>{engram.frontmatter.type}</Chip>
+            )}
+            {description !== null && (
+              <span title={description} className="line-clamp-2 min-w-0">
+                {description}
+              </span>
+            )}
+          </p>
+        )}
         {discarding && (
           <DiscardConfirm
             question={`Discard the changes to ${changePath}?`}
@@ -645,7 +831,7 @@ export default function EngramPage() {
         <p
           role="status"
           aria-label="Moved"
-          className="text-sm text-slate-600 dark:text-slate-300"
+          className="text-sm text-slate-600 print:hidden dark:text-slate-300"
         >
           {`Moved. Rewrote ${plural(moved.references, "reference", "references")} in ${plural(moved.engrams, "engram", "engrams")} to point here.`}
         </p>
@@ -707,19 +893,42 @@ export default function EngramPage() {
         the files into this column under the body.
       */}
       <div
+        data-print-column=""
         className={`grid gap-8 ${
-          fullWidth ? "" : "lg:grid-cols-[minmax(0,1fr)_18rem]"
+          fullWidth ? "" : "lg:grid-cols-[minmax(0,1fr)_18.75rem] lg:gap-14"
         }`}
       >
         <div className="flex min-w-0 flex-col gap-8">
-          <article aria-labelledby="engram-title">
+          {inDisclosure && (
+            <details className="group print:hidden">
+              <summary
+                className={`cursor-pointer rounded ${RAIL_LABEL} ${FOCUS_RING}`}
+              >
+                On this page
+              </summary>
+              <div className="pt-2">
+                <PageOutline headings={outline} label={false} />
+              </div>
+            </details>
+          )}
+          <article ref={bodyRef} aria-labelledby="engram-title">
             {/*
               The heading above is the page's rendering of the title, so the
               body's own opening `# Title` folds away rather than repeating
               it.
             */}
+            {tickProblem !== null && (
+              <p
+                role="alert"
+                className="mb-3 rounded bg-red-50 px-3 py-2 text-sm text-red-800 dark:bg-red-950 dark:text-red-200"
+              >
+                {tickProblem}
+              </p>
+            )}
             <Markdown
-              source={engram.content}
+              source={tick.isPending ? tick.variables.content : engram.content}
+              onTick={onTick}
+              canTick={canTick}
               wikilinks={wikilinks}
               foldTitle={engram.title}
               // What a relative `assets/` target is relative to: without it an
@@ -742,6 +951,17 @@ export default function EngramPage() {
             />
           </article>
           {/*
+            What links here and the files it carries, at the end of the
+            printed page: the rail that lists them on screen does not print.
+          */}
+          <PrintRelated
+            key={`related:${engram.domain}/${engram.permalink}`}
+            domain={engram.domain}
+            permalink={engram.permalink}
+            inboundCount={engram.inboundCount}
+            body={engram.content}
+          />
+          {/*
             The files this engram carries, which the details panel lists at
             the reading measure. They are not metadata - they are things a
             reader opens, and the only place a writer removes one - so at full
@@ -750,26 +970,48 @@ export default function EngramPage() {
           {fullWidth && (
             <div className="print:hidden">
               <AttachmentsSection
+                key={`${engram.domain}/${engram.permalink}`}
                 domain={engram.domain}
                 body={engram.content}
                 canDelete={canWrite}
               />
             </div>
           )}
-          <div className="print:hidden">
-            <GraphSection domain={engram.domain} permalink={engram.permalink} />
+          {/*
+            At full width there is no rail, so the Explore rows stand here,
+            above the panels they open.
+          */}
+          {fullWidth && <div className="print:hidden">{explore}</div>}
+          {/*
+            The panels' wrappers are always here, empty while closed, so the
+            Explore rows' aria-controls always resolves. An empty one takes no
+            room and no gap.
+          */}
+          <div id={GRAPH_PANEL_ID} className="print:hidden empty:hidden">
+            {graphOpen && (
+              <GraphSection
+                domain={engram.domain}
+                permalink={engram.permalink}
+              />
+            )}
           </div>
-          <div className="print:hidden">
-            <AgentsEye
-              domain={engram.domain}
-              salience={engram.frontmatter.salience}
-              content={engram.content}
-            />
-          </div>
+          <AgentsEye
+            domain={engram.domain}
+            salience={engram.frontmatter.salience}
+            content={engram.content}
+            open={eyeOpen}
+          />
         </div>
         {!fullWidth && (
-          <aside className="flex flex-col gap-6 print:hidden">
+          <aside className="flex flex-col divide-y divide-hair print:hidden [&>*]:py-4 [&>*:first-child]:pt-0">
+            {inRail && <PageOutline headings={outline} />}
+            {/*
+              Keyed by the engram so a new page starts each panel fresh, and
+              each key named for its panel: two siblings under one key make
+              React keep the stale one beside the new one on every change.
+            */}
             <DetailsPanel
+              key={`details:${engram.domain}/${engram.permalink}`}
               frontmatter={engram.frontmatter}
               address={engram.url}
               domain={engram.domain}
@@ -778,11 +1020,13 @@ export default function EngramPage() {
               body={engram.content}
               canDelete={canWrite}
             />
-            <BacklinksPanel
+            <LinkedFrom
+              key={`linked:${engram.domain}/${engram.permalink}`}
               domain={engram.domain}
               permalink={engram.permalink}
               inboundCount={engram.inboundCount}
             />
+            {explore}
           </aside>
         )}
       </div>
@@ -790,6 +1034,7 @@ export default function EngramPage() {
         <RetireDialog
           engram={engram}
           backlinks={backlinks}
+          canDelete={!keepsManifest}
           onClose={() => {
             setRetiring(false);
           }}
@@ -902,18 +1147,19 @@ function chain(
 }
 
 /**
- * The neighborhood, one hop out, folded away until it is asked for.
+ * The neighborhood, one hop out, drawn under the prose once the Explore row in
+ * the details rail has opened it.
  *
- * Folded by default for two reasons that point the same way. The drawing is the
- * heaviest thing this page can load and it arrives only when the section opens,
+ * Closed by default for two reasons that point the same way. The drawing is the
+ * heaviest thing this page can load and it arrives only when the row opens it,
  * so a reader who came for the prose never pays for it; and the picture is a
  * detour from the engram, which is what this page is for. Opened, it costs
  * nothing on the wire either: it reads the same neighborhood under the same
- * cache key the backlinks panel already read.
+ * cache key the page already read.
  *
- * A reader who does open it is a reader who reads this way, so the section
+ * A reader who does open it is a reader who reads this way, so the page
  * remembers: the default is closed, and the choice against it survives the
- * visit.
+ * visit (the page holds that state, since the row and the panel are apart).
  */
 function GraphSection({
   domain,
@@ -922,49 +1168,25 @@ function GraphSection({
   domain: string;
   permalink: string;
 }) {
-  const [open, toggle] = useRememberedDisclosure(GRAPH_SECTION_KEY);
-
   return (
     <section aria-labelledby="engram-graph">
       <div className="mb-2 flex flex-wrap items-baseline justify-between gap-3">
         <h2 id="engram-graph" className="text-section">
           Graph
         </h2>
-        {open && (
-          <Link
-            to={graphRoute(domain, permalink)}
-            className="text-sm text-accent-700 underline underline-offset-2 hover:no-underline dark:text-accent-300"
-          >
-            Open the full view
-          </Link>
-        )}
+        <Link
+          to={graphRoute(domain, permalink)}
+          {...PREFETCH.graph}
+          className="text-sm text-accent-700 underline underline-offset-2 hover:no-underline dark:text-accent-300"
+        >
+          Open the full view
+        </Link>
       </div>
-      <button
-        type="button"
-        aria-expanded={open}
-        aria-controls="engram-graph-panel"
-        onClick={toggle}
-        className={`${BUTTON.ghost} inline-flex items-center gap-1.5`}
-      >
-        <ChevronRight
-          aria-hidden="true"
-          size={14}
-          strokeWidth={1.75}
-          className={
-            open ? "rotate-90 transition-transform" : "transition-transform"
-          }
-        />
-        {open ? "Hide the neighborhood" : "Show the neighborhood"}
-      </button>
-      <div id="engram-graph-panel" className="mt-3">
-        {open && (
-          <NeighborhoodGraph
-            anchor={{ domain, permalink }}
-            depth={NEIGHBORHOOD_DEPTH}
-            height="h-80"
-          />
-        )}
-      </div>
+      <NeighborhoodGraph
+        anchor={{ domain, permalink }}
+        depth={NEIGHBORHOOD_DEPTH}
+        height="h-80"
+      />
     </section>
   );
 }
@@ -984,8 +1206,8 @@ function EngramNotFound({
         No engram at {`"${permalink}"`} in {`"${domain}"`}.
       </p>
       <Link
-        to={domainRoute(domain)}
-        className="text-sm text-sky-700 underline underline-offset-2 hover:no-underline dark:text-sky-400"
+        to={engramsRoute(domain)}
+        className="text-sm text-link underline decoration-(--link-line) decoration-1 underline-offset-[3px] hover:no-underline"
       >
         See what {domain} does hold
       </Link>
@@ -1047,7 +1269,7 @@ function RecentChangeLine({ change }: { change: RecentChange | null }) {
       role="status"
       aria-label="Recent change"
       aria-live="polite"
-      className="rounded bg-slate-100 px-3 py-2 text-sm text-slate-700 empty:sr-only dark:bg-slate-800 dark:text-slate-200"
+      className="rounded bg-slate-100 px-3 py-2 text-sm text-slate-700 empty:sr-only print:hidden dark:bg-slate-800 dark:text-slate-200"
     >
       {text}
     </p>

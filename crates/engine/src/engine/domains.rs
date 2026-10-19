@@ -280,6 +280,7 @@ impl Engine {
             if let Some(host) = s.and_then(|d| d.host_instance_id.clone()) {
                 let hosted_here = !self.instance_id.is_empty() && host == self.instance_id;
                 obj["host"] = json!({
+                    "label": s.and_then(|d| d.host_label.clone()).unwrap_or_else(|| host.clone()),
                     "instance_id": host,
                     "heartbeat_at": s.and_then(|d| d.host_heartbeat_at.clone()),
                     "hosted_here": hosted_here,
@@ -459,10 +460,29 @@ impl Engine {
         self.refuse_read_only_domain(domain, scope).await?;
         self.refuse_read_only_switch_on(domain, markdown, scope)
             .await?;
+        // A MANIFEST that switches Reflection on meets the screens the
+        // domain policies meet.
+        self.screen_manifest_write(domain, None, markdown).await?;
+        let switch_before = self.reflection_switch(domain);
 
         let (rel, created) = match self.content_source(domain)? {
             ContentSource::File { root } => {
                 let path = root.join("MANIFEST.md");
+                // A MANIFEST that switches the Reflection off closes its rooms
+                // first, while it is still on, and before the write lock below:
+                // the close takes the co-editing registry, which is never taken
+                // under a file's write lock. Only for a save that should land:
+                // the token is read here once ahead of the guarded compare, so
+                // a stale save closes nobody's room.
+                let fresh = sha256_hex(
+                    std::fs::read_to_string(&path)
+                        .unwrap_or_default()
+                        .as_bytes(),
+                ) == expected_checksum;
+                if fresh {
+                    self.close_reflection_rooms_if_switching_off(domain, Some(markdown))
+                        .await;
+                }
                 // The same compare-then-write section `save_engram` holds, for
                 // the same reason: two saves of one MANIFEST must not both find
                 // their token fresh. See `Engine::write_lock`.
@@ -489,12 +509,31 @@ impl Engine {
                     )));
                 }
                 write_file(&path, markdown)?;
-                let store = self.store.lock().await;
-                let domain_id = store
-                    .upsert_domain(domain, Some(&root.to_string_lossy()), DomainKind::File)
-                    .await?;
-                self.reindex_file(&*store, domain_id, &root, "MANIFEST.md")
-                    .await?;
+                let indexed = async {
+                    let store = self.store.lock().await;
+                    let domain_id = store
+                        .upsert_domain(domain, Some(&root.to_string_lossy()), DomainKind::File)
+                        .await?;
+                    self.reindex_file(&*store, domain_id, &root, "MANIFEST.md")
+                        .await
+                }
+                .await;
+                if let Err(e) = indexed {
+                    let actor = crate::scope::overlay_actor(scope).unwrap_or_default();
+                    return Err(self.refuse_file_write(
+                        e,
+                        domain,
+                        &path,
+                        current.as_deref().map(str::as_bytes),
+                        markdown.as_bytes(),
+                        Some(super::fence::EngramKeep {
+                            rel: "MANIFEST.md",
+                            text: markdown,
+                            account: crate::scope::overlay_actor(scope),
+                            actor: &actor,
+                        }),
+                    ));
+                }
                 ("MANIFEST.md".to_string(), current.is_none())
             }
             ContentSource::Virtual => {
@@ -555,8 +594,7 @@ impl Engine {
         };
 
         // Where the MANIFEST row answers, read back the way a save's receipt
-        // reads it, then announced: the verb carries no scope, so nobody is
-        // named.
+        // reads it, then announced under the account that saved it.
         let permalink = {
             let store = self.store.lock().await;
             let found = store
@@ -581,12 +619,17 @@ impl Engine {
             },
             from: None,
             checksum: Some(sha256_hex(markdown.as_bytes())),
-            actor: None,
+            actor: change_label(scope),
             draft_of: None,
             audience: None,
         }));
 
         self.refresh_routing_cache().await;
+        // A switch written here moves the Reflection's mode for every file
+        // in the folder; the index follows before the switch is announced,
+        // so a client that refetches on the announce sees it whole.
+        self.heal_reflection_rows_after(domain, "MANIFEST.md").await;
+        self.announce_switch_if_moved(domain, switch_before, change_label(scope));
 
         Ok(json!({
             "domain": domain,
@@ -714,10 +757,15 @@ impl Engine {
         if self.domain_is_read_only(domain).await {
             return;
         }
+        // The switch in effect, so the listings follow what the index holds:
+        // an engram still waiting under a pending switch keeps its entry. A
+        // mode that cannot be read lists the folder, as with the switch off.
+        let mode = self.reflection_mode(domain).await.unwrap_or_default();
         let name = domain.to_string();
         // A full walk plus one read per engram is blocking IO, so it runs on the
         // blocking pool rather than on a runtime worker.
-        let joined = tokio::task::spawn_blocking(move || crate::index_files::refresh(&root)).await;
+        let joined =
+            tokio::task::spawn_blocking(move || crate::index_files::refresh(&root, mode)).await;
         match joined {
             Ok(report) if report.written > 0 || report.removed > 0 => {
                 tracing::debug!(
@@ -817,6 +865,9 @@ impl Engine {
                             bullets: m.bullets.clone(),
                             preferred: false,
                             read_only: m.domain_read_only,
+                            // The onboarding block stays count-free: session
+                            // start is where the counts are named.
+                            reflect_open: 0,
                         }),
                 );
         }
@@ -1008,7 +1059,8 @@ impl Engine {
     /// reports the larger number. Neither is the other's approximation: a level
     /// states a fact about the rows it drew, a folder listing promises the
     /// folder, and a client that means to say "N engrams in this folder" takes
-    /// the number from the listing.
+    /// the number from the listing, or from `folder_counts`, which carries that
+    /// recursive number for each child folder of the level.
     ///
     /// A `glob` narrows the rows this level returned, so on a truncated level
     /// it selects within the cap rather than across the whole folder. The tree
@@ -1089,6 +1141,9 @@ impl Engine {
             "domain": p.domain,
             "path": raw,
             "folders": level.folders,
+            // Each folder's engrams at any depth, this reader's drafts
+            // included: the total the listing scoped to it reports.
+            "folder_counts": level.folder_counts,
             "engrams": entries,
             "truncated": truncated,
             "total": level.total,

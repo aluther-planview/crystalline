@@ -1795,6 +1795,21 @@ async fn domain_tree_walks_folders_and_filters_by_glob() {
     assert_eq!(root["domain"], "eng");
     assert_eq!(root["path"], "/");
     assert_eq!(root["folders"].as_array().unwrap(), &["notes"]);
+    // Each folder counts its engrams at any depth, the number the listing
+    // scoped to it totals; the root's MANIFEST is in no folder.
+    let listed: serde_json::Value = get(fixture.addr, "/api/v1/domains/eng/engrams?path=notes")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        root["folder_counts"],
+        serde_json::json!({ "notes": listed["total"] }),
+        "{root} {listed}"
+    );
+    assert!(listed["total"].as_u64().unwrap() >= 2, "{listed}");
+    // A listing hit says when its engram was recorded.
+    assert_eq!(listed["hits"][0]["recorded_at"], "2026-01-01", "{listed}");
     // A row says what state its engram is in, not only where it lives: a tree
     // is what a navigation sidebar is drawn from, and fading a retired engram
     // there would otherwise cost a second request per folder.
@@ -2059,7 +2074,9 @@ async fn domain_manifest_carries_every_section_it_declares() {
                 { "key": "generated_indexes", "kind": "choice", "declared": "shared", "effective": "shared", "values": ["local", "shared"], "default": "local", "meaning": "Whether the generated folder listings travel with a share.", "changed_by": "owner" },
                 { "key": "sharing", "kind": "choice", "declared": null, "effective": "proposal", "values": ["proposal", "direct"], "default": "proposal", "meaning": "Whether a share opens a proposal for review or commits straight to the branch.", "changed_by": "owner" },
                 { "key": "domain_name", "kind": "text", "declared": null, "effective": "eng", "values": [], "default": "", "meaning": "The name this domain is known by everywhere; links from other domains use it.", "changed_by": "owner" },
-                { "key": "read_only", "kind": "choice", "declared": null, "effective": "off", "values": ["off", "on"], "default": "off", "meaning": "Whether every change to this domain through Crystalline is refused; pulls from the team still apply.", "changed_by": "owner" }
+                { "key": "read_only", "kind": "choice", "declared": null, "effective": "off", "values": ["off", "on"], "default": "off", "meaning": "Whether every change to this domain through Crystalline is refused; pulls from the team still apply.", "changed_by": "owner" },
+                { "key": "reflection", "kind": "choice", "declared": null, "effective": "off", "values": ["off", "on"], "default": "off", "meaning": "Whether this domain keeps a Reflection: documents for people under reflections/.", "changed_by": "owner" },
+                { "key": "reflection_home", "kind": "text", "declared": null, "effective": "", "values": [], "default": "", "meaning": "The address of the one server this domain's Reflection lives on; filled in when Reflection is switched on.", "changed_by": "owner" }
             ],
             "starters": starters_json()
         }),
@@ -2094,7 +2111,9 @@ async fn domain_manifest_names_what_it_lacks() {
                 { "key": "generated_indexes", "kind": "choice", "declared": null, "effective": "local", "values": ["local", "shared"], "default": "local", "meaning": "Whether the generated folder listings travel with a share.", "changed_by": "owner" },
                 { "key": "sharing", "kind": "choice", "declared": null, "effective": "proposal", "values": ["proposal", "direct"], "default": "proposal", "meaning": "Whether a share opens a proposal for review or commits straight to the branch.", "changed_by": "owner" },
                 { "key": "domain_name", "kind": "text", "declared": null, "effective": "eng", "values": [], "default": "", "meaning": "The name this domain is known by everywhere; links from other domains use it.", "changed_by": "owner" },
-                { "key": "read_only", "kind": "choice", "declared": null, "effective": "off", "values": ["off", "on"], "default": "off", "meaning": "Whether every change to this domain through Crystalline is refused; pulls from the team still apply.", "changed_by": "owner" }
+                { "key": "read_only", "kind": "choice", "declared": null, "effective": "off", "values": ["off", "on"], "default": "off", "meaning": "Whether every change to this domain through Crystalline is refused; pulls from the team still apply.", "changed_by": "owner" },
+                { "key": "reflection", "kind": "choice", "declared": null, "effective": "off", "values": ["off", "on"], "default": "off", "meaning": "Whether this domain keeps a Reflection: documents for people under reflections/.", "changed_by": "owner" },
+                { "key": "reflection_home", "kind": "text", "declared": null, "effective": "", "values": [], "default": "", "meaning": "The address of the one server this domain's Reflection lives on; filled in when Reflection is switched on.", "changed_by": "owner" }
             ],
             "starters": starters_json()
         }),
@@ -3744,7 +3763,15 @@ async fn an_admin_creates_lists_edits_and_removes_an_account() {
     assert_eq!(body["user"]["disabled"], false);
     assert_eq!(
         user_fields(&body["user"]),
-        vec!["disabled", "display", "email", "last_seen", "name", "role"],
+        vec![
+            "disabled",
+            "display",
+            "email",
+            "last_seen",
+            "name",
+            "reflection",
+            "role"
+        ],
         "no password material may reach the client: {body}"
     );
 
@@ -3761,7 +3788,15 @@ async fn an_admin_creates_lists_edits_and_removes_an_account() {
     );
     assert_eq!(
         user_fields(&body["users"][0]),
-        vec!["disabled", "display", "email", "last_seen", "name", "role"],
+        vec![
+            "disabled",
+            "display",
+            "email",
+            "last_seen",
+            "name",
+            "reflection",
+            "role"
+        ],
         "the listing carries no hashes either: {body}"
     );
 
@@ -3844,6 +3879,63 @@ async fn an_admin_creates_lists_edits_and_removes_an_account() {
             .await
             .unwrap();
     assert_eq!(user_names(&body), vec!["root".to_string()], "{body}");
+}
+
+/// The Reflection level on the users routes: `POST` takes `role: none` and
+/// `reflection`, `PATCH` changes `reflection` on its own (`default` clears
+/// it), and a body that changes nothing names the four fields it could send.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_admin_sets_knowledge_none_and_the_reflection_level() {
+    let (fixture, token, csrf) = serve_as_admin(AuthOptions::default()).await;
+    let addr = fixture.addr;
+
+    let created = as_session(addr, reqwest::Method::POST, "/api/v1/users", &token, &csrf)
+        .json(&serde_json::json!({
+            "name": "nora",
+            "role": "none",
+            "reflection": "contributor",
+            "password": "hunter2",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let body: serde_json::Value = created.json().await.unwrap();
+    assert_eq!(body["user"]["role"], "none", "{body}");
+    assert_eq!(body["user"]["reflection"], "contributor", "{body}");
+
+    let patch = |body: serde_json::Value| {
+        as_session(
+            addr,
+            reqwest::Method::PATCH,
+            "/api/v1/users/nora",
+            &token,
+            &csrf,
+        )
+        .json(&body)
+        .send()
+    };
+    let cleared = patch(serde_json::json!({"reflection": "default"}))
+        .await
+        .unwrap();
+    assert_eq!(cleared.status(), 200);
+    let body: serde_json::Value = cleared.json().await.unwrap();
+    assert_eq!(body["user"]["reflection"], "default", "{body}");
+    assert_eq!(
+        body["user"]["role"], "none",
+        "the role is untouched: {body}"
+    );
+
+    let nothing = patch(serde_json::json!({})).await.unwrap();
+    assert_eq!(nothing.status(), 422);
+    let body: serde_json::Value = nothing.json().await.unwrap();
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap()
+            .contains("send role, reflection, disabled or display"),
+        "{body}"
+    );
 }
 
 /// An admin cannot lock itself out by hand: deleting or disabling its own

@@ -97,6 +97,16 @@
 //! stays registered like every other hidden tool, so a call by name still
 //! sweeps and answers.
 //!
+//! The four Reflection tools (`reflect`, `read_reflection`,
+//! `write_reflection`, `discuss`) are always listed on a writable instance
+//! and refuse at call time on a domain whose Reflection is off (V1). On a
+//! read-only instance `read_reflection` stays listed and the other three are
+//! hidden, `reflect` for the reason `evolve_engrams` is; their routes stay
+//! registered. Their rights are the Reflection's own, decided by the
+//! engine's reflection gate and never by `refuse_unwritable`, so a viewer's
+//! agent may discuss and a contributor's agent may edit. See
+//! `REFLECTION_WRITE_TOOLS`.
+//!
 //! One more tool, `provision`, is gated a fourth way, and it splits across
 //! the rule too: hidden read-only, since every action but `status` writes,
 //! and refusing while no registered domain's MANIFEST declares a
@@ -110,7 +120,7 @@
 //! The shipped agent skills are served here too, so a remote client that never
 //! runs `crystalline install` can still learn how to use Crystalline well:
 //! the `skills` tool (an index with no arguments, one skill's full `SKILL.md`
-//! with `name`), five `skill://<name>/SKILL.md` resources and two prompts,
+//! with `name`), one `skill://<name>/SKILL.md` resource per skill and two prompts,
 //! `onboarding` (the live routing block) and `connector` (the static snippet
 //! that teaches a client to onboard itself). The whole surface shares one
 //! gate, the live `skills.serve` setting; when it hides the surface the tool,
@@ -119,7 +129,7 @@
 //!
 //! That gate is tri-state. `true` and `false` force always and never, and
 //! `auto`, the default, withholds the surface from a session whose spawning
-//! harness already has the five skills on disk. **That answer is resolved
+//! harness already has the six managed skills on disk. **That answer is resolved
 //! before the session starts and is fixed for the serving process's life**:
 //! `crystalline install` registers the server as `crystalline mcp --harness
 //! <name>`, the spawned process asks this machine's install receipt whether
@@ -265,7 +275,7 @@ use rmcp::service::{RequestContext, SubscriptionContext};
 use rmcp::{RoleServer, ServerHandler, prompt, prompt_router, tool, tool_handler, tool_router};
 use serde_json::{Value, json};
 
-use crystalline_core::{CrystallineUrl, SKILL_ASSETS};
+use crystalline_core::{ContentKind, CrystallineUrl, SKILL_ASSETS};
 use crystalline_remote::RemoteError;
 
 /// The tools hidden in read-only mode: the five content-mutating engram tools
@@ -283,6 +293,18 @@ const WRITE_TOOLS: [&str; 7] = [
     "add_domain",
     "remove_domain",
 ];
+
+/// The Reflection tools hidden in read-only mode: `reflect` for the reason
+/// `evolve_engrams` is (every item it returns prescribes a write), the other
+/// two because they write. `read_reflection` is a read and stays listed.
+/// None of them is one of the `WRITE_TOOLS`: their rights are the
+/// Reflection's own, decided by the engine's reflection gate, never by
+/// `refuse_unwritable`.
+const REFLECTION_WRITE_TOOLS: [&str; 3] = ["reflect", "write_reflection", "discuss"];
+
+/// The four Reflection tools, whose engine refusals MCP answers as
+/// call-time refusals (`McpServer::reflection_refused`).
+const REFLECTION_TOOLS: [&str; 4] = ["reflect", "read_reflection", "write_reflection", "discuss"];
 
 /// Whether a tool name is one of the write-gated tools (hidden in read-only
 /// mode).
@@ -684,14 +706,14 @@ fn skill_uri(name: &str) -> String {
     format!("skill://{name}/SKILL.md")
 }
 
-/// The shipped skill a resource uri names, or `None` when the uri is not one
-/// of the five this server serves.
+/// The shipped skill a resource uri names, or `None` when the uri names no
+/// skill this server serves.
 fn skill_for_uri(uri: &str) -> Option<&'static crystalline_core::SkillAsset> {
     let name = uri.strip_prefix("skill://")?.strip_suffix("/SKILL.md")?;
     crystalline_core::skill(name)
 }
 
-/// The five shipped skill names, comma separated, for an error that names
+/// Every shipped skill name, comma separated, for an error that names
 /// what the caller could have asked for instead.
 fn skill_names() -> String {
     SKILL_ASSETS
@@ -701,7 +723,7 @@ fn skill_names() -> String {
         .join(", ")
 }
 
-/// The six skill resource uris, comma separated, for the same reason.
+/// Every skill resource uri, comma separated, for the same reason.
 fn skill_uris() -> String {
     SKILL_ASSETS
         .iter()
@@ -721,6 +743,16 @@ const ATTACHMENT_TEMPLATE_NAME: &str = "attachment";
 /// What the template is for, in the words a model reads before deciding to
 /// fetch one.
 const ATTACHMENT_TEMPLATE_DESCRIPTION: &str = "A file attachment a human added to a domain: read it here when an engram's resource links or an evolve finding point at it.";
+
+/// The template every Reflection file is addressed by, the reserved
+/// expansion again so a nested path keeps its separators.
+const REFLECTION_ASSET_URI_TEMPLATE: &str = "crystalline://{domain}/reflections/assets/{+path}";
+
+/// Its programmatic name.
+const REFLECTION_ASSET_TEMPLATE_NAME: &str = "reflection_file";
+
+/// What it is for, in the words a model reads before fetching one.
+const REFLECTION_ASSET_TEMPLATE_DESCRIPTION: &str = "A file a person added to a domain's Reflection (reflections/assets/), an image or a document a reflection shows: read it here when read_reflection's resource links or a reflect item point at it. Needs read access to that Reflection; engram access plays no part.";
 
 /// Whether the whole skill-serving surface (the `skills` tool, the `skill://`
 /// resources and the two prompts) is hidden.
@@ -745,7 +777,7 @@ const ATTACHMENT_TEMPLATE_DESCRIPTION: &str = "A file attachment a human added t
 /// endpoint "MUST NOT vary per-connection" - so the client's identity is gone
 /// from here. What replaces it is the same fact learned from the deployment
 /// instead of from the wire: the harness that spawned this process already has
-/// the five skills on disk and is onboarded by its own session hook, so
+/// the six managed skills on disk and is onboarded by its own session hook, so
 /// serving them again spends the tokens twice.
 ///
 /// **A hook in the receipt is not enough.** The surface is hidden only when
@@ -899,11 +931,13 @@ fn refused_collab_tool(name: &str, github_enabled: bool) -> bool {
 use crystalline_core::config::{ResponseFormat, SkillsServe};
 
 use crate::DiscardTarget;
+use crate::ReflectionCaller;
 use crate::collab::session::AgentPeer;
 use crate::domain_view::DomainView;
 use crate::engine::{
     ACTOR_MAX_CHARS, ConfigureAction, Engine, EngineError, LiveWriteTarget, OVERLAY_NEEDS_IDENTITY,
-    ProvisionAction, ShareActor, WriteBlock, sanitize_actor,
+    ProvisionAction, ReflectionSearch, SEARCH_DEFAULT_LIMIT, ShareActor, WriteBlock,
+    sanitize_actor,
 };
 /// The two facts the `crystalline mcp` process resolved about its harness,
 /// re-exported here because [`McpServer::with_harness_gate`] takes one.
@@ -911,6 +945,72 @@ pub use crate::instance::HarnessGate;
 use crate::params::*;
 use crate::scope::Scope;
 use crate::similar::SimilarProbe;
+
+/// reflect's arguments as the MCP tool takes them: [`ReflectParams`], with a
+/// key it does not take refused instead of ignored. An agent that sent
+/// write_reflection's settle arguments to reflect got the queue back and
+/// believed it had settled. Only this tool's own arguments are checked
+/// here, after rmcp hands them over (`_meta` travels beside them, and a
+/// `_`-prefixed key is left to the protocol); the schema is
+/// [`ReflectParams`]'s, unchanged, so a client that validates arguments
+/// itself still reaches this refusal and its words. Route, control socket
+/// and remote callers deserialize [`ReflectParams`] as before.
+struct ReflectArgs(ReflectParams);
+
+impl<'de> serde::Deserialize<'de> for ReflectArgs {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let args = serde_json::Map::<String, Value>::deserialize(deserializer)?;
+        let known = reflect_keys();
+        let mut unknown: Vec<&str> = args
+            .keys()
+            .map(String::as_str)
+            .filter(|key| !key.starts_with('_') && !known.iter().any(|k| k == key))
+            .collect();
+        unknown.sort_unstable();
+        if !unknown.is_empty() {
+            let named: Vec<String> = unknown.iter().map(|key| format!("`{key}`")).collect();
+            return Err(D::Error::custom(format!(
+                "reflect does not take {}: it only returns the queue and changes nothing. To settle feedback items, call write_reflection with action settle, sections and outcome.",
+                named.join(", ")
+            )));
+        }
+        serde_json::from_value(Value::Object(args))
+            .map(ReflectArgs)
+            .map_err(D::Error::custom)
+    }
+}
+
+/// Every key [`ReflectParams`] reads, `skip_unavailable` included (kept out
+/// of the schema, still taken): it serializes them all once the flag is set.
+/// A test holds the list against the schema's properties.
+fn reflect_keys() -> Vec<String> {
+    match serde_json::to_value(ReflectParams {
+        skip_unavailable: true,
+        ..ReflectParams::default()
+    }) {
+        Ok(Value::Object(map)) => map.into_iter().map(|(key, _)| key).collect(),
+        _ => Vec::new(),
+    }
+}
+
+impl rmcp::schemars::JsonSchema for ReflectArgs {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        ReflectParams::schema_name()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        ReflectParams::schema_id()
+    }
+
+    fn inline_schema() -> bool {
+        ReflectParams::inline_schema()
+    }
+
+    fn json_schema(generator: &mut rmcp::schemars::SchemaGenerator) -> rmcp::schemars::Schema {
+        ReflectParams::json_schema(generator)
+    }
+}
 
 /// rmcp's `subscriptions/listen` sink as the engine's registry sees it.
 #[derive(Debug)]
@@ -1901,6 +2001,32 @@ impl McpServer {
         }
     }
 
+    /// Who a reflection tool call is: an agent under this connection's scope,
+    /// named the way a write's actor is, and the open tier (`auth.mcp` off,
+    /// no account) curating what it can see, as `refuse_unwritable` lets it
+    /// write engrams.
+    fn reflection_caller(&self, ctx: &RequestContext<RoleServer>) -> ReflectionCaller {
+        let caller = self.caller(ctx);
+        let open_tier = matches!(caller.scope, Scope::Anonymous) && !self.engine.auth_mcp();
+        let name = caller.actor().unwrap_or_else(|| "agent".to_string());
+        ReflectionCaller::agent(caller.scope, &name, open_tier)
+    }
+
+    /// A reflection verb's error as MCP answers it: the gate's refusals (the
+    /// Reflection is off, pending, homeless, lives elsewhere or is served by
+    /// the instance that holds the domain's host lock, a right too
+    /// low or capped by the write list) and a read-only domain are call-time
+    /// refusals the agent reads (V1); every other error maps as `to_error`
+    /// maps it.
+    fn reflection_refused(e: EngineError) -> Result<CallToolResult, ErrorData> {
+        match e {
+            EngineError::Refused(text)
+            | EngineError::Forbidden(text)
+            | EngineError::DomainReadOnly(text) => refuse(text),
+            other => Err(to_error(other)),
+        }
+    }
+
     /// The gate on changing what this instance IS: which domains are
     /// registered on it, how it is configured, and which of the artifacts its
     /// domains ship are installed into the harnesses on the machine it runs
@@ -2044,7 +2170,8 @@ impl McpServer {
     /// down window answers at once.
     ///
     /// A refusal this machine makes itself (a write on a read-only instance)
-    /// has the shape the local call gets; every other routed refusal is a
+    /// has the shape the local call gets, and so does an argument error the
+    /// server found (`invalid_params`, R86); every other routed refusal is a
     /// tool error the agent reads.
     async fn mounted<P: serde::Serialize>(
         &self,
@@ -2061,28 +2188,73 @@ impl McpServer {
         };
         let routed = crate::route::routed(&self.engine, tool, &args, &agent, None).await?;
         Some(match routed {
-            Ok(value) => self.render_routed(tool, value),
+            Ok(value) => {
+                // The one domain a read was routed for, as this machine
+                // names it: a one-domain call routes on its first name.
+                let domain = crate::route::named_domains(tool, &args)
+                    .ok()
+                    .and_then(|named| named.into_iter().next());
+                self.render_routed(tool, value, domain.as_deref())
+            }
             // The local part of a sweep failed, or this machine refused: the
             // shape a local call gets.
-            Err(crate::route::RouteError::Local(e)) => Err(match e.downcast::<EngineError>() {
-                Ok(engine) => to_error(engine),
-                Err(e) => ErrorData::internal_error(format!("{e:#}"), None),
-            }),
+            Err(crate::route::RouteError::Local(e)) => match e.downcast::<EngineError>() {
+                // A Reflection tool's local refusal reads as its local
+                // handler answers it: a call-time refusal.
+                Ok(engine) if REFLECTION_TOOLS.contains(&tool) => Self::reflection_refused(engine),
+                Ok(engine) => Err(to_error(engine)),
+                Err(e) => Err(ErrorData::internal_error(format!("{e:#}"), None)),
+            },
+            // An argument error the server found: the protocol error a local
+            // call gives, in the server's words.
+            Err(crate::route::RouteError::Source {
+                failure: crystalline_remote::RemoteFailure::Invalid(text),
+                ..
+            }) => Err(ErrorData::invalid_params(text, None)),
             Err(other) => refuse(other.to_string()),
         })
     }
 
     /// A routed answer as the handler of `tool` renders its own. The page
     /// address stays the server's (the receipt already carries it, and
-    /// nothing here attaches one of this machine's over it), and a mounted
-    /// read carries no attachment links (decision D24).
-    fn render_routed(&self, tool: &str, value: Value) -> Result<CallToolResult, ErrorData> {
+    /// nothing here attaches one of this machine's over it). A mounted
+    /// `read_engram` and a mounted `read_reflection` page carry resource
+    /// links for the files they show, as local reads do (R85, which
+    /// replaced decision D24): the server lists them as `files`, which is
+    /// taken out of the answer here and turned into links under this
+    /// machine's name for the domain the call was routed for (`domain`,
+    /// never a name the answer gives), and this machine's `resources/read`
+    /// forwards a link to the server (`route::routed_file`). A server older
+    /// than 0.27.0 sends no `files`, and the read answers without links.
+    fn render_routed(
+        &self,
+        tool: &str,
+        mut value: Value,
+        domain: Option<&str>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let links = match (tool, domain) {
+            ("read_engram" | "read_reflection", Some(domain)) => routed_links(&mut value, domain),
+            _ => Vec::new(),
+        };
+        let mut result = self.render_routed_value(tool, value)?;
+        result.content.extend(links);
+        Ok(result)
+    }
+
+    /// [`McpServer::render_routed`] without the file links.
+    fn render_routed_value(&self, tool: &str, value: Value) -> Result<CallToolResult, ErrorData> {
         match tool {
             "write_engram" | "edit_engram" => ok_written(value),
             "move_engram" => ok_moved(value),
             "split_engram" => ok_split(value),
             "read_engram" | "delete_engram" | "infer_schema" => ok(value),
             "search_engrams" => self.ok_found(value),
+            // The Reflection tools render as their own handlers do: one page,
+            // a write and a thread as plain JSON; a queue, a tree and a thread
+            // list as a list.
+            "write_reflection" => ok(value),
+            "read_reflection" if value.get("markdown").is_some() => ok(value),
+            "discuss" if value.get("id").is_some() => ok(value),
             _ => self.ok_list(value),
         }
     }
@@ -2105,6 +2277,35 @@ impl McpServer {
 /// answered from this server's own domains (decision D8); a core that routed
 /// would let two servers connected to each other forward one call for ever.
 impl McpServer {
+    /// `read_reflection`'s body for both doors: the tree, one page or a
+    /// search. A call that names a path and a query is an argument error
+    /// (`Invalid`, like `write_reflection`'s "markdown or operation, not
+    /// both").
+    async fn read_reflection_core(
+        &self,
+        p: &ReadReflectionParams,
+        caller: &ReflectionCaller,
+    ) -> Result<Value, EngineError> {
+        match (p.query.as_deref(), p.path.as_deref()) {
+            (Some(_), Some(_)) => Err(EngineError::Invalid(
+                "pass path to read one reflection or query to search them, not both".into(),
+            )),
+            (Some(query), None) => {
+                let search = ReflectionSearch {
+                    query,
+                    search_type: p.search_type.as_deref(),
+                    limit: p.limit.unwrap_or(SEARCH_DEFAULT_LIMIT),
+                    page: p.page.unwrap_or(1),
+                };
+                self.engine
+                    .search_reflection(&p.domain, &search, caller)
+                    .await
+            }
+            (None, None) => self.engine.read_reflection_tree(&p.domain, caller).await,
+            (None, Some(path)) => self.engine.read_reflection(&p.domain, path, caller).await,
+        }
+    }
+
     /// `p` with every domain it names spelled as a local name, for `scope`.
     /// See [`McpServer::localized`].
     async fn localized_in<P: DomainArgs + Clone>(
@@ -2396,6 +2597,16 @@ impl McpServer {
             .search_engrams(&p, &caller.scope)
             .await
             .map_err(to_error)?;
+        // A filter-only page dates its dated hits for the web listing; the
+        // tool's rows keep one shape, which is what lets them encode as a
+        // table.
+        if let Some(hits) = v.get_mut("hits").and_then(Value::as_array_mut) {
+            for hit in hits {
+                if let Some(obj) = hit.as_object_mut() {
+                    obj.remove("recorded_at");
+                }
+            }
+        }
         crate::web_url::attach_template(&mut v, &caller.base);
         Ok(v)
     }
@@ -2458,6 +2669,11 @@ impl McpServer {
             .browse_domain(&p, &caller.scope)
             .await
             .map_err(to_error)?;
+        // The per-folder counts are for a drawn tree; an agent descends by
+        // name, and the tool's answer keeps its shape.
+        if let Some(obj) = v.as_object_mut() {
+            obj.remove("folder_counts");
+        }
         crate::web_url::attach_template(&mut v, &caller.base);
         Ok(v)
     }
@@ -2540,24 +2756,34 @@ pub(crate) enum RemoteToolError {
     /// error: a write gate, a live document, a call off the allow-list.
     Refused(String),
     /// The arguments did not parse, or the engine failed: the message an MCP
-    /// call gets as its protocol error.
-    Failed(String),
+    /// call gets as its protocol error. `invalid` is whether that error is an
+    /// input error (`invalid_params`: a missing page, an unparsable filter),
+    /// which the envelope marks so a connected machine answers it as the same
+    /// protocol error.
+    Failed { message: String, invalid: bool },
 }
 
 impl RemoteToolError {
     /// The sentence the envelope carries.
     pub(crate) fn into_message(self) -> String {
         match self {
-            RemoteToolError::Refused(text) | RemoteToolError::Failed(text) => text,
+            RemoteToolError::Refused(text) | RemoteToolError::Failed { message: text, .. } => text,
         }
+    }
+
+    /// Whether the envelope marks this error as an argument error.
+    pub(crate) fn is_invalid(&self) -> bool {
+        matches!(self, RemoteToolError::Failed { invalid: true, .. })
     }
 }
 
 /// A remote call's `args` as the params the MCP handler of the same verb
 /// parses.
 fn remote_args<T: serde::de::DeserializeOwned>(args: Value) -> Result<T, RemoteToolError> {
-    serde_json::from_value(args)
-        .map_err(|e| RemoteToolError::Failed(format!("invalid arguments: {e}")))
+    serde_json::from_value(args).map_err(|e| RemoteToolError::Failed {
+        message: format!("invalid arguments: {e}"),
+        invalid: true,
+    })
 }
 
 /// A verb core's answer for a remote caller: the raw receipt, or the refusal
@@ -2570,8 +2796,47 @@ fn remote_verdict(verdict: Result<Verdict, ErrorData>) -> Result<Value, RemoteTo
     }
 }
 
+/// Whether an MCP error is an argument error: one [`to_error`] marked with
+/// the `kind` of the class (a missing page, an unknown or ambiguous domain,
+/// a conflict, an invalid value). A refusal, which the same `invalid_params`
+/// code also carries, is not.
+fn is_argument_error(error: &ErrorData) -> bool {
+    error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("kind"))
+        .and_then(Value::as_str)
+        == Some(crystalline_remote::INVALID_KIND)
+}
+
+/// An MCP error as a remote answer. An argument error is marked as one (the
+/// envelope's `kind`); a refusal and a server-side error are not.
 fn remote_failed(error: ErrorData) -> RemoteToolError {
-    RemoteToolError::Failed(error.message.to_string())
+    RemoteToolError::Failed {
+        invalid: is_argument_error(&error),
+        message: error.message.to_string(),
+    }
+}
+
+/// The Reflection caller of a remote `tool` call: the token's account under
+/// its own scope, named the way its writes are recorded (decision D11). Never
+/// the MCP open tier: a remote call always carries a token. None of the
+/// four arms goes through `refuse_unwritable`; the reflection gate decides,
+/// as it does for the MCP handlers.
+fn remote_reflection_caller(caller: &Caller) -> ReflectionCaller {
+    let name = caller.actor().unwrap_or_else(|| "agent".to_string());
+    ReflectionCaller::agent(caller.scope.clone(), &name, false)
+}
+
+/// An engine error of a Reflection arm as a remote answer: a refusal keeps
+/// its own words, everything else as `to_error` maps it.
+fn remote_engine(e: EngineError) -> RemoteToolError {
+    match e {
+        EngineError::Refused(text)
+        | EngineError::Forbidden(text)
+        | EngineError::DomainReadOnly(text) => RemoteToolError::Refused(text),
+        other => remote_failed(to_error(other)),
+    }
 }
 
 impl McpServer {
@@ -2586,6 +2851,10 @@ impl McpServer {
     /// engine JSON, as the control socket's `tool` answers, never the
     /// session's TOON.
     ///
+    /// The four Reflection tools run the engine's Reflection verbs for the
+    /// token's account ([`remote_reflection_caller`]) and are gated by the
+    /// engine's reflection gate instead, as their MCP handlers are.
+    ///
     /// `tool` is one of `remote_ctl::REMOTE_TOOLS`; the route has refused
     /// anything else, and so does the last arm here. This never reaches the
     /// engine's sources: a remote call is answered from this server's own
@@ -2598,10 +2867,24 @@ impl McpServer {
     ) -> Result<Value, RemoteToolError> {
         match tool {
             "write_engram" => remote_verdict(self.write_core(remote_args(args)?, caller).await),
-            "read_engram" => self
-                .read_core(remote_args(args)?, caller)
-                .await
-                .map_err(remote_failed),
+            "read_engram" => {
+                let mut value = self
+                    .read_core(remote_args(args)?, caller)
+                    .await
+                    .map_err(remote_failed)?;
+                let domain = value["domain"].as_str().unwrap_or_default().to_string();
+                let files = self
+                    .linked_files(
+                        ContentKind::Engram,
+                        &domain,
+                        &value,
+                        &caller.scope,
+                        &remote_reflection_caller(caller),
+                    )
+                    .await;
+                with_files(&mut value, files);
+                Ok(value)
+            }
             "edit_engram" => remote_verdict(self.edit_core(remote_args(args)?, caller).await),
             "move_engram" => remote_verdict(self.move_core(remote_args(args)?, caller).await),
             "split_engram" => remote_verdict(self.split_core(remote_args(args)?, caller).await),
@@ -2642,11 +2925,118 @@ impl McpServer {
                 .evolve_engrams_core(remote_args(args)?, caller)
                 .await
                 .map_err(remote_failed),
+            "reflect" => {
+                let p: ReflectParams = remote_args(args)?;
+                let p = self
+                    .engine
+                    .localized_for(&p, &caller.scope)
+                    .await
+                    .map_err(remote_engine)?;
+                self.engine
+                    .reflect(&p, &remote_reflection_caller(caller))
+                    .await
+                    .map_err(remote_engine)
+            }
+            "read_reflection" => {
+                let p: ReadReflectionParams = remote_args(args)?;
+                let p = self
+                    .engine
+                    .localized_for(&p, &caller.scope)
+                    .await
+                    .map_err(remote_engine)?;
+                let reflection_caller = remote_reflection_caller(caller);
+                let mut value = self
+                    .read_reflection_core(&p, &reflection_caller)
+                    .await
+                    .map_err(remote_engine)?;
+                if p.path.is_some() {
+                    let files = self
+                        .linked_files(
+                            ContentKind::Reflection,
+                            &p.domain,
+                            &value,
+                            &caller.scope,
+                            &reflection_caller,
+                        )
+                        .await;
+                    with_files(&mut value, files);
+                }
+                Ok(value)
+            }
+            "write_reflection" => {
+                let p: WriteReflectionParams = remote_args(args)?;
+                let p = self
+                    .engine
+                    .localized_for(&p, &caller.scope)
+                    .await
+                    .map_err(remote_engine)?;
+                self.engine
+                    .write_reflection(&p, &remote_reflection_caller(caller))
+                    .await
+                    .map_err(remote_engine)
+            }
+            "discuss" => {
+                let p: DiscussParams = remote_args(args)?;
+                let p = self
+                    .engine
+                    .localized_for(&p, &caller.scope)
+                    .await
+                    .map_err(remote_engine)?;
+                self.engine
+                    .discuss(&p, &remote_reflection_caller(caller))
+                    .await
+                    .map_err(remote_engine)
+            }
             other => Err(RemoteToolError::Refused(format!(
                 "the tool '{other}' {}",
                 crate::remote_ctl::NOT_REMOTE
             ))),
         }
+    }
+
+    /// One file for a connected machine's `file` command: `path` is
+    /// domain-relative (`assets/...` or `reflections/assets/...`), and the
+    /// kind of file follows from it, never from the request. Read through
+    /// [`McpServer::file_bytes`] for the token's account, as `resources/read`
+    /// reads it for an MCP session, and answered as `{mime, size, base64}`.
+    /// Never routed: a server answers from its own domains (decision D8).
+    pub(crate) async fn remote_file(
+        &self,
+        domain: &str,
+        path: &str,
+        caller: &Caller,
+    ) -> Result<Value, RemoteToolError> {
+        let url = CrystallineUrl {
+            domain: domain.to_string(),
+            permalink: path.to_string(),
+            glob: false,
+        };
+        let Some((kind, inner)) = url.asset_ref() else {
+            return Err(RemoteToolError::Refused(format!(
+                "'{path}' is not a file of a domain: a file path starts with assets/ or reflections/assets/"
+            )));
+        };
+        let hidden = self
+            .engine
+            .hidden_for(&caller.scope)
+            .await
+            .map_err(remote_engine)?;
+        let domain = self.engine.localize_visible(domain, &hidden).await;
+        let (bytes, row) = self
+            .file_bytes(
+                kind,
+                &domain,
+                inner,
+                &caller.scope,
+                &remote_reflection_caller(caller),
+            )
+            .await
+            .map_err(remote_engine)?;
+        Ok(json!({
+            "mime": row.mime,
+            "size": bytes.len(),
+            "base64": BASE64.encode(&bytes),
+        }))
     }
 }
 
@@ -2655,7 +3045,7 @@ impl McpServer {
     #[tool(
         name = "write_engram",
         title = "Capture engram",
-        description = "Capture a new engram - a unit of knowledge - into a domain. Writes the markdown file and indexes it. Body bullets: '- [decision] we chose X #tag' become observations, '- rel_type [[Target]]' become relations. domain is required so an engram never lands in the wrong place. Pass folder to file the engram under a topic prefix: reuse the domain's existing layout (browse_domain shows it), start a subfolder when a topic cluster is forming and keep singletons at the root; the folder path becomes the permalink prefix build_context globs as crystalline://domain/folder/*. permalink, status, recorded_at and generated (who wrote it, with which model, and when) are filled in; pass model with your own model id, the one you were told you are (for example claude-opus-5), on every capture, so a later reader can weigh the page by which model wrote it - leave it out only when you do not know it; valid_from/valid_to are never auto-set - absence means always valid; to bound validity pass them inside metadata as plain ISO dates (YYYY-MM-DD). Any other date format is rejected; a sentinel far-future valid_to and an explicit null are dropped, since absence already means valid forever. Recommended type values: engram, guide, decision, architecture, runbook, reference. Recommended status values (guidance, not enforced): stable, implemented, draft, proposed, idea, poc, deprecated, superseded, archived, legacy. stable is the default and the word for knowledge that holds now; current is the legacy alias for the same state, and a status filter on either word matches engrams carrying either. Of those, deprecated, superseded, archived and legacy are the recognized retirement set: a status inside it softly fades in search ranking, any other value ranks at full strength. Errors if the permalink exists in the same folder unless overwrite is true, and an overwrite replaces the engram that owns the permalink in its own file, whatever that file is called; a permalink owned by an engram in another folder is refused whether or not overwrite is set, and no overwrite is offered for it (move_engram it first, or change it in place with edit_engram); it refuses a title that would file the engram as the reserved index.md or log.md (Crystalline generates the folder index itself). The vocabulary tool lists tags already in use; reuse one before coining a new tag. Set an optional numeric salience metadata key (0-10) to mark exceptionally valuable knowledge; salient engrams are lifted in hybrid search ranking. Raise it later to elevate an engram that proved load-bearing. The receipt may carry a similar list: up to three existing engrams closest in meaning to what was just written, with guidance - read the one that fits and merge into it, supersede it or link it, and say so; never ignore the list silently. The receipt may also carry close_folders when the write started a new folder next to existing sibling folders with a close name (planview beside planview-work, note beside notes, a typo or a case variant), each with its engram count, plus folder_guidance: if it is the same topic, move the engram into that folder with move_engram and keep one folder; if the topics differ, leave it. Replacing an engram somebody has open in the web editor is never silent: an overwrite of a live document is refused and names who is in there, so use edit_engram for the change, which composes into their document. In a domain in review mode (review: overlay) your write lands in your own private draft; share_changes proposes exactly your drafts for review, and a receipt marked draft means the tree did not move. To capture into somebody's shared draft rather than a copy of your own, pass the draft share-link they handed you (dl_...) as share_link on that call: it opens their draft for this session and the write lands in their copy, at the page the link was minted on and nowhere else.",
+        description = "Capture a new engram - a unit of knowledge - into a domain. Writes the markdown file and indexes it. Body bullets: '- [decision] we chose X #tag' become observations, '- rel_type [[Target]]' become relations. domain is required so an engram never lands in the wrong place. Pass folder to file the engram under a topic prefix: reuse the domain's existing layout (browse_domain shows it), start a subfolder when a topic cluster is forming and keep singletons at the root; the folder path becomes the permalink prefix build_context globs as crystalline://domain/folder/*. permalink, status, recorded_at and generated (who wrote it, with which model, and when) are filled in; pass model with your own model id, the one you were told you are (for example claude-opus-5), on every capture, so a later reader can weigh the page by which model wrote it - leave it out only when you do not know it; valid_from/valid_to are never auto-set - absence means always valid; to bound validity pass them inside metadata as plain ISO dates (YYYY-MM-DD). Any other date format is rejected; a sentinel far-future valid_to and an explicit null are dropped, since absence already means valid forever. Recommended type values: engram, guide, decision, architecture, runbook, reference. Recommended status values (guidance, not enforced): stable, implemented, draft, proposed, idea, poc, deprecated, superseded, archived, legacy. stable is the default and the word for knowledge that holds now; current is the legacy alias for the same state, and a status filter on either word matches engrams carrying either. Of those, deprecated, superseded, archived and legacy are the recognized retirement set: a status inside it softly fades in search ranking, any other value ranks at full strength. Errors if the permalink exists in the same folder unless overwrite is true, and an overwrite replaces the engram that owns the permalink in its own file, whatever that file is called; a permalink owned by an engram in another folder is refused whether or not overwrite is set, and no overwrite is offered for it (move_engram it first, or change it in place with edit_engram); it refuses a title that would file the engram as the reserved index.md or log.md (Crystalline generates the folder index itself). The vocabulary tool lists tags already in use; reuse one before coining a new tag. Set an optional numeric salience metadata key (0-10) to mark exceptionally valuable knowledge; salient engrams are lifted in hybrid search ranking. Raise it later to elevate an engram that proved load-bearing. The receipt may carry a similar list: up to three existing engrams closest in meaning to what was just written, with guidance - read the one that fits and merge into it, supersede it or link it, and say so; never ignore the list silently. The receipt may also carry close_folders when the write started a new folder next to existing sibling folders with a close name (planview beside planview-work, note beside notes, a typo or a case variant), each with its engram count, plus folder_guidance: if it is the same topic, move the engram into that folder with move_engram and keep one folder; if the topics differ, leave it. Replacing an engram somebody has open in the web editor is never silent: an overwrite of a live document is refused and names who is in there, so use edit_engram for the change, which composes into their document. In a domain in review mode (review: overlay) your write lands in your own private draft; share_changes proposes exactly your drafts for review, and a receipt marked draft means the tree did not move. To capture into somebody's shared draft rather than a copy of your own, pass the draft share-link they handed you (dl_...) as share_link on that call: it opens their draft for this session and the write lands in their copy, at the page the link was minted on and nowhere else. The receipt carries markdown_findings (code, severity, message, line) when the text has a status colour or callout kind Crystalline does not know (or, in an engram, an observation inside a callout): fix them.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2679,7 +3069,7 @@ impl McpServer {
     #[tool(
         name = "read_engram",
         title = "Read engram",
-        description = "Read an engram's full markdown and resolved frontmatter to learn what is already known before acting or writing. Identify it by bare permalink, title or a crystalline:// URL; pass domain to disambiguate. An identifier without crystalline:// is domain-relative: 'onboarding/setup', never 'mydomain/onboarding/setup'. A file path is not an identifier: a miss names the permalink it probably meant. The response flags whether each relation and prose link resolves, summarizes what links back and names a build_context anchor for exploring nearby knowledge. Attachments the engram references come back as resource links; fetch one with resources/read when the file itself matters. Somebody may have the engram open in the web editor while you read it: the reply then carries live: true, present (who is in there) and their unsaved text, which is what the engram says right now - read it as work in progress and expect it to move. An engram open in a live editor is read through the live document whenever you are reading your own view of it, so you see what the person sees; a draft you reach with a share_link answers its author's last saved text instead, so an edit inside one is best sent without expected_checksum. Reading a live document is not a private act: you usually join that person's participant strip by name for a minute, so they can see an agent is reading along. If somebody handed you a draft share-link (dl_...), pass it as share_link to read their draft of the page instead of the page the domain holds; that also opens the draft for this connection, so a later edit_engram of it lands in their copy. A stdio server or an MCP session holds that open until the session ends; a sessionless HTTP connection holds it for 30 minutes after your last call about that draft, so present the link again whenever an edit is refused as unjoined. A link you may only read still opens the draft for reading. Where this instance serves the web UI the reply carries web_url, the address a person opens the engram at, to hand to somebody who wants to see it; add # and a heading's slug to open it at a section. The answer carries read_only: true when you cannot write in the engram's domain; propose the change to a person instead of editing.",
+        description = "Read an engram's full markdown and resolved frontmatter to learn what is already known before acting or writing. Identify it by bare permalink, title or a crystalline:// URL; pass domain to disambiguate. An identifier without crystalline:// is domain-relative: 'onboarding/setup', never 'mydomain/onboarding/setup'. A file path is not an identifier: a miss names the permalink it probably meant. The response flags whether each relation and prose link resolves, summarizes what links back and names a build_context anchor for exploring nearby knowledge. Attachments the engram references come back as resource links; fetch one with resources/read when the file itself matters. An engram from a domain served by another machine carries them too, and resources/read fetches them from that server (Crystalline 0.27 or newer there). Somebody may have the engram open in the web editor while you read it: the reply then carries live: true, present (who is in there) and their unsaved text, which is what the engram says right now - read it as work in progress and expect it to move. When their editor cannot save right now (its save is in conflict or was refused) the reply carries the saved version instead, which is where your edits go, with room: waiting, present and room_note: tell the person what room_note says. An engram open in a live editor is read through the live document whenever you are reading your own view of it, so you see what the person sees; a draft you reach with a share_link answers its author's last saved text instead, so an edit inside one is best sent without expected_checksum. Reading a live document is not a private act: you usually join that person's participant strip by name for a minute, so they can see an agent is reading along. If somebody handed you a draft share-link (dl_...), pass it as share_link to read their draft of the page instead of the page the domain holds; that also opens the draft for this connection, so a later edit_engram of it lands in their copy. A stdio server or an MCP session holds that open until the session ends; a sessionless HTTP connection holds it for 30 minutes after your last call about that draft, so present the link again whenever an edit is refused as unjoined. A link you may only read still opens the draft for reading. Where this instance serves the web UI the reply carries web_url, the address a person opens the engram at, to hand to somebody who wants to see it; add # and a heading's slug to open it at a section. The answer carries read_only: true when you cannot write in the engram's domain; propose the change to a person instead of editing.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn read_engram(
@@ -2700,16 +3090,25 @@ impl McpServer {
                 self.engine.github_enabled(),
             ),
         );
-        let links = self.attachment_links(&value, &caller.scope).await;
+        let domain = value["domain"].as_str().unwrap_or_default().to_string();
+        let files = self
+            .linked_files(
+                ContentKind::Engram,
+                &domain,
+                &value,
+                &caller.scope,
+                &self.reflection_caller(&ctx),
+            )
+            .await;
         let mut result = ok(value)?;
-        result.content.extend(links);
+        result.content.extend(file_links(&domain, &files));
         Ok(result)
     }
 
     #[tool(
         name = "edit_engram",
         title = "Edit engram",
-        description = "Refine an existing engram in place as understanding evolves. Sections are addressed by heading path such as '## API > ### Auth'. replace_section keeps the section's heading line and replaces the section body under it, keeping deeper subsections unless include_subsections is set; insert_after_section puts content right under that same heading line. For both, content is the section body only - send only the body, never the heading. Content that repeats the section's own heading has the repeat dropped (a duplicated heading would leave an empty section) and the receipt reports heading_stripped. An edit of a domain's MANIFEST that leaves it broken - an empty When to Use or Scope section, a duplicate heading, a wrong type - still lands, and the receipt lists manifest_findings (the validate M rules: code, severity, message, line) so you can fix the routing right away. operation is one of append, prepend, find_replace, replace_section, insert_before_section, insert_after_section, set_frontmatter. find_replace takes find_text and an optional expected_replacements guard that fails on a count mismatch. set_frontmatter assigns one frontmatter field by key instead of text-substituting a frontmatter line. A set_frontmatter that changes nothing - the same tags, sources, status or plain value the engram already holds - writes nothing (no file write, no new generated stamp, the checksum stays) and the receipt answers unchanged: true. tags takes values, the whole new list: to add a tag, remove a tag or set tags, read the engram, check vocabulary and pass every tag it should carry (each folded to lowercase-with-hyphens, a tag that cannot be folded refused by name; an empty list removes them). sources takes values too, the whole new list of locations the engram was distilled from: to add or drop one location, read the engram and pass every location it should keep (each trimmed and kept exactly as spelled, repeats kept once, an entry whose JSON is over 1024 bytes refused by its position because a $contains filter could not find it; an empty list removes the key). The other settable keys take one value: status, valid_from, valid_to, stale_after, source_date, resource, source_version, salience, verified and evolve_ack; identity, recorded_at and the generated block are refused. Use it to retag or retire an engram, record where knowledge came from (resource, source_version, sources), close or reopen a validity window, push a review date forward, mark knowledge salient or record that you re-checked something. Omit value to remove the field (that is how a valid_to that should never have been set is cleared); status cannot be removed. The four date keys take a plain ISO date (YYYY-MM-DD), resource and source_version take plain text and salience a number from 0 to 10. verified never removes: it stamps { by, at } with the current instant, taking value as the verifying actor or else your own identity. evolve_ack is never cleared by an omitted value either: it acknowledges an evolve finding the user ruled intentional, taking value as the rule id optionally followed by a note ('V101' or 'V101 lineage citation, keep'), and the server records what evidence the finding fired on so the acknowledgment holds while that evidence holds and comes back marked stale when it changes; acknowledging the same finding again replaces its entry, and V112, V301 and V302 are the three rules that keep more than one, an entry per pair (a pair of sibling folders for V112, a twin pair for V301, a pair of observation lines for V302), so acknowledging a second pair on the same engram records it beside the first and each pair is silenced on its own; a V112 acknowledgment holds on any engram in either folder of its pair, while both folder names hold, and given on an engram other than the one its queue row names it records the pair that engram's folder is in, refused when the engram sits in more than one pair (acknowledge on the row's engram then) or in none. Every other rule keeps exactly one entry however often it fires on that engram, so a second acknowledgment of it replaces what the first said and the finding it was not given for comes back marked stale. To unacknowledge a finding - to unack it, to take back an acknowledgment so the finding resurfaces on the next sweep - pass the value 'remove <rule-id>' ('remove V101') on the same key; it takes back every entry for that rule, which for V301 and V302 means every pair you acknowledged on that engram. 'remove V112' takes back every pair this engram holds or anchors, on this engram and on every other engram of the two folders, since a pair's acknowledgment can sit on any of them: the receipt names the engrams it cleared in evolve_ack_removed_from and the ones it could not (a draft shared with you to read and not joined, or a rewrite that reported an error, which says so when the file was written first and the entry may already be gone) with the reason in evolve_ack_not_removed_from, and in a domain in review mode each engram it clears gets a draft of your own. It errors when no entry for that rule is there to take back, and the receipt reports evolve_ack_removed. Take an acknowledgment back only when the user asks. Pass expected_checksum (from read_engram) to guard an edit against a change since your read: a conflict is refused if it changed, so re-read and retry; omit it for last-write-wins. An edit of an engram somebody has open in the web editor composes into their live document instead of the file - it arrives under their cursor, keeps what they have typed, and the receipt says landed: live with present naming who is in there; their session saves it. You are usually named in their participant strip while you work there, for a minute after each call, so they can tell which agent a change came from. To edit somebody's shared draft rather than your own copy of the page, pass the draft share-link they handed you (dl_...) as share_link: it opens that draft for this connection and the edit lands in its author's copy, with the receipt saying whose. A draft reached that way is read from its author's last saved text rather than from their open document, so send an edit inside one without expected_checksum: the text composes correctly either way, and a checksum taken from a granted read is refused as stale for as long as its author keeps typing. That stays open until your session ends, or - on a sessionless HTTP connection - for 30 minutes after your last call about the draft, so present the link again whenever an edit is refused as unjoined. Without it, an edit at a path somebody shared with you is refused and told the two ways forward. The generated provenance block is refreshed with who edited it, with which model, and when: pass model with your own model id (for example claude-opus-5) on every edit, and a verification you record carries it too. A content edit's receipt may carry a similar list, the existing engrams closest in meaning to the text just added, with guidance to merge, supersede, link or leave them; set_frontmatter never probes. Status values to reflect a changed lifecycle (recommended values: see write_engram). Temporal frontmatter fields (recorded_at, valid_from, valid_to, source_date, stale_after, plus the legacy last_verified and review_after spellings) must stay plain ISO dates (YYYY-MM-DD): an edit that leaves one malformed is rejected and a sentinel far-future valid_to or an explicit null is dropped, except recorded_at which is required and cannot be nulled. In a domain in review mode (review: overlay) your write lands in your own private draft; share_changes proposes exactly your drafts for review, and a receipt marked draft means the tree did not move.",
+        description = "Refine an existing engram in place as understanding evolves. Sections are addressed by heading path such as '## API > ### Auth'. replace_section keeps the section's heading line and replaces the section body under it, keeping deeper subsections unless include_subsections is set; insert_after_section puts content right under that same heading line. For both, content is the section body only - send only the body, never the heading. Content that repeats the section's own heading has the repeat dropped (a duplicated heading would leave an empty section) and the receipt reports heading_stripped. An edit of a domain's MANIFEST that leaves it broken - an empty When to Use or Scope section, a duplicate heading, a wrong type - still lands, and the receipt lists manifest_findings (the validate M rules: code, severity, message, line) so you can fix the routing right away. operation is one of append, prepend, find_replace, replace_section, insert_before_section, insert_after_section, set_frontmatter. find_replace takes find_text and an optional expected_replacements guard that fails on a count mismatch. set_frontmatter assigns one frontmatter field by key instead of text-substituting a frontmatter line. A set_frontmatter that changes nothing - the same tags, sources, status or plain value the engram already holds - writes nothing (no file write, no new generated stamp, the checksum stays) and the receipt answers unchanged: true. tags takes values, the whole new list: to add a tag, remove a tag or set tags, read the engram, check vocabulary and pass every tag it should carry (each folded to lowercase-with-hyphens, a tag that cannot be folded refused by name; an empty list removes them). sources takes values too, the whole new list of locations the engram was distilled from: to add or drop one location, read the engram and pass every location it should keep (each trimmed and kept exactly as spelled, repeats kept once, an entry whose JSON is over 1024 bytes refused by its position because a $contains filter could not find it; an empty list removes the key). The other settable keys take one value: status, valid_from, valid_to, stale_after, source_date, resource, source_version, salience, verified and evolve_ack; identity, recorded_at and the generated block are refused. Use it to retag or retire an engram, record where knowledge came from (resource, source_version, sources), close or reopen a validity window, push a review date forward, mark knowledge salient or record that you re-checked something. Omit value to remove the field (that is how a valid_to that should never have been set is cleared); status cannot be removed. The four date keys take a plain ISO date (YYYY-MM-DD), resource and source_version take plain text and salience a number from 0 to 10. verified never removes: it stamps { by, at } with the current instant, taking value as the verifying actor or else your own identity. evolve_ack is never cleared by an omitted value either: it acknowledges an evolve finding the user ruled intentional, taking value as the rule id optionally followed by a note ('V101' or 'V101 lineage citation, keep'), and the server records what evidence the finding fired on so the acknowledgment holds while that evidence holds and comes back marked stale when it changes; acknowledging the same finding again replaces its entry, and V112, V301 and V302 are the three rules that keep more than one, an entry per pair (a pair of sibling folders for V112, a twin pair for V301, a pair of observation lines for V302), so acknowledging a second pair on the same engram records it beside the first and each pair is silenced on its own; a V112 acknowledgment holds on any engram in either folder of its pair, while both folder names hold, and given on an engram other than the one its queue row names it records the pair that engram's folder is in, refused when the engram sits in more than one pair (acknowledge on the row's engram then) or in none. Every other rule keeps exactly one entry however often it fires on that engram, so a second acknowledgment of it replaces what the first said and the finding it was not given for comes back marked stale. To unacknowledge a finding - to unack it, to take back an acknowledgment so the finding resurfaces on the next sweep - pass the value 'remove <rule-id>' ('remove V101') on the same key; it takes back every entry for that rule, which for V301 and V302 means every pair you acknowledged on that engram. 'remove V112' takes back every pair this engram holds or anchors, on this engram and on every other engram of the two folders, since a pair's acknowledgment can sit on any of them: the receipt names the engrams it cleared in evolve_ack_removed_from and the ones it could not (a draft shared with you to read and not joined, or a rewrite that reported an error, which says so when the file was written first and the entry may already be gone) with the reason in evolve_ack_not_removed_from, and in a domain in review mode each engram it clears gets a draft of your own. It errors when no entry for that rule is there to take back, and the receipt reports evolve_ack_removed. Take an acknowledgment back only when the user asks. Pass expected_checksum (from read_engram) to guard an edit against a change since your read: a conflict is refused if it changed, so re-read and retry; omit it for last-write-wins. An edit of an engram somebody has open in the web editor composes into their live document instead of the file - it arrives under their cursor, keeps what they have typed, and the receipt says landed: live with present naming who is in there; their session saves it. While their editor is not saving (its save is in conflict or was refused) the edit goes to the file instead, and the receipt says landed: file with room and room_note: tell the person what room_note says. You are usually named in their participant strip while you work there, for a minute after each call, so they can tell which agent a change came from. To edit somebody's shared draft rather than your own copy of the page, pass the draft share-link they handed you (dl_...) as share_link: it opens that draft for this connection and the edit lands in its author's copy, with the receipt saying whose. A draft reached that way is read from its author's last saved text rather than from their open document, so send an edit inside one without expected_checksum: the text composes correctly either way, and a checksum taken from a granted read is refused as stale for as long as its author keeps typing. That stays open until your session ends, or - on a sessionless HTTP connection - for 30 minutes after your last call about the draft, so present the link again whenever an edit is refused as unjoined. Without it, an edit at a path somebody shared with you is refused and told the two ways forward. The generated provenance block is refreshed with who edited it, with which model, and when: pass model with your own model id (for example claude-opus-5) on every edit, and a verification you record carries it too. A content edit's receipt may carry a similar list, the existing engrams closest in meaning to the text just added, with guidance to merge, supersede, link or leave them; set_frontmatter never probes. Status values to reflect a changed lifecycle (recommended values: see write_engram). Temporal frontmatter fields (recorded_at, valid_from, valid_to, source_date, stale_after, plus the legacy last_verified and review_after spellings) must stay plain ISO dates (YYYY-MM-DD): an edit that leaves one malformed is rejected and a sentinel far-future valid_to or an explicit null is dropped, except recorded_at which is required and cannot be nulled. In a domain in review mode (review: overlay) your write lands in your own private draft; share_changes proposes exactly your drafts for review, and a receipt marked draft means the tree did not move. The receipt carries markdown_findings (code, severity, message, line) when the text has a status colour or callout kind Crystalline does not know (or, in an engram, an observation inside a callout): fix them.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -2733,7 +3132,7 @@ impl McpServer {
     #[tool(
         name = "move_engram",
         title = "Move engram",
-        description = "Move, rename or re-home an engram: a new path, a new permalink, a new domain, or any mix, as the knowledge base is reorganized. A move is a refactoring, so use this tool, never write_engram plus delete_engram, which loses recorded_at and the generated provenance. The destination may stay inside the same domain: re-filing an engram into a topic subfolder as a cluster forms is a normal move. Every reference follows the engram to its new address: [[old]] and [[domain:old]] wikilinks, relation bullets and crystalline://domain/old URLs (a #fragment is kept) are rewritten in every domain you can see, and the receipt counts them (links_rewritten engrams, references_rewritten references, rewritten names them); a link by title is left alone unless the domain changed. Set update_links to false to skip the rewrite. The permalink: omit it and it follows the move when it was in step with the old path, and stays when it was a deliberate custom one; permalink \"path\" derives it from the destination path, \"keep\" keeps it, any other value is the new permalink. Rename a permalink in place, for example to repair a permalink that drifted off its folder (evolve_engrams V109), by passing the engram's own current path as destination with permalink \"path\". A permalink another engram already holds, or an engram open in the editor, is refused. A destination filename of index.md or log.md is refused: both names are reserved for the generated directory index and log. In a domain in review mode (review: overlay) your write lands in your own private draft; share_changes proposes exactly your drafts for review, and a receipt marked draft means the tree did not move; a draft keeps its permalink unless you pass one, and references in other engrams follow when the team moves the engram.",
+        description = "Move, rename or re-home an engram: a new path, a new permalink, a new domain, or any mix, as the knowledge base is reorganized. A move is a refactoring, so use this tool, never write_engram plus delete_engram, which loses recorded_at and the generated provenance. The destination may stay inside the same domain: re-filing an engram into a topic subfolder as a cluster forms is a normal move. Every reference follows the engram to its new address: [[old]] and [[domain:old]] wikilinks, relation bullets and crystalline://domain/old URLs (a #fragment is kept) are rewritten in every domain you can see, and the receipt counts them (links_rewritten engrams, references_rewritten references, rewritten names them and marks one open in the editor landed live, links_failed names any engram whose references could not be rewritten); a link by title is left alone unless the domain changed. Set update_links to false to skip the rewrite. The permalink: omit it and it follows the move when it was in step with the old path, and stays when it was a deliberate custom one; permalink \"path\" derives it from the destination path, \"keep\" keeps it, any other value is the new permalink. Rename a permalink in place, for example to repair a permalink that drifted off its folder (evolve_engrams V109), by passing the engram's own current path as destination with permalink \"path\". A permalink another engram already holds is refused. A move that changes the address of an engram somebody has open in the editor saves their text first, then closes the editor and tells it the new address. A destination filename of index.md or log.md is refused: both names are reserved for the generated directory index and log. A domain's MANIFEST.md cannot be moved away (a file domain needs it): edit it with edit_engram instead, or remove the domain to drop it. In a domain in review mode (review: overlay) your write lands in your own private draft; share_changes proposes exactly your drafts for review, and a receipt marked draft means the tree did not move; a draft keeps its permalink unless you pass one, and references in other engrams follow when the team moves the engram.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -2781,7 +3180,7 @@ impl McpServer {
     #[tool(
         name = "delete_engram",
         title = "Delete engram",
-        description = "Remove an engram when its knowledge is retired. Deletes the file and its index rows. Prefer setting status to deprecated or superseded when the history still matters. An identifier under assets/ deletes that attachment instead - the stored file and its row - which is how an orphaned-attachment finding is completed after the user says yes; expected_checksum guards engram markdown and is refused for an attachment. In a domain in review mode (review: overlay) your write lands in your own private draft; share_changes proposes exactly your drafts for review, and a receipt marked draft means the tree did not move.",
+        description = "Remove an engram when its knowledge is retired. Deletes the file and its index rows. Prefer setting status to deprecated or superseded when the history still matters. An identifier under assets/ deletes that attachment instead - the stored file and its row - which is how an orphaned-attachment finding is completed after the user says yes; expected_checksum guards engram markdown and is refused for an attachment. A domain's MANIFEST.md cannot be deleted (a file domain needs it): edit it with edit_engram instead, or remove the domain to drop it. In a domain in review mode (review: overlay) your write lands in your own private draft; share_changes proposes exactly your drafts for review, and a receipt marked draft means the tree did not move.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -2981,9 +3380,123 @@ impl McpServer {
     }
 
     #[tool(
+        name = "reflect",
+        title = "Reflect",
+        description = "Get the work queue of a domain's Reflection and work it. The Reflection is the domain's documents for people under reflections/, written at the level its PACT.md agrees on; it exists where the domain's MANIFEST says reflection: on. Three kinds of item, oldest first: feedback (a person changed a section - the diff, who changed it and the engrams the section was built from; judge it into the engrams, keep it as their text, or answer it in a thread), update (an engram behind a section changed, was retired or is gone, in this domain or another; source_unavailable when a source's domain cannot be checked here: keep such a source while its domain may come back, and drop it only by writing its section's sources without it once the domain is gone for good; engrams no section covers yet; a page off the pact's structure; a changed pact; a file nobody links, a link to a missing file, an embedded engram attachment - bring the engrams into the reflections) and review (threads waiting for you; a thread item carries label and blocking when its opening comment is a conventional comment, and a blocking thread comes first in its section). Within a section the feedback item comes before any update item, so you read a person's change before you rewrite it. A source in a domain you cannot open is never named: a feedback or update item carries hidden_sources and a note instead, so ask a person instead of updating blind. Read-only: it changes nothing. Call it when a session-end reminder or the routing block names a domain's Reflection, when the user asks what the Reflection needs, and in a scheduled run on the home instance. Refuses on a domain without reflection: on, and names the home instance when the Reflection lives on another server. domains narrows the queue, kinds filters it, limit and page page through it. When the answer's scope carries unreadable, those domains were left out because their Reflection could not be read; the rest of the queue is complete. When it carries pending, those domains' Reflection waits until the engrams in their reflections/ folder are moved out: tell the person.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn reflect(
+        &self,
+        Parameters(ReflectArgs(p)): Parameters<ReflectArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Some(answer) = self.mounted("reflect", &p, &ctx).await {
+            return answer;
+        }
+        let p = self.localized(p, &ctx).await?;
+        let caller = self.reflection_caller(&ctx);
+        match self.engine.reflect(&p, &caller).await {
+            Ok(v) => self.ok_list(v),
+            Err(e) => Self::reflection_refused(e),
+        }
+    }
+
+    #[tool(
+        name = "read_reflection",
+        title = "Read reflection",
+        description = "Read a domain's Reflection - its documents for people under reflections/, where the MANIFEST says reflection: on. Without path: the tree of reflections with titles, section counts and open thread counts, and PACT.md, the agreement on audience, level of detail, presentation and structure. With path: one reflection's markdown with every section's hidden id (the <!-- r:... --> line under its ## heading), whether its text changed since it was last reflected, the engrams it was built from (each with its state: current, changed, retired, missing, or unavailable when its domain cannot be checked here; a source in another domain also carries that domain, and sources in a domain you cannot open are only counted as hidden_sources) and its open threads. With query: search the reflections by words and meaning (search_type hybrid by default, text or semantic) and get the matching sections, best first, each with its page, title, section id, heading and a snippet (at most 100 hits per page); pass path or query, not both. Files the reflection shows (under reflections/assets/) come back as resource links; fetch one with resources/read when the file itself matters. A page from a domain served by another machine carries them too and resources/read fetches them from that server, which needs Crystalline 0.27 or newer on that server. Read before write_reflection or discuss, and pass the checksum back as expected_checksum. Refuses on a domain without reflection: on, and names the home instance when the Reflection lives on another server.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn read_reflection(
+        &self,
+        Parameters(p): Parameters<ReadReflectionParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Some(answer) = self.mounted("read_reflection", &p, &ctx).await {
+            return answer;
+        }
+        let p = self.localized(p, &ctx).await?;
+        let caller = self.reflection_caller(&ctx);
+        match self.read_reflection_core(&p, &caller).await {
+            Ok(value) if p.path.is_some() => {
+                let files = self
+                    .linked_files(
+                        ContentKind::Reflection,
+                        &p.domain,
+                        &value,
+                        &caller.scope,
+                        &caller,
+                    )
+                    .await;
+                let mut result = ok(value)?;
+                result.content.extend(file_links(&p.domain, &files));
+                Ok(result)
+            }
+            Ok(value) => self.ok_list(value),
+            Err(e) => Self::reflection_refused(e),
+        }
+    }
+
+    #[tool(
+        name = "write_reflection",
+        title = "Write reflection",
+        description = "Create, change, move or delete a reflection - a document for people under reflections/, where the domain's MANIFEST says reflection: on - or edit PACT.md, the domain's agreement on audience, level of detail, presentation and structure (PACT.md and every write with sources need curate access, which everyone who edits the engrams holds; anyone else proposes a PACT.md change with discuss). Write at the level PACT.md describes. action write (the default) takes the whole markdown: keep each ## heading's <!-- r:... --> id line as it is. Crystalline gives a new heading its id line; never write one yourself. The `reflection:` frontmatter key is Crystalline's bookkeeping; never write it (pass `sources` instead). To change one section instead, pass operation replace_section, insert_before_section or insert_after_section with section (the heading path, for example ## Night deploys) and content, exactly as edit_engram does; the section keeps its id line. Pass sources (a ## section's id or heading text to the engrams it was built from: a permalink for an engram in this domain, a crystalline://<domain>/<permalink> address for one in another domain you can read) for every section you built from engrams: that curates the section and records what it reflects, and the queue notices when those engrams change. Never write sources into the page as HTML comments or text. A heading this same write creates works as a key; the # title and ### headings are not sections, and a heading two sections share needs their ids from the receipt. Without sources a write is an ordinary edit, and a person's change stays a feedback item in reflect. Sources alone, with no markdown and no operation, curate those sections as the page stands and rewrite none of its text (a heading without an id line still gets one, and addresses are spelled with current domain names). action settle with sections and outcome kept (the person's text stands, sources stay) or taken_in (you changed the engrams to match) settles feedback items. action move carries the reflection's threads and baseline and rewrites relative links to it (a page open in a co-editing room is saved first, and the room is closed and told the new path), and its receipt carries links_failed when a page that links it could not be rewritten; delete takes both along. action move_asset (path and to) or delete_asset (path) moves or removes a file under reflections/assets/ and needs curate access; a move rewrites every link to the file, and its receipt carries links_failed (pages whose link could not be rewritten) or note (the file moved and its index row did not follow) when that happened. A page that embeds an engram attachment is refused (copy the file into reflections/assets/ first, which a person does). When a person has the page open in a co-editing room, the receipt says landed live (the room took your text in) or landed file with room (conflict or waiting) and room_note: tell the person what room_note says. Needs edit access; sources and settle need curate access. Refuses on a domain without reflection: on, and names the home instance when the Reflection lives on another server. The receipt carries markdown_findings (code, severity, message, line) when the text has a status colour or callout kind Crystalline does not know: fix them. Present the page with the crystalline-presentation skill (callouts, status labels, diagrams, tables, math) where they serve the reader; read it with the skills tool if it is not installed.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn write_reflection(
+        &self,
+        Parameters(p): Parameters<WriteReflectionParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Some(answer) = self.mounted("write_reflection", &p, &ctx).await {
+            return answer;
+        }
+        let p = self.localized(p, &ctx).await?;
+        let caller = self.reflection_caller(&ctx);
+        match self.engine.write_reflection(&p, &caller).await {
+            Ok(v) => ok(v),
+            Err(e) => Self::reflection_refused(e),
+        }
+    }
+
+    #[tool(
+        name = "discuss",
+        title = "Discuss",
+        description = "Discuss a passage of a reflection with the people who read it, the way comments work on a shared document. The Reflection is a domain's documents for people under reflections/, where its MANIFEST says reflection: on. open a thread on a section (by id or heading) or on an exact quoted passage, answer it, resolve it with a short outcome, reopen it, or list threads. Use it to ask about or disagree with a person's change instead of overwriting it (answers_feedback marks their feedback item as answered while the thread is open), and to answer the review items reflect returns. Answer a person's thread and leave it open. The person who opened it resolves it. Write for people in plain words: contributors cannot see engrams, so engram links in your text are refused. Write each comment as a conventional comment: a first line `<label> [decorations]: <subject>`, then an optional discussion, with the label one of praise, nitpick, suggestion, issue, todo, question, thought, chore or note and the decorations blocking, non-blocking or if-minor (for example `question (non-blocking): is this still true after the migration?`). A thread opened on a heading that has no id yet keeps that heading text as its anchor section, so a thread's section is an id or a heading. A resolved thread's history never changes; a reopen is a new entry. Anyone who can read the Reflection may discuss. Refuses on a domain without reflection: on, and names the home instance when the Reflection lives on another server.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn discuss(
+        &self,
+        Parameters(p): Parameters<DiscussParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Some(answer) = self.mounted("discuss", &p, &ctx).await {
+            return answer;
+        }
+        let p = self.localized(p, &ctx).await?;
+        let caller = self.reflection_caller(&ctx);
+        let listing = p.action.as_deref() == Some("list");
+        match self.engine.discuss(&p, &caller).await {
+            Ok(value) if listing => self.ok_list(value),
+            Ok(value) => ok(value),
+            Err(e) => Self::reflection_refused(e),
+        }
+    }
+
+    #[tool(
         name = "configure",
         title = "Configure Crystalline",
-        description = "View and adjust Crystalline's settings, like an app's preferences page: call with no arguments to see them, set to change them (for example github.enabled to turn on team collaboration) and connect: \"github\" to link, connect or reconnect a GitHub account. Call it whenever someone asks to connect or sign in to GitHub, and whenever sharing, a proposal or an origin check fails because no GitHub identity is connected. On an instance that registered a GitHub App of its own, connect answers a single-use browser link in url - relay it and ask the person to open it while signed in here - and otherwise a short code to confirm at github.com/login/device. With a token it accepts a personal access token instead. Connecting works before or after enabling; only team domains need github.enabled turned on. Call it with domain to see and change how one domain behaves: its domain policies (the MANIFEST keys sharing, direct or proposal, generated indexes, local or shared, and read_only, off or on), what each MANIFEST section does, and its rule overrides in .crystalline.yaml (a verify rule's severity, off, error, warning or info, and the token budget). With domain, set and unset change that domain, for example set { \"sharing\": \"direct\" } to allow direct commits or { \"rules.E007\": \"off\" } to turn a rule off. read_only: on refuses every write to the domain; switch it on when the user asks. Call it with domain whenever the user wants a domain to commit directly or open proposals, to share or keep its generated indexes, or to silence or raise a rule. With domain it refuses these: switching read_only off (only a person does that, in the domain policies), any other change on a read-only domain, a rule override in a domain that reviews changes (.crystalline.yaml is not an engram, so change the file in the domain), a rule override in a virtual domain (it has no .crystalline.yaml), and any call on a mounted domain (change it on the server it comes from). In a domain that reviews changes a policy change becomes your draft. The instance's network, database and sign-in are not listed here: the operator sets them with the crystalline CLI.",
+        description = "View and adjust Crystalline's settings, like an app's preferences page: call with no arguments to see them, set to change them (for example github.enabled to turn on team collaboration) and connect: \"github\" to link, connect or reconnect a GitHub account. Call it whenever someone asks to connect or sign in to GitHub, and whenever sharing, a proposal or an origin check fails because no GitHub identity is connected. On an instance that registered a GitHub App of its own, connect answers a single-use browser link in url - relay it and ask the person to open it while signed in here - and otherwise a short code to confirm at github.com/login/device. With a token it accepts a personal access token instead. Connecting works before or after enabling; only team domains need github.enabled turned on. Call it with domain to see and change how one domain behaves: its domain policies (the MANIFEST keys sharing, direct or proposal, generated indexes, local or shared, and read_only, off or on, and reflection, off or on (on makes reflections/ the domain's Reflection and is refused while engrams live there; reflection_home is filled in, never set)), what each MANIFEST section does, and its rule overrides in .crystalline.yaml (a verify rule's severity, off, error, warning or info, and the token budget). With domain, set and unset change that domain, for example set { \"sharing\": \"direct\" } to allow direct commits or { \"rules.E007\": \"off\" } to turn a rule off. read_only: on refuses every write to the domain; switch it on when the user asks. Call it with domain whenever the user wants a domain to commit directly or open proposals, to share or keep its generated indexes, or to silence or raise a rule. With domain it refuses these: switching read_only off (only a person does that, in the domain policies), any other change on a read-only domain, a rule override in a domain that reviews changes (.crystalline.yaml is not an engram, so change the file in the domain), a rule override in a virtual domain (it has no .crystalline.yaml), and any call on a mounted domain (change it on the server it comes from). In a domain that reviews changes a policy change becomes your draft. The instance's network, database and sign-in are not listed here: the operator sets them with the crystalline CLI.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -3747,7 +4260,7 @@ impl McpServer {
     #[tool(
         name = "skills",
         title = "Skills",
-        description = "List the agent skills this server ships and read any skill's full SKILL.md playbook: how to route, capture, model schemas, collaborate and provision tools well with Crystalline. Call with no arguments for the index of names and descriptions; pass name to read one skill before its kind of task.",
+        description = "List the agent skills this server ships and read any skill's full SKILL.md playbook: how to route, capture, model schemas, collaborate, provision tools and present reflections (callouts, status labels, diagrams, tables, math) well with Crystalline. Call with no arguments for the index of names and descriptions; pass name to read one skill before its kind of task.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -3918,64 +4431,126 @@ impl McpServer {
         }
     }
 
-    /// The resource links a `read_engram` result carries: one per distinct
-    /// `assets/` reference in the body that resolves to a stored attachment.
+    /// The files a read answer shows, one per distinct reference in its text
+    /// that resolves to a stored file: for an engram (`kind` Engram), every
+    /// `assets/` reference in `content`; for one Reflection page (`kind`
+    /// Reflection), every reference to a file under `reflections/assets/` in
+    /// `markdown`. One function for both kinds; the right follows the kind.
     ///
-    /// Links rather than bytes, deliberately. A screenshot inlined as base64
-    /// would spend a model's whole context on a file it may not need; a link
-    /// names it - uri, filename, mime and size - and `resources/read` fetches
-    /// the bytes when the model decides the file itself matters.
+    /// The MCP handlers turn these into resource links ([`file_links`]);
+    /// a connected machine's read gets them as `files` and turns them into
+    /// links on its side (`render_routed`). Links rather than bytes,
+    /// deliberately: a screenshot inlined as base64 would spend a model's
+    /// whole context on a file it may not need; a link names it - uri,
+    /// filename, mime and size - and `resources/read` fetches the bytes when
+    /// the model decides the file itself matters.
     ///
-    /// A reference that resolves to nothing produces no link and no complaint:
-    /// a dangling attachment reference is knowledge debt, and `evolve_engrams`
-    /// is where debt is reported. A listing that cannot be read (a domain
-    /// dropped between the read and this call) costs the links, never the read.
+    /// A reference that resolves to nothing produces nothing and no
+    /// complaint: a dangling attachment reference is knowledge debt, and
+    /// `evolve_engrams` is where debt is reported. A listing that cannot be
+    /// read (a domain dropped between the read and this call) costs the
+    /// files, never the read.
     ///
-    /// `scope` is the caller's, and the domain is re-checked against it before
-    /// the listing is read. Belt and braces: the value handed in came out of a
-    /// scoped `read_engram`, so its domain is one this caller may already see.
-    /// The engine's attachment listing takes a domain by name and no scope of
-    /// its own, though, so the check is made where the name is used rather than
-    /// assumed from where it came - and a resolver that cannot answer costs the
-    /// links rather than widening them.
-    async fn attachment_links(&self, value: &Value, scope: &Scope) -> Vec<ContentBlock> {
-        let (Some(domain), Some(content)) = (
-            value.get("domain").and_then(Value::as_str),
-            value.get("content").and_then(Value::as_str),
-        ) else {
-            return Vec::new();
-        };
-        let refs = crystalline_core::find_asset_refs(content);
-        if refs.is_empty() {
-            return Vec::new();
-        }
-        if self.engine.require_domain(domain, scope).await.is_err() {
-            return Vec::new();
-        }
-        // This reader's own view, so a draft-only attachment a draft
-        // references is a resource link for its author and nothing at all for
-        // anybody else. A screen that cannot be computed costs the links rather
-        // than widening them, exactly as an unresolvable view does.
-        let Ok(hidden) = self.engine.hidden_for(scope).await else {
-            return Vec::new();
-        };
-        let Ok(view) = DomainView::for_read(&self.engine, domain, &hidden, scope) else {
-            return Vec::new();
-        };
-        let Ok(rows) = view.attachments().await else {
-            return Vec::new();
+    /// An engram's files are checked against `scope`: the domain is
+    /// re-checked before the listing is read (belt and braces - the value
+    /// came out of a scoped read, but the listing takes a domain by name and
+    /// no scope of its own), and the listing is the reader's own view, so a
+    /// draft-only attachment a draft references is a file for its author and
+    /// nothing at all for anybody else. A Reflection page's files are checked
+    /// against `rc`'s Reflection read right only. A page never lists an
+    /// engram attachment it embeds (`../assets/...`): that is engram content,
+    /// and a Reflection reader may have no engram rights.
+    async fn linked_files(
+        &self,
+        kind: ContentKind,
+        domain: &str,
+        value: &Value,
+        scope: &Scope,
+        rc: &ReflectionCaller,
+    ) -> Vec<LinkedFile> {
+        let (refs, rows) = match kind {
+            ContentKind::Engram => {
+                let Some(content) = value.get("content").and_then(Value::as_str) else {
+                    return Vec::new();
+                };
+                let refs = crystalline_core::find_asset_refs(content);
+                if refs.is_empty() || self.engine.require_domain(domain, scope).await.is_err() {
+                    return Vec::new();
+                }
+                let Ok(hidden) = self.engine.hidden_for(scope).await else {
+                    return Vec::new();
+                };
+                let Ok(view) = DomainView::for_read(&self.engine, domain, &hidden, scope) else {
+                    return Vec::new();
+                };
+                let Ok(rows) = view.attachments().await else {
+                    return Vec::new();
+                };
+                (refs, rows)
+            }
+            ContentKind::Reflection => {
+                let (Some(path), Some(markdown)) = (
+                    value.get("path").and_then(Value::as_str),
+                    value.get("markdown").and_then(Value::as_str),
+                ) else {
+                    return Vec::new();
+                };
+                let refs = crystalline_core::reflection::reflection_asset_refs(markdown, path);
+                if refs.is_empty() {
+                    return Vec::new();
+                }
+                let Ok(rows) = self.engine.reflection_asset_list(domain, rc).await else {
+                    return Vec::new();
+                };
+                (refs, rows)
+            }
         };
         refs.iter()
             .filter_map(|target| rows.iter().find(|row| row.path == *target))
-            .map(|row| {
-                let name = row.path.rsplit('/').next().unwrap_or(row.path.as_str());
-                ContentBlock::resource_link(
-                    Resource::new(format!("crystalline://{domain}/{}", row.path), name)
-                        .with_mime_type(row.mime.clone())
-                        .with_size(row.size),
-                )
+            .map(|row| LinkedFile {
+                path: match kind {
+                    ContentKind::Engram => row.path.clone(),
+                    ContentKind::Reflection => format!(
+                        "{}/{}",
+                        crystalline_core::reflection::REFLECTIONS_DIR,
+                        row.path
+                    ),
+                },
+                mime: row.mime.clone(),
+                size: row.size,
             })
             .collect()
+    }
+
+    /// One file's bytes and its row, for `resources/read` and a connected
+    /// machine's `file` command alike. `path` is the path inside the kind's
+    /// home as [`CrystallineUrl::asset_ref`] answers it (`assets/...` for
+    /// both kinds). The right follows the kind: an engram attachment is read
+    /// through the caller's engram view (a domain the caller may not see is
+    /// refused exactly as an unregistered one, before the file is touched,
+    /// and the bytes come through the caller's own view, their drafts in a
+    /// reviewing domain); a Reflection's file under the Reflection right,
+    /// never the engram right, so a reader at knowledge `none` reads every
+    /// file of a Reflection it reads. The Reflection gate also refuses a
+    /// Reflection served by another instance and names that instance.
+    async fn file_bytes(
+        &self,
+        kind: ContentKind,
+        domain: &str,
+        path: &str,
+        scope: &Scope,
+        rc: &ReflectionCaller,
+    ) -> Result<(Vec<u8>, crystalline_index::AttachmentRow), EngineError> {
+        match kind {
+            ContentKind::Engram => {
+                self.engine.require_domain(domain, scope).await?;
+                let hidden = self.engine.hidden_for(scope).await?;
+                DomainView::for_read(&self.engine, domain, &hidden, scope)?
+                    .attachment_bytes(path)
+                    .await
+            }
+            ContentKind::Reflection => self.engine.reflection_asset_read(domain, path, rc).await,
+        }
     }
 
     /// Wrap a list-shaped engine value as a successful tool result: TOON
@@ -4600,6 +5175,9 @@ impl ServerHandler for McpServer {
             if t.name == crate::EVOLVE_TOOL_NAME && hidden_evolve_tool(read_only) {
                 return false;
             }
+            if REFLECTION_WRITE_TOOLS.contains(&t.name.as_ref()) && read_only {
+                return false;
+            }
             if t.name == "provision" && hidden_provision_tool(read_only) {
                 return false;
             }
@@ -4626,6 +5204,9 @@ impl ServerHandler for McpServer {
             return None;
         }
         if name == crate::EVOLVE_TOOL_NAME && hidden_evolve_tool(read_only) {
+            return None;
+        }
+        if REFLECTION_WRITE_TOOLS.contains(&name) && read_only {
             return None;
         }
         if name == "provision" && hidden_provision_tool(read_only) {
@@ -4664,8 +5245,11 @@ impl ServerHandler for McpServer {
         Ok(ListResourcesResult::with_all_items(resources).with_cache_hints(&context))
     }
 
-    /// The one template this server serves: every attachment a domain carries,
-    /// addressed as `crystalline://<domain>/assets/<path>`.
+    /// The two templates this server serves: every attachment a domain
+    /// carries, addressed as `crystalline://<domain>/assets/<path>`, and
+    /// every file of a domain's Reflection, addressed as
+    /// `crystalline://<domain>/reflections/assets/<path>`. The attachment
+    /// template is listed first.
     ///
     /// A template rather than a listing because the set is open and per domain:
     /// enumerating every screenshot of every registered domain would spend a
@@ -4682,12 +5266,20 @@ impl ServerHandler for McpServer {
         _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListResourceTemplatesResult, ErrorData> {
-        let template = ResourceTemplate::new(ATTACHMENT_URI_TEMPLATE, ATTACHMENT_TEMPLATE_NAME)
-            .with_description(ATTACHMENT_TEMPLATE_DESCRIPTION);
-        Ok(ListResourceTemplatesResult::with_all_items(vec![template]).with_cache_hints(&context))
+        let templates = vec![
+            ResourceTemplate::new(ATTACHMENT_URI_TEMPLATE, ATTACHMENT_TEMPLATE_NAME)
+                .with_description(ATTACHMENT_TEMPLATE_DESCRIPTION),
+            ResourceTemplate::new(
+                REFLECTION_ASSET_URI_TEMPLATE,
+                REFLECTION_ASSET_TEMPLATE_NAME,
+            )
+            .with_description(REFLECTION_ASSET_TEMPLATE_DESCRIPTION),
+        ];
+        Ok(ListResourceTemplatesResult::with_all_items(templates).with_cache_hints(&context))
     }
 
-    /// Read one shipped skill, or one attachment, by its resource uri.
+    /// Read one shipped skill, one attachment or one file of a Reflection, by
+    /// its resource uri.
     ///
     /// A skill answers even while `skills.serve` is off, like every hidden
     /// tool: the gate hides the surface from a listing rather than disabling
@@ -4695,11 +5287,14 @@ impl ServerHandler for McpServer {
     /// client holding a uri from an earlier listing gets the bytes rather than
     /// a puzzle.
     ///
-    /// An attachment uri is anything [`CrystallineUrl::asset_path`] recognizes
-    /// once its path has been percent-decoded (see `decoded_uri_path`), and
-    /// the bytes come back the way the file is read rather than the way it was
-    /// asked for: a text mime as `TextResourceContents`, everything else base64
-    /// in `BlobResourceContents`. This is the one place base64 is ever emitted
+    /// A file uri is anything [`CrystallineUrl::asset_ref`] recognizes once
+    /// its path has been percent-decoded (see `decoded_uri_path`): one branch
+    /// for both kinds, the right check following the kind (the caller's
+    /// engram view for an attachment, the Reflection right for a
+    /// Reflection's file, never the engram right), and the bytes come back
+    /// the way the file is read rather than the way it was asked for: a text
+    /// mime as `TextResourceContents`, everything else base64 in
+    /// `BlobResourceContents`. This is the one place base64 is ever emitted
     /// - a tool result carries links, never bytes - so a model spends the
     /// context on an image or a deck only when it decided to open it.
     async fn read_resource(
@@ -4719,24 +5314,42 @@ impl ServerHandler for McpServer {
                 permalink: decoded_uri_path(&url.permalink)?,
                 ..url
             };
-            if let Some(path) = url.asset_path() {
-                // An attachment uri names its domain outright, and nothing had
-                // to be read first to learn the name, so this is the one
-                // attachment path a caller can reach cold. A domain it may not
-                // see is refused exactly as an unregistered one - the same
-                // bytes, from the engine's own line - before the file is
-                // touched. The domain may be spelled by any of its names; one
-                // this caller may not see keeps the spelling they sent.
+            if let Some((kind, path)) = url.asset_ref() {
+                // A file of a mounted domain lives on its server: a stdio
+                // session (this machine's owner, decision D8) reads it from
+                // there, under the account's own rights on that server. An
+                // HTTP session never borrows the owner's sign-in. Asked before
+                // any local name is resolved, so a hidden local copy of the
+                // domain never answers for it.
+                if self.transport == Transport::Stdio
+                    && let Some(routed) =
+                        crate::route::routed_file(&self.engine, &url.domain, &url.permalink).await
+                {
+                    let file = routed.map_err(routed_file_error)?;
+                    return Ok(ReadResourceResult::new(vec![attachment_contents(
+                        &request.uri,
+                        file.bytes,
+                        &file.mime,
+                    )])
+                    .with_cache_hints_as(&context, CacheScope::Private)
+                    .into());
+                }
+                // A file uri names its domain outright, and nothing had to be
+                // read first to learn the name, so this is the one file path
+                // a caller can reach cold. The domain may be spelled by any
+                // of its names; one this caller may not see keeps the
+                // spelling they sent.
                 let scope = self.scope_of(&context);
                 let hidden = self.engine.hidden_for(&scope).await.map_err(to_error)?;
                 let domain = self.engine.localize_visible(&url.domain, &hidden).await;
-                self.engine
-                    .require_domain(&domain, &scope)
-                    .await
-                    .map_err(to_error)?;
-                let (bytes, row) = DomainView::for_read(&self.engine, &domain, &hidden, &scope)
-                    .map_err(to_error)?
-                    .attachment_bytes(path)
+                let (bytes, row) = self
+                    .file_bytes(
+                        kind,
+                        &domain,
+                        path,
+                        &scope,
+                        &self.reflection_caller(&context),
+                    )
                     .await
                     .map_err(to_error)?;
                 return Ok(ReadResourceResult::new(vec![attachment_contents(
@@ -4752,7 +5365,7 @@ impl ServerHandler for McpServer {
         }
         Err(ErrorData::invalid_params(
             format!(
-                "unknown resource '{}'; this server serves {} and every attachment addressed as {ATTACHMENT_URI_TEMPLATE}",
+                "unknown resource '{}'; this server serves {} and every attachment addressed as {ATTACHMENT_URI_TEMPLATE} or {REFLECTION_ASSET_URI_TEMPLATE}",
                 request.uri,
                 skill_uris()
             ),
@@ -4827,6 +5440,88 @@ fn decoded_uri_path(path: &str) -> Result<String, ErrorData> {
         ));
     }
     Ok(decoded.into_owned())
+}
+
+/// One file a read answer shows, as [`McpServer::linked_files`] lists it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct LinkedFile {
+    /// The domain-relative path: `assets/...` for an engram attachment,
+    /// `reflections/assets/...` for a Reflection's file.
+    pub path: String,
+    /// The MIME type resolved from the extension.
+    pub mime: String,
+    /// Byte length.
+    pub size: u64,
+}
+
+/// One resource link per file, under `domain`.
+fn file_links(domain: &str, files: &[LinkedFile]) -> Vec<ContentBlock> {
+    files
+        .iter()
+        .map(|file| {
+            let name = file.path.rsplit('/').next().unwrap_or(file.path.as_str());
+            ContentBlock::resource_link(
+                Resource::new(format!("crystalline://{domain}/{}", file.path), name)
+                    .with_mime_type(file.mime.clone())
+                    .with_size(file.size),
+            )
+        })
+        .collect()
+}
+
+/// `files` on a remote read answer, left out when the read shows none.
+fn with_files(value: &mut Value, files: Vec<LinkedFile>) {
+    if files.is_empty() {
+        return;
+    }
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("files".into(), json!(files));
+    }
+}
+
+/// The `files` a routed read answer carries, taken out of it and turned
+/// into resource links under `domain`, the mounted domain the call was
+/// routed for (never a name the server's answer gives). The server lists;
+/// this machine decides: an entry whose path is not a file a domain may hold
+/// is dropped, and the mime comes from the file name here
+/// ([`crate::route::file_mime`]). An answer without `files` (a 0.26 server,
+/// a read that shows no file) gives no links; a malformed list is dropped.
+fn routed_links(value: &mut Value, domain: &str) -> Vec<ContentBlock> {
+    let Some(files) = value.as_object_mut().and_then(|obj| obj.remove("files")) else {
+        return Vec::new();
+    };
+    let files: Vec<LinkedFile> = serde_json::from_value(files).unwrap_or_default();
+    let files: Vec<LinkedFile> = files
+        .into_iter()
+        .filter_map(|file| {
+            let mime = crate::route::file_mime(&file.path)?;
+            Some(LinkedFile {
+                mime: mime.to_string(),
+                ..file
+            })
+        })
+        .collect();
+    file_links(domain, &files)
+}
+
+/// A routed file read that did not answer, as `resources/read` reports it:
+/// a refusal or an argument error (the server's, word for word, or this
+/// machine's) as an input error the agent reads, a server out of reach as a
+/// server-side error.
+fn routed_file_error(e: crate::route::RouteError) -> ErrorData {
+    use crate::route::RouteError;
+    match &e {
+        RouteError::Refused(_)
+        | RouteError::Source {
+            failure:
+                crystalline_remote::RemoteFailure::Refused(_)
+                | crystalline_remote::RemoteFailure::Invalid(_),
+            ..
+        } => ErrorData::invalid_params(e.to_string(), None),
+        RouteError::Source { .. } | RouteError::Local(_) => {
+            ErrorData::internal_error(e.to_string(), None)
+        }
+    }
 }
 
 /// One attachment's bytes as resource contents, in the shape its mime asks
@@ -5472,12 +6167,18 @@ fn done_written(mut receipt: Value, base: &crate::web_url::WebBase) -> Verdict {
 /// Map an engine error to an rmcp tool error with an actionable message.
 fn to_error(e: EngineError) -> ErrorData {
     match e {
+        // The caller named something wrong: an argument error, marked with
+        // its kind so a connected machine can answer it as the same protocol
+        // error (R86).
         EngineError::UnknownDomain { .. }
         | EngineError::NotFound(_)
         | EngineError::Ambiguous(_)
         | EngineError::Conflict(_)
-        | EngineError::Invalid(_)
-        | EngineError::ReadOnly
+        | EngineError::Invalid(_) => ErrorData::invalid_params(
+            e.to_string(),
+            Some(json!({ "kind": crystalline_remote::INVALID_KIND })),
+        ),
+        EngineError::ReadOnly
         | EngineError::DomainReadOnly(_)
         // The caller asked for something they are not allowed to do, and the
         // message says who is: input-class guidance, like the read-only
@@ -5558,6 +6259,61 @@ mod tests {
     use rmcp::model::ErrorCode;
 
     use super::*;
+
+    /// reflect refuses what it does not take, so the keys it takes must be
+    /// exactly what its schema offers, plus the one flag kept out of it: a
+    /// renamed or skipped field would otherwise refuse a valid argument.
+    #[test]
+    fn reflect_takes_exactly_the_keys_its_schema_offers() {
+        let schema = serde_json::to_value(rmcp::schemars::schema_for!(ReflectParams)).unwrap();
+        let mut offered: Vec<String> = schema["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        offered.push("skip_unavailable".to_string());
+        offered.sort();
+        let mut taken = super::reflect_keys();
+        taken.sort();
+        assert_eq!(taken, offered);
+    }
+
+    /// A routed file read the server refused (a Reflection served by another
+    /// instance, a right too low) is an input error with the server's words;
+    /// a server out of reach is a server-side error.
+    #[test]
+    fn a_routed_file_refusal_is_an_input_error_in_the_servers_words() {
+        use crate::route::RouteError;
+        use crystalline_remote::RemoteFailure;
+        let hosted = "this domain's Reflection is served by alpha; move it with crystalline serve --take-over";
+        let refused = routed_file_error(RouteError::Source {
+            source: "acme".into(),
+            domain: "open".into(),
+            failure: RemoteFailure::Refused(hosted.into()),
+        });
+        assert_eq!(refused.code, ErrorCode::INVALID_PARAMS);
+        assert_eq!(refused.message, hosted);
+        let invalid = routed_file_error(RouteError::Source {
+            source: "acme".into(),
+            domain: "open".into(),
+            failure: RemoteFailure::Invalid("no such file".into()),
+        });
+        assert_eq!(invalid.code, ErrorCode::INVALID_PARAMS);
+        assert_eq!(invalid.message, "no such file");
+        let ours = routed_file_error(RouteError::Refused("too old".into()));
+        assert_eq!(ours.code, ErrorCode::INVALID_PARAMS);
+        let down = routed_file_error(RouteError::Source {
+            source: "acme".into(),
+            domain: "open".into(),
+            failure: RemoteFailure::Unreachable {
+                source: "acme".into(),
+                url: "https://acme.test".into(),
+                detail: "nothing accepts connections at that address".into(),
+            },
+        });
+        assert_eq!(down.code, ErrorCode::INTERNAL_ERROR);
+    }
 
     /// Every spelling `discard_changes` and `resolve_conflict` accept for the
     /// MANIFEST is caught, and an engram beside it is not.

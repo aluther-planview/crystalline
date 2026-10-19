@@ -17,6 +17,7 @@ import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
 
 import { documentHref } from "../base";
+import { dropHtmlComments } from "../markdown/htmlComments";
 
 /** Every tag this renderer is allowed to draw. Everything else unwraps into
  * its own children rather than becoming an element of its own. */
@@ -41,7 +42,7 @@ const components: Components = {
     return (
       <a
         href={documentHref(href)}
-        className="text-sky-700 underline underline-offset-2 hover:no-underline dark:text-sky-400"
+        className="text-link underline decoration-(--link-line) decoration-1 underline-offset-[3px] hover:no-underline"
         {...(outward ? { target: "_blank", rel: "noreferrer" } : {})}
       >
         {children}
@@ -55,6 +56,8 @@ export default function InlineMarkdownBody({ source }: { source: string }) {
     <ReactMarkdown
       allowedElements={ALLOWED_ELEMENTS}
       unwrapDisallowed
+      // A comment is a note for whoever edits the text, never shown.
+      rehypePlugins={[dropHtmlComments]}
       components={components}
     >
       {source}

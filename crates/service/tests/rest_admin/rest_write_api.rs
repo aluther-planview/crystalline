@@ -2540,6 +2540,34 @@ async fn validate_reports_findings_without_writing() {
     );
 }
 
+/// The editor's findings rail reads this answer: an unknown status colour in
+/// the body is a Q006 at the line the document holds it on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn validate_names_an_unknown_status_colour_at_its_line() {
+    let fx = serve(Options::default()).await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+    let content = ALPHA.replace("A rule about alpha.", "Build is :status[Done]{orange}.");
+    let line = content
+        .lines()
+        .position(|l| l.contains(":status["))
+        .unwrap()
+        + 1;
+    let resp = as_session(fx.addr, reqwest::Method::POST, "/api/v1/validate", &editor)
+        .json(&serde_json::json!({"domain": "eng", "path": "alpha.md", "content": content}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let q006 = body["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["rule"] == "Q006")
+        .unwrap_or_else(|| panic!("expected Q006 in {body}"));
+    assert_eq!(q006["line"], line, "{body}");
+}
+
 /// The dry run holds a document named into a domain to that domain's
 /// overrides; one named into no registered domain runs every rule at its
 /// default.
@@ -3040,6 +3068,17 @@ fn write_ops() -> Vec<WriteOp> {
             min_role: Role::Admin,
             read_only_exempt: false,
         },
+        // A kept text is dropped by a person who may write its source, and a
+        // kept comment also by its sender, who may be a reader of the
+        // Reflection: a viewer gets past authorization to the 404 of an id
+        // that names none.
+        WriteOp {
+            method: Method::DELETE,
+            path: "/api/v1/domains/eng/kept/abc12345",
+            body: None,
+            min_role: Role::Viewer,
+            read_only_exempt: false,
+        },
         // `eng` has no origin, so the allowed leg answers 409 - which is
         // exactly the "anything but 401/403" this matrix asserts, and it needs
         // no team fixture to prove the gate. The endpoint's own semantics are
@@ -3140,6 +3179,68 @@ fn write_ops() -> Vec<WriteOp> {
             path: "/api/v1/domains/eng/evolve/ack",
             body: Some(serde_json::json!({"permalink": "alpha", "rule": "V006"})),
             min_role: Role::Editor,
+            read_only_exempt: false,
+        },
+        // The Reflection's five page and thread writes. The fixture's `eng` has Reflection
+        // off, so every signed-in role passes authorization and meets the
+        // engine's 409; the Reflection's own rights are pinned in
+        // `tests/reflection/rest.rs`.
+        WriteOp {
+            method: Method::PUT,
+            path: "/api/v1/domains/eng/reflections/guides/a.md",
+            body: Some(serde_json::json!({"markdown": "# A\n"})),
+            min_role: Role::Viewer,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::DELETE,
+            path: "/api/v1/domains/eng/reflections/guides/a.md",
+            body: None,
+            min_role: Role::Viewer,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/domains/eng/reflection/move",
+            body: Some(serde_json::json!({"from": "guides/a.md", "to": "howto/a.md"})),
+            min_role: Role::Viewer,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/domains/eng/reflection/threads",
+            body: Some(serde_json::json!({"path": "guides/a.md", "section": "A", "text": "Why?"})),
+            min_role: Role::Viewer,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/domains/eng/reflection/threads/t-00000000/answer",
+            body: Some(serde_json::json!({"path": "guides/a.md", "text": "Because."})),
+            min_role: Role::Viewer,
+            read_only_exempt: false,
+        },
+        // The Reflection's three file writes, held to the same rule: every
+        // signed-in role passes authorization and meets the engine's 409.
+        WriteOp {
+            method: Method::PUT,
+            path: "/api/v1/domains/eng/reflection/assets/flow.png",
+            body: None,
+            min_role: Role::Viewer,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::DELETE,
+            path: "/api/v1/domains/eng/reflection/assets/flow.png",
+            body: None,
+            min_role: Role::Viewer,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/domains/eng/reflection/move-asset",
+            body: Some(serde_json::json!({"from": "assets/flow.png", "to": "assets/b.png"})),
+            min_role: Role::Viewer,
             read_only_exempt: false,
         },
         // Last among the domain rows, and no later row targets `scrap`: this
@@ -3657,6 +3758,26 @@ fn canonicalize(path: &str) -> String {
     // holds, so it collapses before the per-segment pass runs over the head.
     if let Some((head, _)) = path.split_once("/files/") {
         return format!("{}/files/{{path}}", canonicalize(head));
+    }
+    // A Reflection's file routes take a wildcard after
+    // `reflection/assets/`; matched before the page routes below.
+    if let Some((head, _)) = path.split_once("/reflection/assets/") {
+        return format!("{}/reflection/assets/{{path}}", canonicalize(head));
+    }
+    // The reflection routes take a wildcard too: everything after
+    // `reflections/` is the one `{path}` parameter.
+    if let Some((head, _)) = path.split_once("/reflections/") {
+        return format!("{}/reflections/{{path}}", canonicalize(head));
+    }
+    // A thread step names its thread and its action in two segments the
+    // per-segment pass below has no name for.
+    if let Some((head, rest)) = path.split_once("/reflection/threads/")
+        && rest.split('/').count() == 2
+    {
+        return format!(
+            "{}/reflection/threads/{{id}}/{{action}}",
+            canonicalize(head)
+        );
     }
     // The MCP token routes take a numeric id, which the per-segment pass
     // below cannot tell apart from the share surface's proposal number, so
@@ -4384,4 +4505,29 @@ async fn the_direct_hand_over_works_on_a_registered_domain_a_stranger_holds_priv
         "the direct hand-over the not-rolled-back message names must work with no \
          re-registration first"
     );
+}
+
+/// A domain name that differs from a registered one only in letter case is
+/// refused with 409: on a disk that ignores case the two would share one
+/// state folder. Nothing is registered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn creating_a_domain_whose_name_differs_only_in_case_is_a_conflict() {
+    let _serialized = crate::support::maintenance_guard().await;
+    let fx = serve(Options::default()).await;
+    let root = login(fx.addr, "root", "rootpw").await;
+    for mode in ["local", "virtual"] {
+        let response = as_session(fx.addr, reqwest::Method::POST, "/api/v1/domains", &root)
+            .json(&serde_json::json!({ "mode": mode, "name": "ENG" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 409, "{mode}");
+        let body: serde_json::Value = response.json().await.unwrap();
+        let detail = body["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("'ENG' differs from the domain 'eng' only in letter case"),
+            "{mode}: {detail}"
+        );
+    }
+    assert!(!fx.engine.config().domains.contains_key("ENG"));
 }

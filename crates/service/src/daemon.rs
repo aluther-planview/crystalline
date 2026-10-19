@@ -481,7 +481,10 @@ pub async fn run_serve(
     if let Ok(state) = config::state_dir() {
         engine = engine.with_state_dir(state);
     }
-    let engine = Arc::new(engine);
+    // The name other instances show for this one: the public URL's host, else
+    // this machine's hostname.
+    let name = engine.config().instance_name();
+    let engine = Arc::new(engine.with_instance_label(name));
     tokio::spawn(crate::engine::run_embed_worker(engine.clone(), embed_rx));
     // Its own task, never a shutdown step: a model download or a scoring
     // batch in flight is abandoned by `Departure`'s exit, not waited for.
@@ -778,6 +781,28 @@ pub async fn run_serve(
         let rx = shared.watch();
         tokio::spawn(async move {
             run_origin_poller(e, rx).await;
+        });
+    }
+
+    // The Reflection backup: commits a home instance's settled Reflection
+    // changes to their backup branch. A no-op tick when nothing is marked.
+    {
+        let e = engine.clone();
+        let rx = shared.watch();
+        tokio::spawn(async move {
+            run_reflection_backup(e, rx).await;
+        });
+    }
+
+    // The reflect count tick: counts every Reflection's open items for the
+    // machine owner and records them in maintenance.json, where the hooks
+    // and the remote hook_status read them. A no-op write when nothing
+    // changed; an empty map when no Reflection is on.
+    {
+        let e = engine.clone();
+        let rx = shared.watch();
+        tokio::spawn(async move {
+            run_reflect_count_tick(e, REFLECT_COUNT_HEARTBEAT, rx).await;
         });
     }
 
@@ -1256,7 +1281,7 @@ async fn run_watcher(
     let mut domains: Vec<(String, PathBuf)> = Vec::new();
     for (name, root) in startup {
         match engine.claim_host(&name, take_over).await {
-            Ok(HostClaim::Acquired) => {
+            Ok(HostClaim::Acquired { .. }) => {
                 if let Err(err) = watcher.watch(&root, RecursiveMode::Recursive) {
                     tracing::warn!(
                         "could not watch domain '{name}' at {}: {err}",
@@ -1267,7 +1292,8 @@ async fn run_watcher(
             }
             Ok(HostClaim::HeldByOther(host)) => {
                 tracing::info!(
-                    "domain '{name}' is hosted by instance {} (last heartbeat {}); not watching, serving read-from-database only",
+                    "domain '{name}' is hosted by {} (instance {}, last heartbeat {}); not watching, serving read-from-database only",
+                    host.label,
                     host.instance_id,
                     host.heartbeat_at
                 );
@@ -1287,13 +1313,22 @@ async fn run_watcher(
             _ = wait_true(&mut shutdown) => break,
             event = new_roots.recv() => {
                 match event {
+                    Some(WatchEvent::Add(name, _)) if domains.iter().any(|(n, _)| *n == name) => {
+                        // A domain this daemon watches already and took back
+                        // from another instance: its watch never stopped, but
+                        // what changed on disk while another host held it was
+                        // not walked here, so one catch-up sync walks it now.
+                        if let Err(err) = engine.sync(Some(name.as_str())).await {
+                            tracing::warn!("catch-up sync of domain '{name}' taken back failed: {err}");
+                        }
+                    }
                     Some(WatchEvent::Add(name, root)) => {
                         if !domains.iter().any(|(n, _)| *n == name) {
                             // Claim the host lock before arming, as at startup: a
                             // domain another live instance hosts is not watched
                             // here and is served read-from-database only.
                             match engine.claim_host(&name, false).await {
-                                Ok(HostClaim::Acquired) => {
+                                Ok(HostClaim::Acquired { .. }) => {
                                     let armed = match watcher.watch(&root, RecursiveMode::Recursive) {
                                         Ok(()) => true,
                                         Err(err) => {
@@ -1323,7 +1358,8 @@ async fn run_watcher(
                                 }
                                 Ok(HostClaim::HeldByOther(host)) => {
                                     tracing::info!(
-                                        "new domain '{name}' is hosted by instance {}; not watching, serving read-from-database only",
+                                        "new domain '{name}' is hosted by {} (instance {}); not watching, serving read-from-database only",
+                                        host.label,
                                         host.instance_id
                                     );
                                 }
@@ -2626,7 +2662,11 @@ async fn health() -> axum::Json<Value> {
 /// Renew this instance's host locks every `secs` seconds until shutdown, so a
 /// live host is never mistaken for stale. The first tick is consumed so renewal
 /// starts one interval in, after the startup claims have settled.
-async fn run_heartbeat(engine: Arc<Engine>, secs: u64, mut shutdown: watch::Receiver<bool>) {
+pub(crate) async fn run_heartbeat(
+    engine: Arc<Engine>,
+    secs: u64,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let mut ticker = tokio::time::interval(Duration::from_secs(secs.max(1)));
     ticker.tick().await;
     loop {
@@ -2785,6 +2825,51 @@ async fn run_origin_poller(engine: Arc<Engine>, mut shutdown: watch::Receiver<bo
     }
 }
 
+/// How often the Reflection backup looks for due changes.
+const REFLECTION_BACKUP_HEARTBEAT: Duration = Duration::from_secs(5);
+
+/// Run the Reflection backup tick until shutdown.
+async fn run_reflection_backup(engine: Arc<Engine>, mut shutdown: watch::Receiver<bool>) {
+    // The marks live in memory: a change made before this start is looked
+    // at once, so a restart never leaves it waiting for the next change.
+    engine.mark_every_reflection_for_backup();
+    let mut ticker = tokio::time::interval(REFLECTION_BACKUP_HEARTBEAT);
+    loop {
+        tokio::select! {
+            _ = wait_true(&mut shutdown) => break,
+            _ = ticker.tick() => {
+                engine.reflection_backup_tick(Instant::now()).await;
+            }
+        }
+    }
+}
+
+/// How often the daemon recounts open reflect items for the hooks. A daily
+/// nudge does not need fresher counts, and a count runs the detection over
+/// every Reflection here.
+pub const REFLECT_COUNT_HEARTBEAT: Duration = Duration::from_secs(300);
+
+/// Run the reflect count tick until shutdown. The interval's first tick is
+/// immediate and is kept, so a daemon that starts after plain-editor edits
+/// records fresh counts at once.
+async fn run_reflect_count_tick(
+    engine: Arc<Engine>,
+    cadence: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut ticker = tokio::time::interval(cadence);
+    loop {
+        tokio::select! {
+            _ = wait_true(&mut shutdown) => break,
+            _ = ticker.tick() => {
+                if let Err(e) = engine.record_reflect_counts().await {
+                    tracing::debug!("reflect counts not recorded: {e}");
+                }
+            }
+        }
+    }
+}
+
 /// How often the embed self-heal tick wakes to re-fire the worker when a
 /// backlog remains. Low by design: the worker is event-driven and this only
 /// closes the gap a transient provider failure opens, so it never needs to run
@@ -2799,7 +2884,8 @@ const EMBED_TICK: Duration = Duration::from_secs(300);
 /// falls back to an inline embed when no worker is wired (an inline pass on this
 /// timer would reintroduce the request-path stall the worker exists to
 /// prevent), so an unwired tick is a silent no-op. The cadence is a parameter so
-/// a test can drive it fast; production passes `EMBED_TICK`.
+/// a test can drive it fast; production passes `EMBED_TICK`. Either backlog
+/// fires it: the engram chunks' or the Reflection's (R55).
 ///
 /// "A backlog remains" is not on its own the condition to fire: it stays true
 /// for the whole life of a pass that is working through one, so a first index
@@ -2809,7 +2895,8 @@ const EMBED_TICK: Duration = Duration::from_secs(300);
 /// live tick lands one cadence in rather than the moment the daemon starts.
 ///
 /// The same tick drives the contradiction pass: it drops an idle NLI model
-/// and, when nothing is left to embed, asks for a contradiction pass while
+/// and, when no engram chunk is left to embed (whatever the Reflection's
+/// chunks wait for), asks for a contradiction pass while
 /// that pass's pending count is unknown or non-zero, which is how a daemon
 /// that starts fully embedded still scores and how a pair a failed batch left
 /// is retried once per tick rather than in a loop. A failed model load is not
@@ -2838,6 +2925,11 @@ pub async fn run_embed_tick(
                 if engine.embed_in_flight() {
                     continue;
                 }
+                // The reflection backlog asks for an embed too, but never
+                // holds back the contradiction pass, which reads engram
+                // vectors only (R55). A failed reflection probe costs one
+                // tick, never the pass.
+                let pages = engine.reflection_embedding_backlog().await.unwrap_or(0);
                 match engine.embedding_backlog().await {
                     // Nothing left to embed is when the contradiction pass
                     // sees every lead vector: asked while its pending count is
@@ -2854,6 +2946,9 @@ pub async fn run_embed_tick(
                         engine.recheck_contradiction_claims().await;
                         if engine.contradictions_wanted() {
                             engine.request_contradictions();
+                        }
+                        if pages > 0 {
+                            engine.request_embed();
                         }
                     }
                     Ok(_) => {
@@ -3214,15 +3309,62 @@ fn classify_in_root(path: &Path, root: &Path) -> DirtyKind {
         // the prefix matched): the safe side is a full rescan.
         return DirtyKind::Escalate;
     };
-    // Hidden paths (dotfiles, anything under a dot-directory) are pruned by the
-    // scan walk, so they never map to an engram: ignore them, matching the walk.
-    if rel.split('/').any(is_hidden) {
-        return DirtyKind::Ignore;
+    // The watcher never looked at artifact folders, so a bare layout (no
+    // MANIFEST read per event) answers what it answered for them. It has no
+    // index to tell a pending switch from an effective one either, so it
+    // classifies as if every domain's Reflection were in effect and lets the
+    // targeted pass decide: `scan_paths` routes with the mode in effect, so
+    // for a domain without a Reflection a path under `reflections/` wakes at
+    // most one pass that finds an ordinary engram, as before, or nothing.
+    let layout = crystalline_core::DomainLayout::bare(crystalline_core::ReflectionMode::Effective);
+    let class = layout.classify(&rel);
+    // A Reflection's pages, the pact, threads and files are indexed, so a
+    // change to one wakes a targeted pass, present or gone. The hidden
+    // baseline and anything else in the folder are no rows; a vanished
+    // `Other` path may have been a folder, so it escalates as every other
+    // vanished non-markdown path does, unless it is hidden or an OKF
+    // reserved name, which no walk ever reads. The hidden-segment test is
+    // inline: a hidden path inside the folder arrives here as `Baseline` or
+    // `Other`, never as `Hidden`.
+    if let crystalline_core::PathClass::Reflection(file) = &class {
+        use crystalline_core::reflection::ReflectionFile;
+        return match file {
+            ReflectionFile::Page(_)
+            | ReflectionFile::Pact
+            | ReflectionFile::Threads { .. }
+            | ReflectionFile::Asset(_) => DirtyKind::Path(rel),
+            ReflectionFile::Baseline { .. } => DirtyKind::Ignore,
+            // Markdown the folder holds as no page (`assets/notes.md`, an
+            // upper-case `.MD`) is an engram while the domain keeps no
+            // Reflection, so it wakes a pass as it always did.
+            ReflectionFile::Other
+                if crystalline_core::DomainLayout::bare(crystalline_core::ReflectionMode::Off)
+                    .classify(&rel)
+                    == crystalline_core::PathClass::Engram =>
+            {
+                DirtyKind::Path(rel)
+            }
+            ReflectionFile::Other
+                if path.exists()
+                    || crystalline_core::is_reserved_path(&rel)
+                    || rel
+                        .split('/')
+                        .any(|s| s.starts_with('.') && s != "." && s != "..") =>
+            {
+                DirtyKind::Ignore
+            }
+            ReflectionFile::Other => DirtyKind::Escalate,
+        };
     }
-    // The OKF reserved names are never indexed (see the sync walk), and
-    // `index.md` is generated by Crystalline itself: ignoring both here keeps a
-    // regeneration from feeding the dirty-path loop it would otherwise trigger.
-    if crystalline_core::is_reserved_path(&rel) {
+    // Hidden paths (dotfiles, anything under a dot-directory) are pruned by the
+    // scan walk, so they never map to an engram, and the OKF reserved names are
+    // never indexed (see the sync walk). `index.md` is generated by Crystalline
+    // itself: ignoring both here keeps a regeneration from feeding the
+    // dirty-path loop it would otherwise trigger.
+    if matches!(
+        class,
+        crystalline_core::PathClass::Hidden | crystalline_core::PathClass::Reserved
+    ) {
         return DirtyKind::Ignore;
     }
     let is_md = rel.to_lowercase().ends_with(".md");
@@ -3236,7 +3378,7 @@ fn classify_in_root(path: &Path, root: &Path) -> DirtyKind {
     // refusals match it: on APFS and NTFS a directory differing only in case is
     // the same directory, and the targeted pass folds the path back to the one
     // spelling rows are keyed by.
-    let is_asset = crystalline_core::is_under_assets(&rel)
+    let is_asset = class == crystalline_core::PathClass::EngramAsset
         && rel
             .rsplit('/')
             .next()
@@ -3280,12 +3422,6 @@ fn clean_rel(root: &Path, path: &Path) -> Option<String> {
     } else {
         Some(parts.join("/"))
     }
-}
-
-/// Whether a single path component is hidden (a dotfile or dot-directory),
-/// mirroring the scan walk's own pruning.
-fn is_hidden(name: &str) -> bool {
-    name.starts_with('.') && name != "." && name != ".."
 }
 
 // --- config + path resolution -----------------------------------------------
@@ -3559,6 +3695,75 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A domain the watcher already watches, handed to it again because
+    /// this daemon took its lock back from another instance, gets one
+    /// catch-up sync: what changed on disk while another host held it was
+    /// never walked here, and its watch saw nothing new.
+    #[tokio::test]
+    async fn a_domain_taken_back_gets_a_catch_up_walk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("eng");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("a.md"),
+            "---\ntype: engram\ntitle: A\npermalink: a\nstatus: stable\n---\n\n# A\n",
+        )
+        .unwrap();
+        let mut cfg = crystalline_core::config::GlobalConfig::default();
+        cfg.domains.insert(
+            "eng".to_string(),
+            crystalline_core::config::DomainEntry::file(root.clone()),
+        );
+        let store = crystalline_index::TursoStore::open_in_memory()
+            .await
+            .unwrap();
+        let (watch_tx, watch_rx) = tokio::sync::mpsc::unbounded_channel();
+        let engine = Arc::new(
+            Engine::new(
+                Arc::new(tokio::sync::Mutex::new(store)),
+                cfg,
+                None,
+                Some(tmp.path().join("config.yaml")),
+            )
+            .with_instance_id("this-machine".to_string())
+            .with_watch_channel(watch_tx.clone()),
+        );
+        let (stop, stopped) = watch::channel(false);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let watcher = tokio::spawn(run_watcher(
+            engine.clone(),
+            vec![("eng".to_string(), root.clone())],
+            false,
+            stopped,
+            watch_rx,
+            ready_tx,
+        ));
+        ready_rx.await.unwrap();
+        let indexed = || async {
+            let store = engine.store();
+            let store = store.lock().await;
+            match store.domain_id("eng").await.unwrap() {
+                Some(id) => store.file_stamps(id).await.unwrap().contains_key("a.md"),
+                None => false,
+            }
+        };
+        assert!(!indexed().await, "arming a watch walks nothing");
+        watch_tx
+            .send(WatchEvent::Add("eng".to_string(), root.clone()))
+            .unwrap();
+        let mut walked = false;
+        for _ in 0..100 {
+            if indexed().await {
+                walked = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let _ = stop.send(true);
+        let _ = watcher.await;
+        assert!(walked, "the domain taken back is walked once");
+    }
 
     /// The default filter quiets the model download library's crates, which
     /// log every transfer step at info (dozens of lines a second during a
@@ -4687,6 +4892,51 @@ mod tests {
         assert!(matches!(
             classify_in_root(&root.join("scratch.txt"), &root),
             DirtyKind::Ignore
+        ));
+    }
+
+    /// The Reflection's files wake a targeted pass, present or gone, as an
+    /// engram attachment does; its baseline and a stray file never do.
+    #[test]
+    fn classify_tracks_files_under_the_reflection_assets_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(root.join("reflections/assets/deep")).unwrap();
+        std::fs::create_dir_all(root.join("reflections/.reflected")).unwrap();
+        std::fs::write(root.join("reflections/assets/deep/flow.png"), "x").unwrap();
+        std::fs::write(root.join("reflections/assets/tool.exe"), "x").unwrap();
+        std::fs::write(root.join("reflections/picture.png"), "x").unwrap();
+        std::fs::write(root.join("reflections/.reflected/a.md"), "x").unwrap();
+        assert!(matches!(
+            classify_in_root(&root.join("reflections/assets/deep/flow.png"), &root),
+            DirtyKind::Path(p) if p == "reflections/assets/deep/flow.png"
+        ));
+        assert!(matches!(
+            classify_in_root(&root.join("reflections/assets/gone.png"), &root),
+            DirtyKind::Path(p) if p == "reflections/assets/gone.png"
+        ));
+        assert!(matches!(
+            classify_in_root(&root.join("reflections/assets/tool.exe"), &root),
+            DirtyKind::Ignore
+        ));
+        assert!(matches!(
+            classify_in_root(&root.join("reflections/picture.png"), &root),
+            DirtyKind::Ignore
+        ));
+        assert!(matches!(
+            classify_in_root(&root.join("reflections/.reflected/a.md"), &root),
+            DirtyKind::Ignore
+        ));
+        assert!(matches!(
+            classify_in_root(&root.join("reflections/.reflected/gone.md"), &root),
+            DirtyKind::Ignore
+        ));
+        // Markdown that is no page is an engram while the switch is off, so
+        // it wakes a pass as it did before the Reflection existed.
+        std::fs::write(root.join("reflections/assets/notes.md"), "x").unwrap();
+        assert!(matches!(
+            classify_in_root(&root.join("reflections/assets/notes.md"), &root),
+            DirtyKind::Path(p) if p == "reflections/assets/notes.md"
         ));
     }
 

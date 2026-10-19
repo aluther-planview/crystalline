@@ -36,7 +36,9 @@ use crate::yaml::YamlValue;
 /// - 0: every index before the generation was recorded.
 /// - 1: a bullet that wraps onto further lines is one observation or
 ///   relation (0.22).
-pub const PARSE_GENERATION: u32 = 1;
+/// - 2: task boxes (`[ ]`, `[x]`, `[X]`, `[~]`) and directive-led bullets
+///   stopped reading as observations and relations (0.28.0).
+pub const PARSE_GENERATION: u32 = 2;
 
 /// An error encountered while parsing an Engram.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -436,48 +438,14 @@ pub(crate) struct BodyLine<'a> {
 /// the fence markers themselves) are flagged `in_fence`.
 pub(crate) fn body_lines(body: &str, body_line_start: usize) -> Vec<BodyLine<'_>> {
     let mut out = Vec::new();
-    let mut fence: Option<(char, usize)> = None;
+    let mut fence = FenceTracker::new();
     for (i, raw) in body.split('\n').enumerate() {
         let text = raw.trim_end_matches('\r');
-        let line_no = body_line_start + i;
-        match fence {
-            None => {
-                if let Some((c, n, _)) = fence_marker(text) {
-                    fence = Some((c, n));
-                    out.push(BodyLine {
-                        line_no,
-                        text,
-                        in_fence: true,
-                    });
-                } else {
-                    out.push(BodyLine {
-                        line_no,
-                        text,
-                        in_fence: false,
-                    });
-                }
-            }
-            Some((fc, fcount)) => {
-                let mut closes = false;
-                if let Some((c, n, _)) = fence_marker(text)
-                    && c == fc
-                    && n >= fcount
-                {
-                    let after = &text.trim_start()[n..];
-                    if after.trim().is_empty() {
-                        closes = true;
-                    }
-                }
-                out.push(BodyLine {
-                    line_no,
-                    text,
-                    in_fence: true,
-                });
-                if closes {
-                    fence = None;
-                }
-            }
-        }
+        out.push(BodyLine {
+            line_no: body_line_start + i,
+            text,
+            in_fence: fence.in_fence(text),
+        });
     }
     out
 }
@@ -701,7 +669,7 @@ fn bullet_text<'a>(first: &'a str, continuation: &[BodyLine<'_>]) -> Cow<'a, str
 }
 
 /// Parse an ATX heading, returning `(level, text)`.
-pub(crate) fn parse_heading(line: &str) -> Option<(u8, String)> {
+pub fn parse_heading(line: &str) -> Option<(u8, String)> {
     let indent = line.len() - line.trim_start_matches(' ').len();
     if indent > 3 {
         return None;
@@ -751,6 +719,48 @@ pub(crate) fn fence_marker(line: &str) -> Option<(char, usize, usize)> {
     Some((first, count, indent))
 }
 
+/// The one fenced-code rule, shared by every walk over a body's lines. A
+/// fence opens on a marker (see `fence_marker`) and closes only on a marker of
+/// the same character, at least as long, with nothing after it.
+///
+/// Feed it each line in order, line ending already stripped.
+#[derive(Debug, Default, Clone)]
+pub struct FenceTracker {
+    open: Option<(char, usize)>,
+}
+
+impl FenceTracker {
+    /// A tracker outside any fence.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Advance over one line. True for an opening or closing marker line and
+    /// for every line inside the fence, false for a line outside fenced code.
+    pub fn in_fence(&mut self, line: &str) -> bool {
+        match self.open {
+            None => {
+                if let Some((c, n, _)) = fence_marker(line) {
+                    self.open = Some((c, n));
+                    true
+                } else {
+                    false
+                }
+            }
+            Some((open_char, open_count)) => {
+                if let Some((c, n, _)) = fence_marker(line)
+                    && c == open_char
+                    && n >= open_count
+                    && line.trim_start()[n..].trim().is_empty()
+                {
+                    self.open = None;
+                }
+                true
+            }
+        }
+    }
+}
+
 fn top_level_bullet(line: &str) -> Option<&str> {
     // Zero indent only; nested or indented bullets are not observations or
     // relations.
@@ -767,6 +777,10 @@ pub(crate) fn split_category(content: &str) -> Option<(&str, &str)> {
     let close = rest.find(']')?;
     let category = &rest[..close];
     if category.is_empty() || category.contains('[') {
+        return None;
+    }
+    // A GFM task box, open, done or not applicable, is not a category.
+    if matches!(category, " " | "x" | "X" | "~") {
         return None;
     }
     let after = &rest[close + 1..];
@@ -822,7 +836,7 @@ pub(crate) fn is_hashtag(token: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '/')
 }
 
-fn parse_relation(content: &str) -> Option<(String, LinkTarget)> {
+pub(crate) fn parse_relation(content: &str) -> Option<(String, LinkTarget)> {
     let open = content.find("[[")?;
     let after = &content[open + 2..];
     let close = after.find("]]")?;
@@ -831,7 +845,10 @@ fn parse_relation(content: &str) -> Option<(String, LinkTarget)> {
 
     let rel_type = if before.len() >= 2 && before.starts_with('"') && before.ends_with('"') {
         before[1..before.len() - 1].to_string()
-    } else if !before.is_empty() && !before.contains(char::is_whitespace) {
+    } else if !before.is_empty()
+        && !before.contains(char::is_whitespace)
+        && !before.starts_with([':', '['])
+    {
         before.to_string()
     } else {
         return None;
@@ -914,6 +931,39 @@ mod tests {
     // change observable output.
 
     #[test]
+    fn fence_tracker_closes_only_on_the_same_marker_at_least_as_long_with_nothing_after() {
+        let mut fence = FenceTracker::new();
+        assert!(!fence.in_fence("prose"));
+        assert!(fence.in_fence("````"), "the opener is a fence line");
+        assert!(fence.in_fence("```"), "a shorter run does not close");
+        assert!(fence.in_fence("~~~~"), "another character does not close");
+        assert!(
+            fence.in_fence("```` tail"),
+            "text after the run does not close"
+        );
+        assert!(
+            fence.in_fence("   `````  "),
+            "a longer run closes, the closer is a fence line"
+        );
+        assert!(!fence.in_fence("after"), "the fence is shut");
+        assert!(fence.in_fence("~~~"), "a tilde fence opens");
+        assert!(fence.in_fence("    ```"), "indent over three is content");
+        assert!(fence.in_fence("~~~"));
+        assert!(!fence.in_fence("done"));
+
+        // A fence that is never closed runs to the end of the input: every
+        // line after the opener stays inside it.
+        let mut unclosed = FenceTracker::new();
+        assert!(unclosed.in_fence("```rust"), "the opener is a fence line");
+        assert!(unclosed.in_fence("let x = 1;"));
+        assert!(
+            unclosed.in_fence("``` trailing"),
+            "text after the run does not close"
+        );
+        assert!(unclosed.in_fence(""), "an empty last line is still inside");
+    }
+
+    #[test]
     fn mask_inline_code_leaves_unterminated_backtick_run_unmasked() {
         let line = "text `unterminated [[Link]] end";
         assert_eq!(mask_inline_code(line), line);
@@ -983,6 +1033,45 @@ mod tests {
 
     fn observations_of(body: &str) -> Vec<Observation> {
         scan_body(body, 1).0
+    }
+
+    #[test]
+    fn task_items_are_not_observations() {
+        for line in [
+            "- [ ] ship it\n",
+            "- [x] ship it\n",
+            "- [X] ship it\n",
+            "- [~] ship it\n",
+        ] {
+            assert!(
+                observations_of(line).is_empty(),
+                "{line:?} read as an observation"
+            );
+        }
+        // A real category still parses.
+        assert_eq!(observations_of("- [fact] ship it\n")[0].category, "fact");
+    }
+
+    #[test]
+    fn a_directive_or_task_box_is_never_a_relation_type() {
+        for body in [
+            "- :status[Done]{green} [[Target]]\n",
+            "- [x] [[Target]]\n",
+            "- [ ] [[Target]]\n",
+        ] {
+            let (_, relations, links, _) = scan_body(body, 1);
+            assert!(relations.is_empty(), "{body:?} read as a relation");
+            assert_eq!(
+                links.len(),
+                1,
+                "the wikilink stays a prose link in {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_parse_generation_moved_for_task_items() {
+        assert_eq!(PARSE_GENERATION, 2);
     }
 
     #[test]
@@ -1185,5 +1274,31 @@ mod tests {
             .collect();
         assert_eq!(lines, vec![(7, 8), (9, 9)]);
         assert_eq!(engram.observations[0].content, "one continued");
+    }
+
+    // The Fluid engram page shows this field on its meta line, so a block
+    // scalar, a plain continuation and a trailing comment must all come out
+    // as the one-line text a reader sees.
+    #[test]
+    fn description_reads_block_scalars_continuations_and_comments() {
+        let engram = |description: &str| {
+            let source =
+                format!("---\ntype: guide\ntitle: T\ndescription: {description}\n---\n\n# T\n");
+            parse_engram(&source).unwrap().frontmatter.description
+        };
+        assert_eq!(
+            engram(">-\n  Why we deploy\n  at night").as_deref(),
+            Some("Why we deploy at night")
+        );
+        assert_eq!(engram("|-\n  one\n  two").as_deref(), Some("one\ntwo"));
+        assert_eq!(
+            engram("Plain text\n  that continues").as_deref(),
+            Some("Plain text that continues")
+        );
+        assert_eq!(
+            engram("\"quoted\n  across lines\"").as_deref(),
+            Some("quoted across lines")
+        );
+        assert_eq!(engram("kept # a comment").as_deref(), Some("kept"));
     }
 }

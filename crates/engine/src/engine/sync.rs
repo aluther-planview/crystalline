@@ -1,5 +1,5 @@
 use super::*;
-use crystalline_index::SnapshotChoice;
+use crystalline_index::{ChunkTable, SnapshotChoice};
 
 impl Engine {
     // --- sync / reindex (ctl + CLI) ------------------------------------------
@@ -109,6 +109,39 @@ impl Engine {
     /// named one and `take_over` forces the claim. Outside collaboration mode
     /// (standalone, single-instance) nothing is claimed and every target syncs.
     pub async fn sync_take_over(&self, only: Option<&str>, take_over: bool) -> Result<Value> {
+        self.sync_with(only, take_over, false).await
+    }
+
+    /// [`Engine::sync_take_over`], and with `accept_disk` the walk of the
+    /// one named domain ends an unresolved host move (Task 50): it deletes
+    /// the rows of files this disk does not have, as an ordinary walk does,
+    /// instead of keeping and reporting them (`crystalline sync --domain
+    /// <name> --accept-disk`). Refused without a named domain, so dropping
+    /// rows is always asked of one domain at a time.
+    pub async fn sync_with(
+        &self,
+        only: Option<&str>,
+        take_over: bool,
+        accept_disk: bool,
+    ) -> Result<Value> {
+        if accept_disk && only.is_none() {
+            return Err(EngineError::Invalid(
+                crystalline_index::ACCEPT_DISK_NEEDS_DOMAIN.to_string(),
+            ));
+        }
+        let walked = self.sync_walk(only, take_over, accept_disk).await;
+        // A one-shot command gives back the locks it took, success or not.
+        self.release_taken_hosts().await;
+        walked
+    }
+
+    /// The body of [`Engine::sync_with`].
+    async fn sync_walk(
+        &self,
+        only: Option<&str>,
+        take_over: bool,
+        accept_disk: bool,
+    ) -> Result<Value> {
         let _activity = ActivityState::begin(&self.activity, "sync", only);
         let targets = self.sync_targets(only)?;
         // The virtual domains have no files to walk, but an older parser may
@@ -118,6 +151,7 @@ impl Engine {
         // never holds up the others or the file domains.
         let mut failed = self.reparse_virtual_domains(only).await?;
         let collab = !self.instance_id.is_empty();
+        let anonymous = self.walks_no_file_domain().await;
         // Each domain this run applied, paired with the report its apply
         // produced, for the final cross-domain resolution pass. A domain that
         // was skipped (hosted elsewhere) or failed to scan wrote nothing and is
@@ -144,24 +178,29 @@ impl Engine {
                 skipped.push(json!({ "domain": name, "renaming": true }));
                 continue;
             };
+            if let Some(reason) = &anonymous {
+                if only.is_some() {
+                    return Err(EngineError::Conflict(reason.clone()));
+                }
+                skipped.push(json!({ "domain": name, "reason": reason }));
+                continue;
+            }
             let (domain, snapshot, force) = {
                 let store = self.store.lock().await;
                 if collab {
                     match self.claim_file_host(&*store, name, root, take_over).await? {
-                        HostClaim::Acquired => {}
+                        HostClaim::Acquired { .. } => {}
                         HostClaim::HeldByOther(host) => {
+                            let reason = host_refusal(name, &host);
                             if only.is_some() {
-                                return Err(EngineError::Conflict(host_refusal(name, &host)));
+                                return Err(EngineError::Conflict(reason));
                             }
-                            tracing::info!(
-                                "domain '{name}' is hosted by instance {} (last heartbeat {}); serving it read-from-database only",
-                                host.instance_id,
-                                host.heartbeat_at
-                            );
+                            tracing::info!("sync skipped: {reason}");
                             skipped.push(json!({
                                 "domain": name,
                                 "hosted_by": host.instance_id,
                                 "heartbeat_at": host.heartbeat_at,
+                                "reason": reason,
                             }));
                             continue;
                         }
@@ -178,7 +217,15 @@ impl Engine {
                 (domain, snapshot, force)
             };
             let scan = match scan_domain(name, root, snapshot, &self.chunk_params, force).await {
-                Ok(scan) => scan,
+                Ok(mut scan) => {
+                    if accept_disk {
+                        scan.accept_disk();
+                    }
+                    if collab {
+                        scan.walked_by(&self.instance_id);
+                    }
+                    scan
+                }
                 Err(e) if only.is_none() => {
                     // One denied domain must not block the rest of the
                     // sweep; its error is carried in the result and the
@@ -189,12 +236,39 @@ impl Engine {
                 }
                 Err(e) => return Err(e.into()),
             };
-            let report = {
+            self.take_apply_hold().await;
+            let outcome = {
                 let store = self.store.lock().await;
-                apply_scan(&*store, domain, scan)
-                    .await
-                    .map_err(|e| EngineError::Internal(format!("sync of '{name}' failed: {e}")))?
+                apply_scan(&*store, domain, scan).await
             };
+            let report = match outcome {
+                Ok(report) => report,
+                // Another instance took the domain over while this walk ran:
+                // nothing was written. A full sweep reports it and goes on, a
+                // named sync is refused.
+                Err(e @ (IndexError::NotHost(_) | IndexError::HostMoveChanged(_))) => {
+                    // Only a lock another instance holds now ends hosting
+                    // here; a move another walk of this instance wrote first
+                    // leaves this instance the host.
+                    if matches!(e, IndexError::NotHost(_)) {
+                        self.lost_host(name);
+                    }
+                    let why = e.to_string();
+                    if only.is_some() {
+                        return Err(EngineError::Conflict(why));
+                    }
+                    tracing::warn!("{why}");
+                    failed.push(json!({ "domain": name, "error": why }));
+                    continue;
+                }
+                Err(e) => {
+                    return Err(EngineError::Internal(format!(
+                        "sync of '{name}' failed: {e}"
+                    )));
+                }
+            };
+            self.bump_after_apply(name, &report);
+            self.after_host_move_resolved(name, &report);
             // Files changed under us, so the generated index files follow.
             if changed_anything(&report) {
                 self.refresh_index_files(name).await;
@@ -202,7 +276,12 @@ impl Engine {
             // The files are in; the drafts no file describes come back from the
             // journal. A no-op on every sync but the first one after a rebuild.
             self.restore_overlays_quietly(name).await;
-            self.announce_report(name, &report, None);
+            let threads_heard = self.announce_report(name, &report, None);
+            if report.reflections_changed > 0 || threads_heard {
+                // A plain editor changed the Reflection: an edit, settled
+                // after a minute without another one.
+                self.mark_reflection_dirty(name, crate::reflection_backup::BackupCause::Edit);
+            }
             applied.push((domain, report));
         }
         // A full run has claimed every file domain this instance can host,
@@ -271,35 +350,175 @@ impl Engine {
         paths: Vec<String>,
         actor: Option<&str>,
     ) -> Result<SyncReport> {
+        // Only the MANIFEST (the switch) and a file under `reflections/` (an
+        // engram there holds the switch pending) can move the Reflection's
+        // mode.
+        let may_move_mode = paths.iter().any(|p| may_move_reflection_mode(p));
+        let walked = self.sync_paths_walk(name, paths, actor).await;
+        // A pass that changed the Reflection's mode (a MANIFEST edited by
+        // hand, the last engram under `reflections/` given a page marker, a
+        // pull) reclassified only the paths it was handed: the domain is
+        // walked whole once, after the pass gave its sync slot back.
+        if may_move_mode && let Ok((_, true)) = &walked {
+            self.heal_reflection_rows(name).await;
+        }
+        // A one-shot command gives back the lock it took, success or not.
+        self.release_taken_hosts().await;
+        walked.map(|(report, _)| report)
+    }
+
+    /// Walk file domain `name` whole when its index rows disagree with the
+    /// Reflection mode in effect (see [`Engine::reflection_rows_out_of_step`]),
+    /// so the Reflection and the engram index are complete without anyone
+    /// touching a file. Runs once and never asks again: a walk that keeps
+    /// rows on purpose (an unreadable folder) must not turn every later call
+    /// into another walk. A failure is logged, never returned: the write or
+    /// the pass that called this has landed, and the next sync tries again.
+    ///
+    /// The caller holds no store lock and no sync slot of the domain.
+    pub(super) async fn heal_reflection_rows(&self, name: &str) {
+        match self.reflection_rows_out_of_step(name).await {
+            Ok(false) => {}
+            Ok(true) => {
+                tracing::info!(
+                    "the Reflection of '{name}' changed its mode; walking the domain whole"
+                );
+                match self.sync(Some(name)).await {
+                    Ok(_) => {}
+                    // Another instance hosts the domain (or this engine walks
+                    // none on a shared database): the host's own pass mends
+                    // its rows, so this is no fault here.
+                    Err(EngineError::Conflict(why)) => {
+                        tracing::info!("the walk of '{name}' is left to its host: {why}");
+                    }
+                    Err(e) => {
+                        tracing::warn!("walking '{name}' after its Reflection changed failed: {e}");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("could not check the Reflection rows of '{name}': {e}");
+            }
+        }
+    }
+
+    /// [`Engine::heal_reflection_rows`] after a write that reindexed only
+    /// `path` of `domain`, when that path can move the Reflection's mode:
+    /// the MANIFEST (the switch) or a file under `reflections/` (an engram
+    /// there holds a switch pending).
+    pub(super) async fn heal_reflection_rows_after(&self, domain: &str, path: &str) {
+        if may_move_reflection_mode(path) {
+            self.heal_reflection_rows(domain).await;
+        }
+    }
+
+    /// Whether the index of file domain `name` disagrees with the Reflection
+    /// mode in effect, which only a walk of the whole domain mends:
+    ///
+    /// - in effect, and an engram row sits under `reflections/` (a page
+    ///   indexed while the switch was off or pending, or by an older
+    ///   version), or no page and no file has a row while the folder holds
+    ///   one (a page that never was an engram);
+    /// - not in effect (off or pending), and a page or a Reflection file
+    ///   still has a row.
+    ///
+    /// A domain with an unresolved host move answers `false`: its walk keeps
+    /// the rows it does not see on purpose, and the walk that resolves the
+    /// move mends them.
+    async fn reflection_rows_out_of_step(&self, name: &str) -> Result<bool> {
+        let ContentSource::File { root } = self.read_source(name) else {
+            return Ok(false);
+        };
+        let mode = self.reflection_mode(name).await?;
+        {
+            let store = self.store.lock().await;
+            let Some(id) = store.domain_id(name).await? else {
+                return Ok(false);
+            };
+            if store.shares_database() && store.host_move_text(id).await?.is_some() {
+                return Ok(false);
+            }
+            if mode == crystalline_core::ReflectionMode::Effective
+                && !store.engram_rows_under_reflections(id, 1).await?.is_empty()
+            {
+                return Ok(true);
+            }
+            let rows = store.has_reflection_rows(id).await?;
+            match mode {
+                crystalline_core::ReflectionMode::Off => return Ok(rows),
+                crystalline_core::ReflectionMode::Effective if rows => return Ok(false),
+                crystalline_core::ReflectionMode::Effective => {}
+            }
+        }
+        tokio::task::spawn_blocking(move || crystalline_index::reflection_files_on_disk(&root))
+            .await
+            .map_err(|e| {
+                EngineError::Internal(format!(
+                    "the Reflection folder of '{name}' could not be read: {e}"
+                ))
+            })
+    }
+
+    /// The body of [`Engine::sync_paths_as`], with whether its scan was
+    /// applied (`false` for a pass that walked nothing: a virtual domain, a
+    /// rename in progress, a domain another instance hosts).
+    async fn sync_paths_walk(
+        &self,
+        name: &str,
+        paths: Vec<String>,
+        actor: Option<&str>,
+    ) -> Result<(SyncReport, bool)> {
         let ContentSource::File { root } = self.content_source(name)? else {
             // A virtual domain has no files on disk; there is nothing to scan.
-            return Ok(SyncReport {
-                domain: name.to_string(),
-                ..SyncReport::default()
-            });
+            return Ok((
+                SyncReport {
+                    domain: name.to_string(),
+                    ..SyncReport::default()
+                },
+                false,
+            ));
         };
+        // An engine with no instance id on a shared database walks no file
+        // domain, a targeted pass as little as a complete one.
+        if let Some(reason) = self.walks_no_file_domain().await {
+            return Err(EngineError::Conflict(reason));
+        }
         // Skipped while a rename has the domain paused; see `sync_take_over`.
         let Some(_pass) = self.try_enter_sync(name) else {
-            return Ok(SyncReport {
-                domain: name.to_string(),
-                ..SyncReport::default()
-            });
+            return Ok((
+                SyncReport {
+                    domain: name.to_string(),
+                    ..SyncReport::default()
+                },
+                false,
+            ));
         };
         let collab = !self.instance_id.is_empty();
         let (domain, snapshot) = {
             let store = self.store.lock().await;
             if collab {
                 match self.claim_file_host(&*store, name, &root, false).await? {
-                    HostClaim::Acquired => {}
+                    HostClaim::Acquired { .. } => {}
+                    // A one-shot command is refused with the reason, so
+                    // the verb that ran it (an import, a discard, a direct
+                    // commit) says why its files are not indexed. The
+                    // daemon's watcher passes over it quietly: the host
+                    // indexes the domain.
+                    HostClaim::HeldByOther(host) if self.is_one_shot() => {
+                        return Err(EngineError::Conflict(host_refusal(name, &host)));
+                    }
                     HostClaim::HeldByOther(host) => {
                         tracing::info!(
-                            "targeted sync skipped: domain '{name}' is hosted by instance {}",
-                            host.instance_id
+                            "targeted sync skipped: domain '{name}' is hosted by {}",
+                            host.label
                         );
-                        return Ok(SyncReport {
-                            domain: name.to_string(),
-                            ..SyncReport::default()
-                        });
+                        return Ok((
+                            SyncReport {
+                                domain: name.to_string(),
+                                ..SyncReport::default()
+                            },
+                            false,
+                        ));
                     }
                 }
             }
@@ -310,13 +529,28 @@ impl Engine {
             (domain, snapshot)
         };
         let manifest_touched = Self::touches_manifest(&paths);
-        let scan = scan_paths(name, &root, snapshot, paths, &self.chunk_params).await;
-        let report = {
+        let mut scan = scan_paths(name, &root, snapshot, paths, &self.chunk_params).await;
+        if collab {
+            scan.walked_by(&self.instance_id);
+        }
+        let applied = {
             let store = self.store.lock().await;
-            apply_scan(&*store, domain, scan).await.map_err(|e| {
-                EngineError::Internal(format!("targeted sync of '{name}' failed: {e}"))
-            })?
+            apply_scan(&*store, domain, scan).await
         };
+        let report = match applied {
+            Ok(report) => report,
+            Err(IndexError::NotHost(why)) => {
+                self.lost_host(name);
+                return Err(EngineError::Conflict(why));
+            }
+            Err(IndexError::HostMoveChanged(why)) => return Err(EngineError::Conflict(why)),
+            Err(e) => {
+                return Err(EngineError::Internal(format!(
+                    "targeted sync of '{name}' failed: {e}"
+                )));
+            }
+        };
+        self.bump_after_apply(name, &report);
         // An out-of-band edit the watcher caught changes what the folder's
         // generated index should say.
         if changed_anything(&report) {
@@ -327,8 +561,48 @@ impl Engine {
         if manifest_touched {
             self.refresh_names().await;
         }
-        self.announce_report(name, &report, actor);
-        Ok(report)
+        // Announced first: a threads file the engine just wrote comes back
+        // here as an echo the bus drops, and that echo asks for no backup.
+        let threads_heard = self.announce_report(name, &report, actor);
+        if report.reflections_changed > 0 || threads_heard {
+            // A file dropped into the Reflection by hand, found by the
+            // watcher: an edit, as in the full sync. A threads file counts
+            // too: it has no row, but the backup commits it.
+            self.mark_reflection_dirty(name, crate::reflection_backup::BackupCause::Edit);
+        }
+        Ok((report, true))
+    }
+
+    /// Why this engine walks no file domain, or `None` when it may. The one
+    /// guard every walk of the engine asks (the sync, the targeted sync and
+    /// the reindex): on a shared database an engine with no instance id
+    /// cannot hold a domain's host lock, and its walk would delete the rows
+    /// of files only the host's disk has and end a host move that is not its
+    /// own. Every production opener on a shared database gives its engine
+    /// this machine's id (the daemon, the embedded MCP stack, the standalone
+    /// opener and the daemonless `crystalline sync` and `reindex`), so this
+    /// guards an engine built without one.
+    pub(super) async fn walks_no_file_domain(&self) -> Option<String> {
+        (self.instance_id.is_empty() && self.store.lock().await.shares_database())
+            .then(|| REFUSED_ANONYMOUS_WALK.to_string())
+    }
+
+    /// A walk of `name` found its host lock taken by another instance: this
+    /// instance stops hosting the domain at once, as the Reflection gate's
+    /// confirm does, rather than at its next heartbeat.
+    pub(super) fn lost_host(&self, name: &str) {
+        if self.hosted.write().unwrap().remove(name).is_some() {
+            self.announce_host_moved(name);
+        }
+    }
+
+    /// An apply ended a host move: the Reflection backup held back while it
+    /// was open is due now, so the edits made during the move reach the
+    /// backup branch without waiting for the next one.
+    pub(super) fn after_host_move_resolved(&self, name: &str, report: &SyncReport) {
+        if report.host_move_resolved {
+            self.mark_reflection_dirty(name, crate::reflection_backup::BackupCause::Edit);
+        }
     }
 
     /// Reindex all file domains. `full` re-reads, re-parses and re-upserts every
@@ -357,18 +631,28 @@ impl Engine {
         let hooks = DaemonReindexHooks {
             engine: self,
             collab: !self.instance_id.is_empty(),
+            anonymous: self.walks_no_file_domain().await,
+            lost: std::sync::Mutex::new(Vec::new()),
+            skipped: std::sync::Mutex::new(Vec::new()),
         };
-        let reports = reindex_domains(
+        let reindexed = reindex_domains(
             &*self.store,
             &targets,
             &self.chunk_params,
             full.then_some(RebuildKind::Full),
             &hooks,
         )
-        .await?;
+        .await;
+        // A one-shot command gives back the locks it took, success or not.
+        self.release_taken_hosts().await;
+        let reports = reindexed?;
+        let lost = std::mem::take(&mut *hooks.lost.lock().unwrap());
+        let skipped = std::mem::take(&mut *hooks.skipped.lock().unwrap());
         Ok(json!({
             "full": full,
             "reports": serde_json::to_value(&reports).unwrap_or(Value::Null),
+            "failed": lost,
+            "skipped": skipped,
         }))
     }
 
@@ -531,6 +815,7 @@ impl Engine {
         let info = store.store_info().await?;
         let stats = store.domain_stats().await?;
         let coverage = store.embedding_coverage().await?;
+        let reflection = store.embedding_coverage_of(ChunkTable::Reflection).await?;
         drop(store);
         let contradictions = self.contradictions_status().await?;
         let active_embedded = coverage.embedded_for(&self.model_id);
@@ -570,9 +855,12 @@ impl Engine {
             .collect();
         let mut activity = self.activity.lock().unwrap().snapshot_json();
         if let Value::Object(map) = &mut activity {
+            // Both backlogs: what the embed worker still has to do (R55).
             map.insert(
                 "embedding_backlog".to_string(),
-                json!(coverage.backlog_for(&self.model_id)),
+                json!(
+                    coverage.backlog_for(&self.model_id) + reflection.backlog_for(&self.model_id)
+                ),
             );
         }
         let mut result = json!({
@@ -610,6 +898,20 @@ impl Engine {
         {
             emb.insert("pruned_model_cache".to_string(), Value::Array(pruned));
         }
+        // Only while a Reflection holds a chunk, so the output stays
+        // byte-stable for an install that never turns one on.
+        if reflection.total_chunks > 0
+            && let Some(emb) = result.get_mut("embeddings").and_then(Value::as_object_mut)
+        {
+            emb.insert(
+                "reflection_chunks".to_string(),
+                json!(reflection.total_chunks),
+            );
+            emb.insert(
+                "reflection_embedded_chunks".to_string(),
+                json!(reflection.embedded_for(&self.model_id)),
+            );
+        }
         // Omitted entirely while collaboration is off, so pre-feature output
         // stays byte-stable for an install that never touches GitHub.
         if self.config.read().unwrap().github_enabled()
@@ -620,14 +922,28 @@ impl Engine {
         Ok(result)
     }
 
-    /// Chunks awaiting embedding for the active model: the figure `status_report`
-    /// exposes as `embedding_backlog`. Reads the cached coverage snapshot, so it
-    /// is cheap enough for the daemon's self-heal tick to poll; no per-chunk
-    /// scan.
+    /// Engram chunks awaiting embedding for the active model (R55): the
+    /// figure the contradiction gate and the similar wait read, and the
+    /// engram half of `status_report`'s `embedding_backlog`, which adds
+    /// [`Engine::reflection_embedding_backlog`]. Reads the cached coverage
+    /// snapshot, so it is cheap enough for the daemon's self-heal tick to
+    /// poll; no per-chunk scan.
     pub async fn embedding_backlog(&self) -> Result<usize> {
         let coverage = {
             let store = self.store.lock().await;
             store.embedding_coverage().await?
+        };
+        Ok(coverage.backlog_for(&self.model_id))
+    }
+
+    /// Reflection chunks awaiting the active model (R55): the daemon tick
+    /// asks for an embed while it is non-zero, and `status` adds it to the
+    /// engram backlog. Never read by the contradiction gate or the similar
+    /// wait, which wait on engram chunks only.
+    pub async fn reflection_embedding_backlog(&self) -> Result<usize> {
+        let coverage = {
+            let store = self.store.lock().await;
+            store.embedding_coverage_of(ChunkTable::Reflection).await?
         };
         Ok(coverage.backlog_for(&self.model_id))
     }
@@ -819,46 +1135,57 @@ impl Engine {
     }
 
     /// Clear the vectors of every model but the active one, but only once the
-    /// active model covers every chunk in the index.
+    /// active model covers every chunk, table by table.
     ///
-    /// `None` says the condition was not met and nothing was touched; `Some(n)`
-    /// says the prune ran and cleared `n` chunks. The gate is the whole point:
-    /// below full coverage the chunks a pass has not reached yet still carry
-    /// the previous model's vectors, and those are what search and the
-    /// neighbours answer from until it does.
+    /// `None` says no chunk table met the condition and nothing was touched;
+    /// `Some(n)` says the prune ran on at least one table and cleared `n`
+    /// chunks across them. The gate is the whole point: below full coverage
+    /// the chunks a pass has not reached yet still carry the previous model's
+    /// vectors, and those are what search and the neighbours answer from until
+    /// it does. Each table is gated on its own coverage, so a table the pass
+    /// has finished is pruned while another still waits.
     pub async fn prune_stale_embeddings_if_complete(&self) -> Result<Option<usize>> {
         let store = self.store.lock().await;
-        let coverage = store.embedding_coverage().await?;
-        if coverage.total_chunks == 0
-            || coverage.embedded_for(&self.model_id) < coverage.total_chunks
-        {
-            return Ok(None);
+        let mut answer: Option<usize> = None;
+        for &table in ChunkTable::ALL {
+            let coverage = store.embedding_coverage_of(table).await?;
+            if coverage.total_chunks == 0
+                || coverage.embedded_for(&self.model_id) < coverage.total_chunks
+            {
+                continue;
+            }
+            // Under the gate above every chunk of this table already carries
+            // the active model, so a snapshot showing one embedding group and
+            // no chunk this model does not account for has already proved the
+            // statement would match nothing. Skip it there: a pass runs on
+            // every write and the statement is a scan of the chunk table. What
+            // survives this is the index the snapshot cannot vouch for, a
+            // second group or an embedded chunk outside the model's count, and
+            // that one still runs.
+            if coverage.models.len() <= 1
+                && coverage.embedded_chunks == coverage.embedded_for(&self.model_id)
+            {
+                answer.get_or_insert(0);
+                continue;
+            }
+            #[cfg(any(test, feature = "testing"))]
+            self.prune_statements
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let pruned = store
+                .prune_embeddings_except_in(table, &self.model_id)
+                .await?;
+            if pruned > 0 {
+                tracing::info!(
+                    model = %self.model_id,
+                    table = ?table,
+                    pruned,
+                    "cleared the vectors of a model this install no longer uses"
+                );
+            }
+            *answer.get_or_insert(0) += pruned;
         }
-        // Under the gate above every chunk already carries the active model, so
-        // a snapshot showing one embedding group and no chunk this model does
-        // not account for has already proved the statement would match nothing.
-        // Skip it there: a pass runs on every write and the statement is a scan
-        // of the chunk table. What survives this is the index the snapshot
-        // cannot vouch for, a second group or an embedded chunk outside the
-        // model's count, and that one still runs.
-        if coverage.models.len() <= 1
-            && coverage.embedded_chunks == coverage.embedded_for(&self.model_id)
-        {
-            return Ok(Some(0));
-        }
-        #[cfg(any(test, feature = "testing"))]
-        self.prune_statements
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let pruned = store.prune_embeddings_except(&self.model_id).await?;
         drop(store);
-        if pruned > 0 {
-            tracing::info!(
-                model = %self.model_id,
-                pruned,
-                "cleared the vectors of a model this install no longer uses"
-            );
-        }
-        Ok(Some(pruned))
+        Ok(answer)
     }
 
     /// Best-effort WAL checkpoint: reclaims disk after a burst of writes (a
@@ -1012,68 +1339,80 @@ impl Engine {
         // The backlog is walked one keyset page at a time so a large first index
         // never holds every chunk's text at once. The store lock is held only to
         // pull a page and to write vectors, never across the embed call.
+        //
+        // Every chunk table is walked in turn, engrams first, each with its own
+        // keyset cursor: a cursor is a position in one table's ordering and
+        // means nothing in another's.
         let mut embedded = 0usize;
-        let mut cursor: Option<(i64, i64)> = None;
-        loop {
-            let mut jobs = {
-                let store = self.store.lock().await;
-                store
-                    .chunks_needing_embedding(&model, scope.as_deref(), page_size, cursor)
-                    .await?
-            };
-            if jobs.is_empty() {
-                break;
-            }
-            // A short page is the last one. The cursor is taken from the store's
-            // ordering, before the length sort reorders the page.
-            let last_page = jobs.len() < page_size;
-            cursor = jobs.last().map(|j| (j.engram_id, j.seq));
-            // Length-sort so batches pay for their longest member once instead
-            // of padding every short chunk out to whatever long one happened to
-            // land in the same batch.
-            order_jobs_for_batching(&mut jobs);
-            if activity.is_none() {
-                *activity = Some(ActivityState::begin(&self.activity, "embed", None));
-            }
-            for batch in jobs.chunks(EMBED_BATCH) {
-                let texts: Vec<String> = batch.iter().map(|j| j.text.clone()).collect();
-                // A batch the provider cannot handle is logged and skipped: its
-                // chunks keep no embedding, so they stay in the backlog for a
-                // later pass instead of starving every batch behind them.
-                let vectors = match provider.embed(&texts).await {
-                    Ok(v) if v.len() == batch.len() => v,
-                    Ok(v) => {
-                        tracing::warn!(
-                            chunks = ?batch.iter().map(|j| j.chunk_id).collect::<Vec<_>>(),
-                            "skipping an embed batch: the provider returned {} vectors for {} inputs",
-                            v.len(),
-                            batch.len()
-                        );
-                        continue;
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            chunks = ?batch.iter().map(|j| j.chunk_id).collect::<Vec<_>>(),
-                            "skipping an embed batch the provider rejected: {e}"
-                        );
-                        continue;
-                    }
+        for &table in ChunkTable::ALL {
+            let mut cursor: Option<(i64, i64)> = None;
+            loop {
+                let mut jobs = {
+                    let store = self.store.lock().await;
+                    store
+                        .chunks_needing_embedding_in(
+                            table,
+                            &model,
+                            scope.as_deref(),
+                            page_size,
+                            cursor,
+                        )
+                        .await?
                 };
-                let rows: Vec<crystalline_index::EmbeddingRow> = batch
-                    .iter()
-                    .zip(vectors)
-                    .map(|(job, embedding)| crystalline_index::EmbeddingRow {
-                        chunk_id: job.chunk_id,
-                        dims: embedding.len(),
-                        embedding,
-                    })
-                    .collect();
-                let store = self.store.lock().await;
-                store.store_embeddings(&rows, &model).await?;
-                embedded += batch.len();
-            }
-            if last_page {
-                break;
+                if jobs.is_empty() {
+                    break;
+                }
+                // A short page is the last one. The cursor is taken from the store's
+                // ordering, before the length sort reorders the page.
+                let last_page = jobs.len() < page_size;
+                cursor = jobs.last().map(|j| (j.engram_id, j.seq));
+                // Length-sort so batches pay for their longest member once instead
+                // of padding every short chunk out to whatever long one happened to
+                // land in the same batch.
+                order_jobs_for_batching(&mut jobs);
+                if activity.is_none() {
+                    *activity = Some(ActivityState::begin(&self.activity, "embed", None));
+                }
+                for batch in jobs.chunks(EMBED_BATCH) {
+                    let texts: Vec<String> = batch.iter().map(|j| j.text.clone()).collect();
+                    // A batch the provider cannot handle is logged and skipped: its
+                    // chunks keep no embedding, so they stay in the backlog for a
+                    // later pass instead of starving every batch behind them.
+                    let vectors = match provider.embed(&texts).await {
+                        Ok(v) if v.len() == batch.len() => v,
+                        Ok(v) => {
+                            tracing::warn!(
+                                chunks = ?batch.iter().map(|j| j.chunk_id).collect::<Vec<_>>(),
+                                "skipping an embed batch: the provider returned {} vectors for {} inputs",
+                                v.len(),
+                                batch.len()
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                chunks = ?batch.iter().map(|j| j.chunk_id).collect::<Vec<_>>(),
+                                "skipping an embed batch the provider rejected: {e}"
+                            );
+                            continue;
+                        }
+                    };
+                    let rows: Vec<crystalline_index::EmbeddingRow> = batch
+                        .iter()
+                        .zip(vectors)
+                        .map(|(job, embedding)| crystalline_index::EmbeddingRow {
+                            chunk_id: job.chunk_id,
+                            dims: embedding.len(),
+                            embedding,
+                        })
+                        .collect();
+                    let store = self.store.lock().await;
+                    store.store_embeddings_in(table, &rows, &model).await?;
+                    embedded += batch.len();
+                }
+                if last_page {
+                    break;
+                }
             }
         }
         Ok(embedded)
@@ -1139,6 +1478,13 @@ fn settle_action(choice: &SnapshotChoice, read_only: bool, user_dir: bool) -> Se
         } => SettleAction::FetchPinned,
         _ => SettleAction::Nothing,
     }
+}
+
+/// Whether a write to, or a change found at, the domain-relative `path` can
+/// move the domain's Reflection mode: the MANIFEST holds the switch, and an
+/// engram under `reflections/` (in any letter case) holds a switch pending.
+fn may_move_reflection_mode(path: &str) -> bool {
+    names_the_manifest(path) || crystalline_core::reflection::is_under_reflections(path)
 }
 
 #[cfg(test)]

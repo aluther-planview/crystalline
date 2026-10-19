@@ -400,6 +400,7 @@ impl SourceSet {
                         source: source.name.clone(),
                         bullets: Vec::new(),
                         domain_read_only: false,
+                        reflect_open: 0,
                         replaces_local: false,
                     });
                 }
@@ -908,6 +909,23 @@ impl SourceSet {
             .await
     }
 
+    /// One file of `domain` (the source's own name) by its domain-relative
+    /// path, from `source`, within `deadline` overall: the server's
+    /// `{mime, size, base64}`. A source inside its down window answers its
+    /// failure at once. See [`crate::Connection::file_within`].
+    pub async fn fetch_file(
+        &self,
+        source: &str,
+        domain: &str,
+        path: &str,
+        deadline: Duration,
+    ) -> Result<Value, RemoteFailure> {
+        let started = std::time::Instant::now();
+        let connection = self.connection(source, deadline).await?;
+        let left = deadline.saturating_sub(started.elapsed());
+        connection.file_within(domain, path, left).await
+    }
+
     /// The mounted part of the routing block from the caches alone, for a
     /// hook with no daemon to ask (decision D20).
     pub fn mounted_routing_from_cache(&self) -> MountedRouting {
@@ -1011,6 +1029,7 @@ mod tests {
                 branch: "main".to_string(),
             }),
             domain_read_only: false,
+            reflect_open: 0,
         }
     }
 

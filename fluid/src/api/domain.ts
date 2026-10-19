@@ -12,6 +12,7 @@
 
 import { api, encodeSegment } from "./client";
 import type { EngramRow } from "./engrams";
+import { isDomainManifestPath } from "../paths";
 import { readEngramRow } from "./engrams";
 import { asArray, asNumber, asObject, asString, asStrings } from "./json";
 
@@ -27,6 +28,12 @@ export interface DomainTree {
    * cap, so a level too big to draw still names every folder under it.
    */
   folders: string[];
+  /**
+   * How many engrams each of `folders` holds at any depth, the reader's
+   * drafts included: the total the listing scoped to that folder reports.
+   * Empty from a server that predates the field.
+   */
+  folderCounts: Record<string, number>;
   /** The engrams directly in this folder, up to the server's per-level cap. */
   engrams: EngramRow[];
   /**
@@ -39,6 +46,12 @@ export interface DomainTree {
   truncated: boolean;
   /** How many engrams the level holds, cap or no cap. */
   total: number;
+  /**
+   * The permalink of the domain's MANIFEST, read off the row whose file is
+   * the root `MANIFEST.md` the way the server names it, or null when this
+   * level holds none (any level but the root, or a domain without one).
+   */
+  manifestPermalink: string | null;
 }
 
 /**
@@ -58,14 +71,35 @@ export function readTree(
   const engrams = asArray(record?.engrams)
     .map((entry) => readEngramRow(entry, domain))
     .filter((row): row is EngramRow => row !== null);
+  const manifest =
+    path === ""
+      ? asArray(record?.engrams).find((entry) => {
+          const file = asString(asObject(entry)?.path);
+          return file !== null && isDomainManifestPath(file);
+        })
+      : undefined;
   return {
     domain: asString(record?.domain) ?? domain,
     path,
     folders: asStrings(record?.folders),
+    folderCounts: readFolderCounts(record?.folder_counts),
     engrams,
     truncated: record?.truncated === true,
     total: asNumber(record?.total) ?? engrams.length,
+    manifestPermalink: asString(asObject(manifest)?.permalink),
   };
+}
+
+/** The per-folder counts, keeping only names that carry a number. */
+function readFolderCounts(value: unknown): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const [name, n] of Object.entries(asObject(value) ?? {})) {
+    const count = asNumber(n);
+    if (count !== null) {
+      counts[name] = count;
+    }
+  }
+  return counts;
 }
 
 /** The cache key of every folder of one domain, which is what a write moves. */
@@ -193,8 +227,8 @@ export interface PolicyView {
   key: string;
   /**
    * `"choice"` (a closed set, drawn as a dropdown) or `"text"` (free text,
-   * changed through a different flow - `domain_name` through a rename, never
-   * this card's select). Defaults to `"choice"` for a daemon that predates
+   * never this card's select: `domain_name` changes through a rename,
+   * `reflection_home` is filled in by the server). Defaults to `"choice"` for a daemon that predates
    * this field, the shape every row had before it existed.
    */
   kind: "choice" | "text";
@@ -202,8 +236,9 @@ export interface PolicyView {
   declared: string | null;
   /**
    * The value that holds: absent and unrecognized both fall to `default` for
-   * a `"choice"` key. For a `"text"` key, an absent or invalid declaration
-   * falls to this domain's local name instead.
+   * a `"choice"` key. For `domain_name`, an absent or invalid declaration
+   * falls to this domain's local name instead; any other `"text"` key is
+   * empty when nothing is set.
    */
   effective: string;
   /** The values this key takes, in display order. Empty for a `"text"` key. */
@@ -248,7 +283,10 @@ function readProblems(value: unknown): ManifestProblem[] {
  * The registry rows, dropped one by one where a row says nothing.
  *
  * A row is its key and what holds; without either there is no line to draw,
- * so it goes rather than being drawn as a blank. The three describing fields
+ * so it goes rather than being drawn as a blank. A `"text"` key is the one
+ * exception: an empty value is what holds for a text key nothing has set
+ * (`reflection_home` before Reflection is switched on), so it is kept and
+ * the card says "not set". The three describing fields
  * have quiet defaults instead: a row that carries no `default` is read as
  * declaring that what holds IS the default, which is true of every key
  * nobody wrote in the frontmatter.
@@ -257,14 +295,18 @@ function readPolicies(value: unknown): PolicyView[] {
   return asArray(value).flatMap((entry) => {
     const record = asObject(entry);
     const key = asString(record?.key);
-    const effective = asString(record?.effective);
+    const kind = asString(record?.kind) === "text" ? "text" : "choice";
+    const effective =
+      kind === "text" && record?.effective === ""
+        ? ""
+        : asString(record?.effective);
     if (key === null || effective === null) {
       return [];
     }
     return [
       {
         key,
-        kind: asString(record?.kind) === "text" ? "text" : "choice",
+        kind,
         declared: asString(record?.declared),
         effective,
         values: asStrings(record?.values),
@@ -444,6 +486,13 @@ export interface PolicyWrite {
   sections: ManifestSections | null;
   /** True in a domain that reviews changes: the write is the caller's draft of the MANIFEST. */
   draft: boolean;
+  /**
+   * What the switch changed besides the line, to show as given: today only a
+   * Reflection switched off on a GitHub-connected domain says something
+   * ("share changes" then offers the files in `reflections/` as engram
+   * changes). Never set together with `draft`.
+   */
+  note: string | null;
 }
 
 /**
@@ -472,5 +521,6 @@ export async function setDomainPolicies(
     // Said only when the server said it: an ordinary domain's answer carries
     // no such key, and the write landed in the domain itself.
     draft: record?.draft === true,
+    note: asString(record?.note),
   };
 }

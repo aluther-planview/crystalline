@@ -189,38 +189,6 @@ fn rewrite_behind_the_prefilter(path: &Path, content: &str) {
 
 // --- backend runner ----------------------------------------------------------
 
-#[cfg(feature = "postgres")]
-fn pg_url() -> Option<String> {
-    use std::sync::Once;
-    static NOTE: Once = Once::new();
-    match std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") {
-        Ok(u) if !u.is_empty() => Some(u),
-        _ => {
-            NOTE.call_once(|| {
-                eprintln!(
-                    "note: skipping the postgres parity leg (CRYSTALLINE_TEST_POSTGRES_URL is unset); turso only"
-                )
-            });
-            None
-        }
-    }
-}
-
-/// A recycled pid must never adopt a schema a panicking run left behind.
-#[cfg(feature = "postgres")]
-fn unique_schema() -> String {
-    use std::hash::{BuildHasher, RandomState};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!(
-        "rx_{}_{}_{:x}",
-        std::process::id(),
-        n,
-        RandomState::new().hash_one(n)
-    )
-}
-
 /// Run a parity body against both backends, each behind the same
 /// `Arc<Mutex<dyn Store>>` handle the driver takes in production.
 macro_rules! parity {
@@ -234,17 +202,15 @@ macro_rules! parity {
             }
             #[cfg(feature = "postgres")]
             {
-                if let Some(url) = pg_url() {
-                    let schema = unique_schema();
-                    let pg = crystalline_index::PostgresStore::open_in_schema(&url, &schema)
-                        .await
-                        .expect("open the postgres test schema");
+                if let Some(scratch) = crate::pg::scratch("rx") {
+                    let pg = crystalline_index::PostgresStore::open_in_schema(
+                        scratch.url(),
+                        scratch.name(),
+                    )
+                    .await
+                    .expect("open the postgres test schema");
                     let store: Arc<Mutex<dyn Store>> = Arc::new(Mutex::new(pg));
                     $body(store).await;
-                    let cleanup = crystalline_index::PostgresStore::open_in_schema(&url, &schema)
-                        .await
-                        .unwrap();
-                    cleanup.drop_schema().await.unwrap();
                 }
             }
         }
@@ -399,6 +365,67 @@ async fn a_completed_rebuild_rereads_what_a_sync_skips(store: Arc<Mutex<dyn Stor
 parity!(
     a_completed_rebuild_replaces_the_index_in_one_step,
     a_completed_rebuild_rereads_what_a_sync_skips
+);
+
+/// `reindex --full` refreshes Reflection page rows too: a page whose text
+/// changed behind the stat prefilter keeps its stale row through a plain
+/// run and gets the new text from the forced one, through the driver's own
+/// wiring of `force` into the walk.
+async fn a_forced_rebuild_rereads_a_reflection_page(store: Arc<Mutex<dyn Store>>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("d");
+    write(
+        &root,
+        "MANIFEST.md",
+        "---\ntype: manifest\ntitle: d\npermalink: manifest\ntags: [manifest]\nstatus: stable\nreflection: on\n---\n\n## Scope\n\n- s\n\n## When to Use\n\n- w\n",
+    );
+    let page = |word: &str| {
+        format!("---\ntitle: P\n---\n\n# P\n\n## Part\n<!-- r:aaaa1111 -->\n\nText {word}.\n")
+    };
+    write(&root, "reflections/p.md", &page("aaaa"));
+    let targets = vec![("d".to_string(), root.clone())];
+    reindex_domains(&*store, &targets, &params(), None, &NoReindexHooks)
+        .await
+        .unwrap();
+    let domain = domain_id(&store, "d", &root).await;
+    let page_text = || async {
+        let store = store.lock().await;
+        store
+            .list_reflections(domain)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.path == "p.md")
+            .expect("the page has its row")
+            .content
+    };
+    assert!(page_text().await.contains("Text aaaa."));
+
+    rewrite_behind_the_prefilter(&root.join("reflections/p.md"), &page("bbbb"));
+    reindex_domains(&*store, &targets, &params(), None, &NoReindexHooks)
+        .await
+        .unwrap();
+    assert!(
+        page_text().await.contains("Text aaaa."),
+        "a plain run skips it"
+    );
+    reindex_domains(
+        &*store,
+        &targets,
+        &params(),
+        Some(RebuildKind::Full),
+        &NoReindexHooks,
+    )
+    .await
+    .unwrap();
+    assert!(
+        page_text().await.contains("Text bbbb."),
+        "the forced run re-read the page"
+    );
+}
+parity!(
+    a_forced_rebuild_rereads_a_reflection_page_on_both_backends,
+    a_forced_rebuild_rereads_a_reflection_page
 );
 
 /// A forced resync keeps every overlay row, and proposes no deletion.

@@ -10,7 +10,7 @@
 //! that bakes in everything the current [`crate::Store`] trait exercises in one
 //! step rather than replaying the Turso migration history.
 
-use sqlx::{Executor, PgConnection};
+use sqlx::{AssertSqlSafe, Executor, PgConnection};
 
 use crate::error::{IndexError, Result};
 
@@ -120,6 +120,36 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 19,
         label: "c-collated base path index",
         sql: SCHEMA_V19,
+    },
+    Migration {
+        version: 20,
+        label: "reflection index",
+        sql: SCHEMA_V20,
+    },
+    Migration {
+        version: 21,
+        label: "reflection assets",
+        sql: SCHEMA_V21,
+    },
+    Migration {
+        version: 22,
+        label: "reflection chunks",
+        sql: SCHEMA_V22,
+    },
+    Migration {
+        version: 23,
+        label: "reflection chunks by domain",
+        sql: SCHEMA_V23,
+    },
+    Migration {
+        version: 24,
+        label: "engram rows under the Reflection folder",
+        sql: SCHEMA_V24,
+    },
+    Migration {
+        version: 25,
+        label: "domain host move",
+        sql: SCHEMA_V25,
     },
 ];
 
@@ -629,6 +659,108 @@ const SCHEMA_V19: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_engram_base_path_c ON engram(domain_id, (path COLLATE "C")) WHERE actor = '';
 "#;
 
+// The Reflection's own index, the twin of Turso's v20: one row per reflection
+// (and PACT.md) under a domain's `reflections/`, beside the engram tables and
+// never joined to them. The unique index serves every statement.
+const SCHEMA_V20: &str = r#"
+CREATE TABLE IF NOT EXISTS reflection (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    domain_id BIGINT NOT NULL REFERENCES domain(id) ON DELETE CASCADE,
+    path TEXT NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    content TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    size BIGINT NOT NULL,
+    modified TEXT NOT NULL,
+    UNIQUE(domain_id, path)
+);
+"#;
+
+// The Reflection's files, the twin of Turso's v21: one row per allowlisted
+// file under a domain's `reflections/assets/`, keyed by its path inside
+// `reflections/`, beside `attachment` and never joined to it. `IF NOT
+// EXISTS`, so a replay converges. The unique index serves every statement.
+const SCHEMA_V21: &str = r#"
+CREATE TABLE IF NOT EXISTS reflection_asset (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    domain_id BIGINT NOT NULL REFERENCES domain(id) ON DELETE CASCADE,
+    path TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    mime TEXT NOT NULL,
+    size BIGINT NOT NULL,
+    modified TEXT NOT NULL,
+    UNIQUE(domain_id, path)
+);
+"#;
+
+// The Reflection's embedding chunks, the twin of Turso's v22: one or more per
+// `##` section of a page under `reflections/`, beside the engram `chunk` table
+// and never joined to it, so no engram reader can meet one. Keyed by
+// `(domain_id, path, seq)` with no foreign key to `reflection`. The embedding
+// starts at `vector(384)` with its own HNSW cosine index, and
+// `ensure_embedding_width` resizes it on its own, as it does `chunk`'s. The
+// page stamps are blanked so the next walk reads every page once and chunks
+// it (R58). Every `CREATE` is `IF NOT EXISTS`, so a replay converges.
+const SCHEMA_V22: &str = r#"
+CREATE TABLE IF NOT EXISTS reflection_chunk (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    domain_id BIGINT NOT NULL REFERENCES domain(id),
+    path TEXT NOT NULL,
+    seq BIGINT NOT NULL DEFAULT 0,
+    section_ord BIGINT NOT NULL DEFAULT 0,
+    section TEXT,
+    heading TEXT NOT NULL DEFAULT '',
+    text TEXT NOT NULL DEFAULT '',
+    text_hash TEXT NOT NULL DEFAULT '',
+    model TEXT,
+    dims BIGINT,
+    embedding vector(384)
+);
+CREATE INDEX IF NOT EXISTS idx_reflection_chunk_page ON reflection_chunk(domain_id, path, seq);
+CREATE INDEX IF NOT EXISTS idx_reflection_chunk_model ON reflection_chunk(model);
+CREATE INDEX IF NOT EXISTS idx_reflection_chunk_embedding ON reflection_chunk USING hnsw (embedding vector_cosine_ops);
+UPDATE reflection SET modified='';
+"#;
+
+// The twin of Turso's v23: one domain's reflection chunks of one model and
+// width, the rows a reflection search reads, so the vector statement and the
+// per-domain coverage seek one domain instead of filtering every domain's
+// chunks of the model row by row. The model index serves no statement any
+// more, so it goes, and a fresh install and an upgrade end with the same
+// indexes. Both statements are guarded, so a replay converges.
+const SCHEMA_V23: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_reflection_chunk_domain_model ON reflection_chunk(domain_id, model, dims);
+DROP INDEX IF EXISTS idx_reflection_chunk_model;
+"#;
+
+// The twin of Turso's v24: the Reflection gate's probe (R82) seeks a domain's
+// base engram rows under `reflections/` in any ASCII letter case instead of
+// walking them. The expression is the probe's own, byte for byte
+// (`ENGRAM_ROWS_UNDER_REFLECTIONS_SQL`): `COLLATE "C"` makes `lower` fold
+// ASCII only, as `is_under_reflections` does, whatever the database's
+// collation, and the planner matches an expression index only to the same
+// expression. The expression leads, as on Turso, so no other statement seeks a
+// prefix of this index. Guarded, so a replay converges.
+const SCHEMA_V24: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_engram_reflection_head ON engram((lower(substr(path, 1, 12) COLLATE "C")), domain_id, actor);
+"#;
+
+// The host move of a file domain on a shared database (Task 50): which
+// instance last took the domain's host lock, kept on the domain row because
+// a release deletes the lock row and a take-over overwrites it, and the
+// mark an instance sets when it takes a domain over from another (or an
+// unknown) holder. While the mark is set, a complete walk keeps the rows it
+// does not see and counts them; `host_move` is the mark and those counts as
+// JSON, NULL when no move is unresolved. Nullable, no default, no backfill:
+// every domain row that predates this migration reads "no last host" and
+// "no move", and converging on a retry as every migration in this dialect
+// does.
+const SCHEMA_V25: &str = r#"
+ALTER TABLE domain ADD COLUMN IF NOT EXISTS last_host_id TEXT;
+ALTER TABLE domain ADD COLUMN IF NOT EXISTS last_host_label TEXT;
+ALTER TABLE domain ADD COLUMN IF NOT EXISTS host_move TEXT;
+"#;
+
 const SCHEMA_V8: &str = r#"
 CREATE TABLE attachment (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -656,6 +788,8 @@ CREATE TABLE attachment_blob (
 /// `contradiction` and `contradiction_pair` reference `engram` and `domain`,
 /// so they go first. `observation_vector` references nothing and leads the
 /// list. `engram_meta_value` references `engram`, so it goes before it.
+/// `reflection` and `reflection_asset` reference `domain(id)` too, and so does
+/// `reflection_chunk`, which goes before `reflection`.
 pub const WIPE_TABLES: &[&str] = &[
     "observation_vector",
     "contradiction",
@@ -673,15 +807,95 @@ pub const WIPE_TABLES: &[&str] = &[
     "tag_alias",
     "attachment_blob",
     "attachment",
+    "reflection_chunk",
+    "reflection",
+    "reflection_asset",
     "domain_lock",
     "domain_spelling",
     "domain",
 ];
 
+/// The session-level advisory lock every migration run holds, so instances
+/// that start at the same moment take turns: without it two of them on an
+/// empty database both read version 0 and race on `CREATE EXTENSION vector`,
+/// on v1's tables and on the stamps. Advisory locks belong to the database,
+/// so this one key also serializes runs into different schemas of one
+/// database, which is what the database-wide extension needs.
+pub(crate) const MIGRATION_LOCK: i64 = 7301551;
+
+/// What a locked migration run left behind.
+pub(crate) struct LockedRun {
+    /// The schema version after the run, or why it failed.
+    pub(crate) version: Result<i64>,
+    /// The session may still hold [`MIGRATION_LOCK`]: taking it failed, or
+    /// releasing it failed or found nothing held. The caller must close the
+    /// session instead of giving it back to a pool, as `release_work_claim`
+    /// does for a work claim.
+    pub(crate) tainted: bool,
+}
+
+/// Take [`MIGRATION_LOCK`] on `conn`, create `schema` when one is given,
+/// apply every pending migration, and release the lock on the same session,
+/// whether the steps succeeded or not. Lock, schema and unlock are separate
+/// statements: one multi-statement query is a single transaction, and the
+/// unlock would run before the work it guards is committed.
+///
+/// A failed release turns a successful run into an error, so a caller never
+/// mistakes a session that may still hold the lock for a clean one.
+pub(crate) async fn apply_locked(conn: &mut PgConnection, schema: Option<&str>) -> LockedRun {
+    if let Err(e) = sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(MIGRATION_LOCK)
+        .execute(&mut *conn)
+        .await
+    {
+        return LockedRun {
+            version: Err(IndexError::Migration(format!(
+                "could not take the migration lock: {e}"
+            ))),
+            tainted: true,
+        };
+    }
+    let version = match schema {
+        Some(schema) => match sqlx::raw_sql(AssertSqlSafe(format!(
+            "CREATE SCHEMA IF NOT EXISTS {}",
+            super::quote_ident(schema)
+        )))
+        .execute(&mut *conn)
+        .await
+        {
+            Ok(_) => apply_unlocked(conn).await,
+            Err(e) => Err(IndexError::Migration(e.to_string())),
+        },
+        None => apply_unlocked(conn).await,
+    };
+    let released = sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
+        .bind(MIGRATION_LOCK)
+        .fetch_one(&mut *conn)
+        .await;
+    match released {
+        Ok(true) => LockedRun {
+            version,
+            tainted: false,
+        },
+        Ok(false) => LockedRun {
+            version: version.and(Err(IndexError::Migration(
+                "the migration lock was not held at its release".into(),
+            ))),
+            tainted: true,
+        },
+        Err(e) => LockedRun {
+            version: version.and(Err(IndexError::Migration(format!(
+                "could not release the migration lock: {e}"
+            )))),
+            tainted: true,
+        },
+    }
+}
+
 /// Ensure the migration ledger exists, then apply every migration above the
-/// recorded version. Returns the resulting schema version. Runs on the given
-/// connection so the caller controls whether it is pinned or pool-acquired.
-pub async fn apply(conn: &mut PgConnection) -> Result<i64> {
+/// recorded version. Returns the resulting schema version. The caller holds
+/// [`MIGRATION_LOCK`].
+async fn apply_unlocked(conn: &mut PgConnection) -> Result<i64> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS schema_migration (version BIGINT PRIMARY KEY, applied_at TEXT NOT NULL)",
     )
@@ -802,6 +1016,51 @@ mod tests {
     use super::*;
     use sqlx::Connection;
 
+    /// Every pending migration under [`MIGRATION_LOCK`], as a store open runs
+    /// them, on a connection the test holds.
+    async fn apply(conn: &mut PgConnection) -> Result<i64> {
+        apply_locked(conn, None).await.version
+    }
+
+    /// A clean schema for one test, with the search path set to it.
+    ///
+    /// The first migration runs `CREATE EXTENSION IF NOT EXISTS vector`, and
+    /// two sessions that run it at the same moment on a database that does not
+    /// have the extension yet make one of them fail with a duplicate key on
+    /// `pg_extension_name_index`. `apply_locked` guards it with [`MIGRATION_LOCK`],
+    /// but most tests here run the migration SQL directly, so the extension is
+    /// created here first, under the same lock (on purpose: both guard the one
+    /// database-wide extension), committed before the lock is released. The
+    /// migration's own statement is then a no-op. The lock is never held
+    /// while this session waits for anything else, so sharing the key cannot
+    /// deadlock.
+    async fn fresh_schema(conn: &mut sqlx::PgConnection, schema: &str) {
+        // One statement each: a multi-statement query is a single
+        // transaction, and the lock would be released before the extension
+        // row is committed.
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(MIGRATION_LOCK)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::raw_sql("CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        let released: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
+            .bind(MIGRATION_LOCK)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        assert!(released, "the extension lock was held until here");
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; SET search_path TO {schema}, public"
+        )))
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    }
+
     /// v16 against an index the old resolve pass wrote, the Turso v17 twin's
     /// fixture row for row: a prefix that spelled no domain had bound the bare
     /// target at home. The migration unbinds exactly those rows (and a row
@@ -822,12 +1081,7 @@ mod tests {
         }
         let schema = format!("mig16_{}", std::process::id());
         let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
-        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-            "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; SET search_path TO {schema}, public"
-        )))
-        .execute(&mut conn)
-        .await
-        .unwrap();
+        fresh_schema(&mut conn, &schema).await;
 
         let (before, v16) = (&MIGRATIONS[..15], &MIGRATIONS[15]);
         assert_eq!(v16.version, 16, "the sixteenth migration is v16");
@@ -959,12 +1213,7 @@ mod tests {
         }
         let schema = format!("mig_{}", std::process::id());
         let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
-        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-            "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; SET search_path TO {schema}, public"
-        )))
-        .execute(&mut conn)
-        .await
-        .unwrap();
+        fresh_schema(&mut conn, &schema).await;
 
         // A database at v10: everything up to but not including the marker.
         for m in &MIGRATIONS[..10] {
@@ -1030,12 +1279,7 @@ mod tests {
         }
         let schema = format!("mig13_{}", std::process::id());
         let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
-        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-            "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; SET search_path TO {schema}, public"
-        )))
-        .execute(&mut conn)
-        .await
-        .unwrap();
+        fresh_schema(&mut conn, &schema).await;
 
         // A database at v12: everything up to but not including the kind.
         for m in &MIGRATIONS[..12] {
@@ -1112,12 +1356,7 @@ mod tests {
         }
         let schema = format!("mig12_{}", std::process::id());
         let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
-        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-            "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; SET search_path TO {schema}, public"
-        )))
-        .execute(&mut conn)
-        .await
-        .unwrap();
+        fresh_schema(&mut conn, &schema).await;
 
         // A database at v11: everything up to but not including the widening.
         for m in &MIGRATIONS[..11] {
@@ -1212,12 +1451,7 @@ mod tests {
         }
         let schema = format!("mig14_{}", std::process::id());
         let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
-        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-            "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; SET search_path TO {schema}, public"
-        )))
-        .execute(&mut conn)
-        .await
-        .unwrap();
+        fresh_schema(&mut conn, &schema).await;
 
         // A database at v13: everything up to but not including the move.
         for m in &MIGRATIONS[..13] {
@@ -1334,12 +1568,7 @@ mod tests {
         }
         let schema = format!("mig15_{}", std::process::id());
         let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
-        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-            "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; SET search_path TO {schema}, public"
-        )))
-        .execute(&mut conn)
-        .await
-        .unwrap();
+        fresh_schema(&mut conn, &schema).await;
 
         for m in &MIGRATIONS[..14] {
             sqlx::raw_sql(m.sql).execute(&mut conn).await.unwrap();
@@ -1392,8 +1621,8 @@ mod tests {
 
     /// The Turso twin's Postgres counterpart: a database stamped one version
     /// above the newest migration this binary knows must refuse rather than
-    /// silently report back as current. Runs `apply` itself (not raw SQL for
-    /// the buildup), since it is the entry point the guard has to protect and
+    /// silently report back as current. Runs `apply_locked` itself (not raw SQL
+    /// for the buildup), since it is the entry point the guard has to protect and
     /// the one every backend caller actually goes through.
     ///
     /// Runs only when `CRYSTALLINE_TEST_POSTGRES_URL` is set, the same gate
@@ -1408,12 +1637,7 @@ mod tests {
         }
         let schema = format!("mig_toonew_{}", std::process::id());
         let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
-        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-            "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; SET search_path TO {schema}, public"
-        )))
-        .execute(&mut conn)
-        .await
-        .unwrap();
+        fresh_schema(&mut conn, &schema).await;
 
         apply(&mut conn).await.unwrap();
         let known = MIGRATIONS.last().unwrap().version;
@@ -1440,6 +1664,80 @@ mod tests {
             "a version mismatch is not a held file, so the owner's startup retry must not \
              wait it out: {err}"
         );
+        assert!(
+            !holds_migration_lock(&mut conn).await,
+            "a refused run still releases the migration lock"
+        );
+
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    /// Whether this session holds [`MIGRATION_LOCK`]. A bigint advisory key
+    /// shows in `pg_locks` as its high half in `classid`, its low half in
+    /// `objid` and `objsubid` 1.
+    async fn holds_migration_lock(conn: &mut PgConnection) -> bool {
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' \
+             AND pid = pg_backend_pid() AND granted \
+             AND classid::bigint = ($1 >> 32) AND objid::bigint = ($1 & 4294967295) \
+             AND objsubid = 1)",
+        )
+        .bind(MIGRATION_LOCK)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap()
+    }
+
+    /// A step that fails inside its transaction leaves the migration lock
+    /// released all the same: the step rolls back, `apply` answers the
+    /// error, and the session no longer holds the lock, so an instance whose
+    /// migration failed does not keep every other instance from starting.
+    /// The ledger here claims every step but the last while no table exists,
+    /// so the last step's index has nothing to go on.
+    #[tokio::test]
+    async fn a_failed_step_still_releases_the_migration_lock() {
+        let Ok(url) = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") else {
+            return;
+        };
+        if url.is_empty() {
+            return;
+        }
+        let schema = format!("mig_failstep_{}", std::process::id());
+        let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+        fresh_schema(&mut conn, &schema).await;
+        sqlx::raw_sql(
+            "CREATE TABLE schema_migration (version BIGINT PRIMARY KEY, applied_at TEXT NOT NULL)",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        let last = MIGRATIONS.last().unwrap().version;
+        sqlx::query("INSERT INTO schema_migration (version, applied_at) VALUES ($1, $2)")
+            .bind(last - 1)
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(&mut conn)
+            .await
+            .unwrap();
+
+        let err = apply(&mut conn)
+            .await
+            .expect_err("the last step has no table to index");
+        assert!(
+            err.to_string().contains(&format!("v{last}")),
+            "the failed step is named: {err}"
+        );
+        assert!(
+            !holds_migration_lock(&mut conn).await,
+            "a failed step still releases the migration lock"
+        );
+        let (stamp,): (i64,) = sqlx::query_as("SELECT MAX(version) FROM schema_migration")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(stamp, last - 1, "the failed step is not stamped");
 
         sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
             .execute(&mut conn)
@@ -1462,12 +1760,7 @@ mod tests {
         let root = tmp.path().join("d");
         let schema = format!("mig_reparse_{}", std::process::id());
         let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
-        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-            "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; SET search_path TO {schema}, public"
-        )))
-        .execute(&mut conn)
-        .await
-        .unwrap();
+        fresh_schema(&mut conn, &schema).await;
         sqlx::raw_sql(
             "CREATE TABLE IF NOT EXISTS schema_migration (version BIGINT PRIMARY KEY, applied_at TEXT NOT NULL)",
         )
@@ -1510,12 +1803,7 @@ mod tests {
         engrams: &[(&str, &str, &serde_json::Value)],
     ) -> Vec<i64> {
         let mut conn = sqlx::PgConnection::connect(url).await.unwrap();
-        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-            "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; SET search_path TO {schema}, public"
-        )))
-        .execute(&mut conn)
-        .await
-        .unwrap();
+        fresh_schema(&mut conn, schema).await;
         sqlx::raw_sql(
             "CREATE TABLE IF NOT EXISTS schema_migration (version BIGINT PRIMARY KEY, applied_at TEXT NOT NULL)",
         )
@@ -1660,12 +1948,7 @@ mod tests {
         }
         let schema = format!("mig_pathc_{}", std::process::id());
         let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
-        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-            "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; SET search_path TO {schema}, public"
-        )))
-        .execute(&mut conn)
-        .await
-        .unwrap();
+        fresh_schema(&mut conn, &schema).await;
         sqlx::raw_sql(
             "CREATE TABLE IF NOT EXISTS schema_migration (version BIGINT PRIMARY KEY, applied_at TEXT NOT NULL)",
         )
@@ -1894,5 +2177,526 @@ mod tests {
             ms as f64 * 1000.0 / ENGRAMS as f64
         );
         store.drop_schema().await.unwrap();
+    }
+
+    /// v21, the Reflection's files: it follows the reflection index, its
+    /// table takes a row once the store opens, a replay of the step converges
+    /// (a database another binary migrated may hold a step without its
+    /// stamp, as `apply_unlocked` notes), and the wipe clears the rows before the
+    /// domains they point at.
+    #[tokio::test]
+    async fn v21_adds_the_reflection_asset_table_and_replays_cleanly() {
+        let Ok(url) = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") else {
+            return;
+        };
+        if url.is_empty() {
+            return;
+        }
+        let at_version = |v: i64| {
+            MIGRATIONS
+                .iter()
+                .position(|m| m.version == v)
+                .unwrap_or_else(|| panic!("no migration v{v}"))
+        };
+        let (v20, v21) = (at_version(20), at_version(21));
+        assert_eq!(MIGRATIONS[v21].label, "reflection assets");
+        assert_eq!(MIGRATIONS[v20].label, "reflection index");
+        assert_eq!(v21, v20 + 1, "nothing between the two");
+
+        let schema = format!("mig_refl_asset_{}", std::process::id());
+        let store = crate::PostgresStore::open_in_schema(&url, &schema)
+            .await
+            .unwrap();
+        let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "SET search_path TO {schema}, public"
+        )))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        sqlx::raw_sql(MIGRATIONS[v21].sql)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO domain (id, name, path) OVERRIDING SYSTEM VALUE VALUES (1, 'd', NULL);
+             INSERT INTO reflection_asset (domain_id, path, sha256, mime, size, modified)
+             VALUES (1, 'assets/a.png', 's', 'image/png', 1, 't');",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        let at = |t: &str| WIPE_TABLES.iter().position(|w| *w == t);
+        assert!(
+            at("reflection_asset").is_some() && at("reflection_asset") < at("domain"),
+            "the file rows are wiped before the domains they point at, or the foreign key refuses"
+        );
+        drop(conn);
+        store.drop_schema().await.unwrap();
+    }
+
+    /// v22, the Reflection's chunks: it follows the reflection asset table, a
+    /// replay of the step converges (every `CREATE` is `IF NOT EXISTS`), it
+    /// blanks the page stamps so the next walk re-reads every page, and the
+    /// wipe clears the chunks before the pages and the domains.
+    #[tokio::test]
+    async fn v22_adds_the_reflection_chunk_table_and_replays_cleanly() {
+        let Ok(url) = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") else {
+            return;
+        };
+        if url.is_empty() {
+            return;
+        }
+        let at_version = |v: i64| {
+            MIGRATIONS
+                .iter()
+                .position(|m| m.version == v)
+                .unwrap_or_else(|| panic!("no migration v{v}"))
+        };
+        let (v21, v22) = (at_version(21), at_version(22));
+        assert_eq!(MIGRATIONS[v22].label, "reflection chunks");
+        assert_eq!(v22, v21 + 1, "it follows the reflection asset table");
+
+        let schema = format!("mig_refl_chunk_{}", std::process::id());
+        let store = crate::PostgresStore::open_in_schema(&url, &schema)
+            .await
+            .unwrap();
+        let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "SET search_path TO {schema}, public"
+        )))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO domain (id, name, path) OVERRIDING SYSTEM VALUE VALUES (1, 'd', NULL);
+             INSERT INTO reflection (domain_id, path, title, content, sha256, size, modified)
+             VALUES (1, 'a.md', 'A', 'x', 's', 1, '2026-10-14T00:00:00+00:00');",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        sqlx::raw_sql(MIGRATIONS[v22].sql)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let (modified,): (String,) = sqlx::query_as("SELECT modified FROM reflection")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            modified, "",
+            "the stamp is blank, so the next walk reads the page"
+        );
+        sqlx::raw_sql(
+            "INSERT INTO reflection_chunk (domain_id, path, seq, text, text_hash)
+             VALUES (1, 'a.md', 0, 't', 'h');",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        let at = |t: &str| WIPE_TABLES.iter().position(|w| *w == t);
+        assert!(
+            at("reflection_chunk").is_some()
+                && at("reflection_chunk") < at("reflection")
+                && at("reflection") < at("domain"),
+            "the chunks are wiped before the pages and the domains, or the foreign key refuses"
+        );
+        drop(conn);
+        store.drop_schema().await.unwrap();
+    }
+
+    /// v24, the Reflection gate's folder index, over a database at v23 with
+    /// a domain of engram rows in it: the index folds ASCII only (`COLLATE
+    /// "C"`), a replay changes nothing, and the shipped probe, forced onto the
+    /// generic plan a prepared statement settles on, seeks it and answers the
+    /// base rows under the folder in any ASCII letter case.
+    #[tokio::test]
+    async fn v24_over_v23_lets_the_folder_probe_seek() {
+        let Ok(url) = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") else {
+            return;
+        };
+        if url.is_empty() {
+            return;
+        }
+        let v24 = MIGRATIONS
+            .iter()
+            .position(|m| m.version == 24)
+            .expect("no migration v24");
+        assert_eq!(MIGRATIONS[v24 - 1].version, 23, "it follows v23");
+        let schema = format!("mig_refl_head_{}", std::process::id());
+        let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+        fresh_schema(&mut conn, &schema).await;
+        for m in &MIGRATIONS[..v24] {
+            sqlx::raw_sql(m.sql).execute(&mut conn).await.unwrap();
+        }
+        // A domain big enough that a walk of it would show: 4000 base rows
+        // over 200 folders, three rows under the folder, a draft under it, a
+        // sibling whose name only starts the same way, and a non-ASCII
+        // spelling that a Unicode fold could reach but `is_under_reflections`
+        // never does.
+        sqlx::raw_sql(
+            "INSERT INTO domain (id, name, path) OVERRIDING SYSTEM VALUE VALUES (1, 'd', NULL);
+             INSERT INTO engram (domain_id, path, permalink, title, engram_type, status, metadata, actor)
+             SELECT 1, 'f' || (g % 200) || '/e' || g || '.md', 'f' || (g % 200) || '/e' || g,
+                    't', 'engram', 'stable', '{}', ''
+             FROM generate_series(1, 4000) g;
+             INSERT INTO engram (domain_id, path, permalink, title, engram_type, status, metadata, actor)
+             VALUES (1, 'reflections/a.md', 'ra', 't', 'engram', 'stable', '{}', ''),
+                    (1, 'Reflections/b.md', 'rb', 't', 'engram', 'stable', '{}', ''),
+                    (1, 'REFLECTIONS/deep/c.md', 'rc', 't', 'engram', 'stable', '{}', ''),
+                    (1, 'reflections/d.md', 'rd', 't', 'engram', 'stable', '{}', 'alice'),
+                    (1, 'reflectionsx/e.md', 're', 't', 'engram', 'stable', '{}', ''),
+                    (1, 'REFLECTİONS/f.md', 'rf', 't', 'engram', 'stable', '{}', '');",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        for round in ["v24", "a replay of v24"] {
+            sqlx::raw_sql(MIGRATIONS[v24].sql)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            let (def,): (String,) = sqlx::query_as(
+                "SELECT indexdef FROM pg_indexes \
+                 WHERE schemaname = $1 AND indexname = 'idx_engram_reflection_head'",
+            )
+            .bind(&schema)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+            assert!(def.contains(r#"COLLATE "C""#), "after {round}: {def}");
+        }
+        sqlx::raw_sql("ANALYZE engram")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "SET plan_cache_mode = force_generic_plan; \
+             PREPARE head_probe(BIGINT, BIGINT) AS {}",
+            crate::postgres::ENGRAM_ROWS_UNDER_REFLECTIONS_SQL
+        )))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        let plan: Vec<(String,)> = sqlx::query_as("EXPLAIN EXECUTE head_probe(1, 64)")
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
+        let plan: Vec<String> = plan.into_iter().map(|(line,)| line).collect();
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("idx_engram_reflection_head")),
+            "the generic plan seeks the index: {plan:#?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("Index Cond: ((lower(")),
+            "on the folder expression: {plan:#?}"
+        );
+        let mut found: Vec<String> = sqlx::query_as::<_, (String,)>("EXECUTE head_probe(1, 64)")
+            .fetch_all(&mut conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(p,)| p)
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                "REFLECTIONS/deep/c.md",
+                "Reflections/b.md",
+                "reflections/a.md"
+            ]
+        );
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    /// v25, the host move columns, over a database at v24 with a domain in
+    /// it: the row reads no last host and no move, the columns take values,
+    /// and a replay changes nothing.
+    #[tokio::test]
+    async fn v25_over_v24_adds_the_host_move_columns() {
+        let Ok(url) = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") else {
+            return;
+        };
+        if url.is_empty() {
+            return;
+        }
+        let v25 = MIGRATIONS
+            .iter()
+            .position(|m| m.version == 25)
+            .expect("no migration v25");
+        assert_eq!(MIGRATIONS[v25 - 1].version, 24, "it follows v24");
+        let schema = format!("mig_host_move_{}", std::process::id());
+        let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+        fresh_schema(&mut conn, &schema).await;
+        for m in &MIGRATIONS[..v25] {
+            sqlx::raw_sql(m.sql).execute(&mut conn).await.unwrap();
+        }
+        sqlx::raw_sql(
+            "INSERT INTO domain (id, name, path) OVERRIDING SYSTEM VALUE VALUES (1, 'd', '/tmp/d');",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        for round in ["v25", "a replay of v25"] {
+            sqlx::raw_sql(MIGRATIONS[v25].sql)
+                .execute(&mut conn)
+                .await
+                .unwrap_or_else(|e| panic!("{round}: {e}"));
+            let (empty,): (i64,) = sqlx::query_as(
+                "SELECT count(*) FROM domain WHERE last_host_id IS NULL \
+                 AND last_host_label IS NULL AND host_move IS NULL",
+            )
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+            assert_eq!(
+                empty, 1,
+                "{round}: the old row reads no last host and no move"
+            );
+        }
+        sqlx::raw_sql(
+            "UPDATE domain SET last_host_id='a', last_host_label='a', host_move='{}' WHERE id=1;",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        let (set,): (i64,) = sqlx::query_as("SELECT count(*) FROM domain WHERE host_move = '{}'")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(set, 1);
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    /// v23, the reflection chunks by domain, over a database at v22 with
+    /// chunk rows in it: the domain index is there afterwards, the model
+    /// index (which no statement seeks any more) is gone, the rows are kept,
+    /// and a replay of v23 changes nothing. Talks to sqlx directly, because
+    /// opening a store applies every migration at once.
+    #[tokio::test]
+    async fn v23_over_v22_swaps_the_model_index_for_the_domain_index() {
+        let Ok(url) = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") else {
+            return;
+        };
+        if url.is_empty() {
+            return;
+        }
+        let v23 = MIGRATIONS
+            .iter()
+            .position(|m| m.version == 23)
+            .expect("no migration v23");
+        assert_eq!(MIGRATIONS[v23 - 1].version, 22, "it follows v22");
+        let schema = format!("mig_refl_domain_{}", std::process::id());
+        let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+        fresh_schema(&mut conn, &schema).await;
+        for m in &MIGRATIONS[..v23] {
+            sqlx::raw_sql(m.sql).execute(&mut conn).await.unwrap();
+        }
+        sqlx::raw_sql(
+            "INSERT INTO domain (id, name, path) OVERRIDING SYSTEM VALUE VALUES (1, 'd', NULL);
+             INSERT INTO reflection_chunk (domain_id, path, seq, text, text_hash, model, dims)
+             VALUES (1, 'a.md', 0, 't', 'h', 'm', 8), (1, 'a.md', 1, 'u', 'i', NULL, NULL);",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        let indexes = |schema: String| async move {
+            let mut conn = sqlx::PgConnection::connect(&url_of()).await.unwrap();
+            let rows: Vec<(String,)> = sqlx::query_as(
+                "SELECT indexname FROM pg_indexes \
+                 WHERE schemaname = $1 AND tablename = 'reflection_chunk' ORDER BY indexname",
+            )
+            .bind(schema)
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
+            rows.into_iter().map(|(n,)| n).collect::<Vec<String>>()
+        };
+        fn url_of() -> String {
+            std::env::var("CRYSTALLINE_TEST_POSTGRES_URL").unwrap()
+        }
+        assert!(
+            indexes(schema.clone())
+                .await
+                .contains(&"idx_reflection_chunk_model".to_string()),
+            "precondition: v22 has the model index"
+        );
+        let want = [
+            "idx_reflection_chunk_domain_model",
+            "idx_reflection_chunk_embedding",
+            "idx_reflection_chunk_page",
+            "reflection_chunk_pkey",
+        ];
+        for round in ["v23", "a replay of v23"] {
+            sqlx::raw_sql(MIGRATIONS[v23].sql)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            assert_eq!(indexes(schema.clone()).await, want, "after {round}");
+            let (n,): (i64,) = sqlx::query_as("SELECT count(*) FROM reflection_chunk")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+            assert_eq!(n, 2, "after {round}: the rows stay");
+        }
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    /// The postgres url `url` with its database name swapped for `db`, any
+    /// query string kept.
+    fn url_for_database(url: &str, db: &str) -> String {
+        let (base, query) = match url.split_once('?') {
+            Some((base, query)) => (base, Some(query)),
+            None => (url, None),
+        };
+        let (server, _) = base
+            .rsplit_once('/')
+            .expect("a postgres url names a database");
+        match query {
+            Some(q) => format!("{server}/{db}?{q}"),
+            None => format!("{server}/{db}"),
+        }
+    }
+
+    /// Two instances that first start at the same moment on an empty schema
+    /// used to race: both read version 0, both ran v1's `CREATE TABLE`, and
+    /// one of them failed its start on a duplicate catalog row or a duplicate
+    /// stamp. The migration's advisory lock makes them take turns, so every
+    /// open succeeds and every version is stamped once. Three rounds, each on
+    /// a schema of its own, because a race does not lose every time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_first_opens_of_one_empty_schema_all_migrate() {
+        let Ok(url) = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") else {
+            return;
+        };
+        if url.is_empty() {
+            return;
+        }
+        let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+        for round in 0..3 {
+            let schema = format!("mig_race_{}_{round}", std::process::id());
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "DROP SCHEMA IF EXISTS {schema} CASCADE"
+            )))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+            let mut opens = tokio::task::JoinSet::new();
+            for _ in 0..4 {
+                let (url, schema) = (url.clone(), schema.clone());
+                opens.spawn(
+                    async move { crate::PostgresStore::open_in_schema(&url, &schema).await },
+                );
+            }
+            let mut stores = Vec::new();
+            let mut failures = Vec::new();
+            while let Some(joined) = opens.join_next().await {
+                match joined.unwrap() {
+                    Ok(store) => stores.push(store),
+                    Err(e) => failures.push(e.to_string()),
+                }
+            }
+            let stamps: Vec<(i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT version, count(*) FROM {schema}.schema_migration GROUP BY version ORDER BY version"
+            )))
+            .fetch_all(&mut conn)
+            .await
+            .unwrap_or_default();
+            let (domain,): (Option<String>,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT to_regclass('{schema}.domain')::text"
+            )))
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+            drop(stores);
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "DROP SCHEMA IF EXISTS {schema} CASCADE"
+            )))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+
+            assert!(
+                failures.is_empty(),
+                "round {round}: every open succeeds: {failures:?}"
+            );
+            let want: Vec<(i64, i64)> = MIGRATIONS.iter().map(|m| (m.version, 1)).collect();
+            assert_eq!(stamps, want, "round {round}: every version is stamped once");
+            assert!(
+                domain.is_some(),
+                "round {round}: the tables land in {schema}, not in public"
+            );
+        }
+    }
+
+    /// The same race one level up: on a database that does not have the
+    /// vector extension yet, two sessions that run v1's `CREATE EXTENSION IF
+    /// NOT EXISTS` at the same moment make one of them fail on a duplicate
+    /// `pg_extension_name_index` row. A database of its own is the only way to
+    /// reach this leg, because the test database already has the extension.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_first_opens_of_a_fresh_database_create_the_extension_once() {
+        let Ok(url) = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") else {
+            return;
+        };
+        if url.is_empty() {
+            return;
+        }
+        let db = format!("crys_ext_{}", std::process::id());
+        let mut admin = sqlx::PgConnection::connect(&url).await.unwrap();
+        let drop_db = format!("DROP DATABASE IF EXISTS {db} WITH (FORCE)");
+        sqlx::raw_sql(sqlx::AssertSqlSafe(drop_db.clone()))
+            .execute(&mut admin)
+            .await
+            .unwrap();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE DATABASE {db}")))
+            .execute(&mut admin)
+            .await
+            .unwrap();
+        let fresh = url_for_database(&url, &db);
+
+        let mut opens = tokio::task::JoinSet::new();
+        for _ in 0..4 {
+            let fresh = fresh.clone();
+            opens.spawn(async move { crate::PostgresStore::open(&fresh).await });
+        }
+        let mut stores = Vec::new();
+        let mut failures = Vec::new();
+        while let Some(joined) = opens.join_next().await {
+            match joined.unwrap() {
+                Ok(store) => stores.push(store),
+                Err(e) => failures.push(e.to_string()),
+            }
+        }
+        let extensions: i64 = match sqlx::PgConnection::connect(&fresh).await {
+            Ok(mut c) => {
+                sqlx::query_scalar("SELECT count(*) FROM pg_extension WHERE extname = 'vector'")
+                    .fetch_one(&mut c)
+                    .await
+                    .unwrap()
+            }
+            Err(_) => -1,
+        };
+        drop(stores);
+        sqlx::raw_sql(sqlx::AssertSqlSafe(drop_db))
+            .execute(&mut admin)
+            .await
+            .unwrap();
+
+        assert!(failures.is_empty(), "every open succeeds: {failures:?}");
+        assert_eq!(extensions, 1, "the extension is created once");
     }
 }

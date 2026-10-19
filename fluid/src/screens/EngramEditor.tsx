@@ -9,18 +9,23 @@
  * editing a page that now 404s.
  */
 
-import { autocompletion } from "@codemirror/autocomplete";
-import type { Extension, Transaction } from "@codemirror/state";
+import type { Extension } from "@codemirror/state";
 import { Compartment, EditorState } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
 import { keymap } from "@codemirror/view";
-import type { QueryClient } from "@tanstack/react-query";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Check, FileCode } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ChevronDown } from "lucide-react";
+import type { ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { Link, useNavigate, useParams } from "react-router";
-import type { YSyncConfig } from "y-codemirror.next";
-import { yCollab, ySyncFacet, yUndoManagerKeymap } from "y-codemirror.next";
+import { yCollab, yUndoManagerKeymap } from "y-codemirror.next";
 import type { Awareness } from "y-protocols/awareness";
 import * as Y from "yjs";
 
@@ -37,51 +42,49 @@ import { saveEngram } from "../api/writes";
 import { useAuth } from "../auth/AuthContext";
 import { useDomainWritable } from "../domainWritable";
 import { CollabConflictDialog } from "../collab/CollabConflictDialog";
+import { normalizePastedEndings } from "../collab/pastedEndings";
+import { cursorFlags } from "../collab/cursorFlags";
 import { PresenceChips } from "../collab/PresenceChips";
 import type { CollabConflict, CollabSession } from "../collab/useCollabSession";
-import { fileSpace, useCollabSession } from "../collab/useCollabSession";
+import {
+  NOT_LIVE,
+  fileSpace,
+  useCollabSession,
+} from "../collab/useCollabSession";
 import { Breadcrumbs, crumbsOf } from "../components/Breadcrumbs";
 import { CopyAddress } from "../components/DetailsPanel";
 import { DraftLinkDialog } from "../components/DraftLinkDialog";
-import { BUTTON, ICON_TOGGLE, Tooltip } from "../components/primitives";
-import { Skeleton } from "../components/Skeleton";
+import { Loading } from "../components/Loading";
+import { BUTTON, FOCUS_RING, TOGGLE, Tooltip } from "../components/primitives";
 import { SimilarEngramsPanel } from "../components/SimilarEngramsPanel";
 import { domainSpellings } from "../domainNames";
+import type { DocumentAdapter } from "../editor/adapter";
+import { engramAdapter } from "../editor/adapter";
 import CmEditor from "../editor/CmEditor";
 import { ConfirmLeaveDialog } from "../editor/ConfirmLeaveDialog";
 import { ConflictDialog } from "../editor/ConflictDialog";
-import {
-  crystallineCompletions,
-  crystallineLines,
-} from "../editor/crystallineLines";
 import { EditorToolbar } from "../editor/EditorToolbar";
-import { fenceMono } from "../editor/fenceMono";
-import { fencePreviews } from "../editor/fencePreviews";
 import { imagePreviews } from "../editor/imagePreviews";
-import { imageContextListener } from "../editor/imageVerbs";
 import { FindingsPanel, jumpToLine } from "../editor/FindingsPanel";
-import { frontmatterFold } from "../editor/frontmatterFold";
 import { FrontmatterForm } from "../editor/FrontmatterForm";
-import { livePreview } from "../editor/preview";
+import { KeptTextNotice } from "../editor/KeptTextNotice";
+import { docText, lineSeparatorFor } from "../editor/setup";
+import type { ElementFace } from "../editor/elementContext";
+import { previewConfig, surfaceExtensions } from "../editor/surface";
+import type { SaveStateKind } from "../editor/SaveState";
+import { SaveState } from "../editor/SaveState";
 import {
-  RAW_MONO,
-  baseExtensions,
-  docText,
-  lineSeparatorFor,
-} from "../editor/setup";
-import { tableContextListener } from "../editor/tableVerbs";
-import { formattingKeymap } from "../editor/toolbar";
-import { useAttachmentUploads } from "../editor/useAttachmentUploads";
+  UploadScreenContext,
+  useAttachmentUploads,
+  useUploadScreen,
+} from "../editor/useAttachmentUploads";
 import { useCloseFlow, useExitRequest } from "../editor/useCloseFlow";
+import { useRoomExit } from "../editor/useRoomExit";
 import { saveKeymap, useEditorSession } from "../editor/useEditorSession";
-import {
-  wikilinkChips,
-  wikilinkCompletions,
-  wikilinkResolverFacet,
-} from "../editor/wikilinkChips";
+import { wikilinkResolverFacet } from "../editor/wikilinkChips";
 import { useIgnoredEngram } from "../events/ignored";
-import { useFullWidth } from "../layoutWidth";
-import { domainRoute, editRoute, engramRoute } from "../paths";
+import { moveDraft } from "../editor/drafts";
+import { editRoute, engramRoute, engramsRoute } from "../paths";
 import { ENGRAM_PREFETCH } from "../prefetch";
 import { useTheme } from "../theme/context";
 import type { WikilinkResolver } from "../wikilinks";
@@ -90,46 +93,6 @@ import NotFound from "./NotFound";
 
 /** The buffer's accessible name - shared with the state a conflict rebuilds. */
 const ARIA_LABEL = "Engram source";
-
-/**
- * What the preview compartment holds, in the one place it is ever spelled.
- *
- * Two sites configure that compartment - `surfaceExtensions`, which every
- * state this screen builds goes through, and the Raw toggle - and a decoration
- * layer added to only one of them would vanish on whichever path was missed.
- * Later layers are appended to this array and reach both at once.
- */
-function previewConfig(
-  off: boolean,
-  dark: boolean,
-  /** The domain the inline image previews load their files from. */
-  domain: string,
-): Extension {
-  return off
-    ? // Raw is deliberately the source view, so the whole buffer goes back to
-      // mono: the shared theme sets prose proportional, and this is the one
-      // place that undoes it.
-      [RAW_MONO]
-    : [
-        livePreview(),
-        wikilinkChips(),
-        crystallineLines(),
-        fencePreviews(dark),
-        // A pasted screenshot is a path in the buffer and a picture on the
-        // page, so the picture is drawn here too: an author placing an image
-        // sees what a reader will see rather than the reference to it.
-        imagePreviews(domain),
-        // The frontmatter form beside the buffer is the metadata surface, so
-        // the block itself folds to one chip here rather than being shown
-        // twice. The MANIFEST editor deliberately does not get this: it has
-        // no form, so its frontmatter is only ever visible in the buffer.
-        frontmatterFold(),
-        // Prose is proportional, code is not. Raw mode does not need this -
-        // the whole buffer is mono there - so it rides the preview branch
-        // with the rest of the read model.
-        fenceMono(),
-      ];
-}
 
 /** Preview is on when the editor opens. */
 const RAW_AT_MOUNT = false;
@@ -164,98 +127,86 @@ const NO_RESOLUTION: WikilinkResolver = () => null;
  */
 const CLOSED_NOTICE_MS = 1200;
 
+/** A refused save or upload: the server's own sentence. */
+const ALERT =
+  "rounded bg-red-50 px-2 py-1 text-sm text-red-800 dark:bg-red-950 dark:text-red-200";
+/** The session banners: moved, closed, an offered draft. */
+const AMBER_BANNER =
+  "flex flex-wrap items-baseline gap-3 rounded border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-100";
+
+/**
+ * The Details rail: the frontmatter form, the findings and the address. A
+ * column beside the text from the large breakpoint; on a narrower screen the
+ * same element sits above the text behind a "Details" disclosure, so the
+ * fields are one press away without pushing the text down a screen. One
+ * element either way, so the two placements cannot drift apart.
+ */
+function EditorDetails({
+  children,
+  hasHardErrors,
+}: {
+  children: ReactNode;
+  /** Opens the disclosure when hard errors appear: the alert above says
+   *  "see Findings", and the findings are in here. */
+  hasHardErrors: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const [hadErrors, setHadErrors] = useState(hasHardErrors);
+  if (hasHardErrors !== hadErrors) {
+    setHadErrors(hasHardErrors);
+    if (hasHardErrors) {
+      setOpen(true);
+    }
+  }
+  const body = useId();
+  return (
+    <aside
+      aria-label="Details"
+      className="order-2 flex flex-col gap-3 border-b border-hair pb-3 lg:col-start-2 lg:row-span-2 lg:row-start-1 lg:border-0 lg:pb-0"
+    >
+      <h2 className="hidden text-caption font-semibold text-ink-3 lg:block">
+        Details
+      </h2>
+      <button
+        type="button"
+        aria-expanded={open}
+        aria-controls={body}
+        onClick={() => {
+          setOpen(!open);
+        }}
+        className={`flex items-center justify-between rounded py-1 text-sm font-medium text-ink-3 lg:hidden ${FOCUS_RING}`}
+      >
+        Details
+        <ChevronDown
+          aria-hidden="true"
+          size={16}
+          className={open ? "rotate-180" : ""}
+        />
+      </button>
+      <div
+        id={body}
+        className={`flex-col gap-4 ${open ? "flex" : "hidden lg:flex"}`}
+      >
+        {children}
+      </div>
+    </aside>
+  );
+}
+
 /** The shared text and the room's presence, once a session has synced. */
 interface Room {
   ytext: Y.Text;
   awareness: Awareness;
 }
 
-/**
- * Whether this transaction is the co-editing binding putting the ROOM's text
- * into the buffer, which must be handed back exactly as it arrived.
- *
- * y-codemirror.next skips its write-back into `Y.Text` only while the
- * transaction still carries the annotation its sync plugin dispatched with,
- * and a transaction rebuilt by the filter below has lost it: the plugin would
- * re-apply a remote insert INTO the shared text and every participant would
- * end up with it twice, with the buffer and the document permanently apart.
- * Session text may legitimately hold a lone CR - the server admits a stray-CR
- * file and broadcasts such lines from a merge - so this is a live path, not a
- * theoretical one.
- *
- * The annotation type is not reachable: y-codemirror.next 0.3.5, the current
- * release, exports `ySyncFacet` and `YSyncConfig` but not `ySyncAnnotation`,
- * and its `exports` map admits no deep import. So the binding is recognized by
- * what it guarantees instead. It dispatches from the `Y.Text` observer, with
- * the shared text ALREADY carrying the change, so the document this
- * transaction produces IS the shared text. A local edit runs the other way -
- * Yjs is written after the transaction lands - so the two still differ here.
- * A state with no binding has no facet and no write-back to protect.
- */
-function isRoomWriteBack(tr: Transaction): boolean {
-  const sync = tr.startState.facet(ySyncFacet) as YSyncConfig | undefined;
-  if (sync === undefined) {
-    return false;
-  }
-  const shared = sync.ytext as Y.Text;
-  return tr.newDoc.toString() === shared.toJSON();
-}
-
-/**
- * Keep the shared text in LF space whatever gets pasted into it.
- *
- * A session document is LF by construction - the server strips a CRLF file's
- * endings on the way in and puts them back on the way out - so a CR arriving
- * through the clipboard is not this author's line ending, it is a stray byte
- * that would land in every participant's file and in the saved engram.
- */
-const normalizePastedEndings = EditorState.transactionFilter.of((tr) => {
-  if (!tr.docChanged) {
-    return tr;
-  }
-  let needsRewrite = false;
-  tr.changes.iterChanges((_fromA, _toA, _fromB, _toB, inserted) => {
-    if (inserted.toString().includes("\r")) {
-      needsRewrite = true;
-    }
-  });
-  if (!needsRewrite) {
-    return tr;
-  }
-  // Checked here rather than at the top: the comparison walks the shared
-  // text, and only a frame carrying a CR can reach it at all. A sync
-  // transaction with no CR in it is handed back untouched either way.
-  if (isRoomWriteBack(tr)) {
-    return tr;
-  }
-  const changes: { from: number; to: number; insert: string }[] = [];
-  tr.changes.iterChanges((fromA, toA, _fromB, _toB, inserted) => {
-    changes.push({
-      from: fromA,
-      to: toA,
-      insert: inserted.toString().replace(/\r\n?/g, "\n"),
-    });
-  });
-  // The selection is deliberately omitted rather than carried over: its
-  // positions belong to the unrewritten, longer inserts and can point past
-  // the end of the rewritten document, which CodeMirror refuses outright.
-  // Given no selection of its own, it maps the existing one through these
-  // changes instead, which is the correct place for the cursor anyway.
-  //
-  // Rebuilding drops the transaction's annotations, which is why the room's
-  // own write-back is let through above: this path only ever rebuilds a local
-  // edit, whose annotations nothing downstream depends on.
-  return { changes };
-});
-
 /** Everything one buffer on this screen is built from. */
-interface SurfaceOptions {
+interface EngramSurfaceOptions {
   /** The text the buffer opens with, whose line endings it inherits. */
   content: string;
-  /** The cache the completion's title lookup goes through. */
-  client: QueryClient;
+  /** What an engram adds to the shared surface. */
+  adapter: DocumentAdapter;
   dark: boolean;
-  /** The engram's own domain, which decides what a completion prefixes. */
+  /** The engram's own domain, which the image previews load from. */
   domain: string;
   /** The layer switch the Raw toggle reconfigures. */
   preview: Compartment;
@@ -263,47 +214,28 @@ interface SurfaceOptions {
   /** The resolver's own switch, reconfigured when the graph lands. */
   resolverBox: Compartment;
   resolver: WikilinkResolver;
-  /**
-   * The domain's vocabulary, read fresh on every completion rather than
-   * closed over: the fetch behind it lands after the buffer mounts, and a
-   * plain value captured here would go on answering `null` forever once it
-   * did.
-   */
-  vocab: () => Vocabulary | null;
   /** The session this buffer is bound to, or null on the solo surface. */
   room: Room | null;
-  /**
-   * Paste and drop uploads. Inside the options for the same reason the table
-   * listener is: every state this screen builds goes through this function,
-   * and handlers added beside it at one site would go silent the first time a
-   * session rebuilt the buffer.
-   */
+  /** Paste and drop uploads; see `SurfaceOptions`. */
   uploads: Extension;
-  /**
-   * Told when the caret enters or leaves a table, so the format bar can draw
-   * its table verbs. It travels inside the options rather than being added
-   * beside them, because every state this screen builds goes through this
-   * function and a listener added at only one site would go silent the first
-   * time a session rebuilt the buffer.
-   */
+  /** Told when the caret enters or leaves a table; see `SurfaceOptions`. */
   onTableContext: (inTable: boolean) => void;
-  /**
-   * Told when the caret enters or leaves an attachment image, so the format
-   * bar can draw its image menu. It travels with the table listener above and
-   * for the same reason.
-   */
+  /** Told when the caret enters or leaves an image; see `SurfaceOptions`. */
   onImageContext: (onImage: boolean) => void;
+  /** Told what callout or label the caret is in; see `SurfaceOptions`. */
+  onElementContext: (face: ElementFace) => void;
 }
 
 /**
- * The whole extension set of one buffer, in the one place it is ever spelled.
+ * The whole extension set of one buffer, in the one place this screen spells
+ * it: the shared surface plus what only this screen adds.
  *
  * Two sites build a state for this screen - the mount and the wholesale
  * rebuild the session's `replaceWith` performs - and `setState` replaces the
  * configuration entirely, so anything listed in only one of them silently
  * disappears the first time a swap rebuilds the buffer.
  */
-function surfaceExtensions(options: SurfaceOptions): Extension[] {
+function engramSurface(options: EngramSurfaceOptions): Extension[] {
   const room = options.room;
   return [
     // A session buffer pins LF rather than deriving a separator from its
@@ -313,48 +245,33 @@ function surfaceExtensions(options: SurfaceOptions): Extension[] {
     ...(room !== null
       ? [EditorState.lineSeparator.of("\n")]
       : lineSeparatorFor(options.content)),
-    // The room's own undo stack replaces CodeMirror's: see `baseExtensions`.
-    ...baseExtensions(options.dark, { history: room === null }),
-    ...(room !== null
-      ? [
-          yCollab(room.ytext, room.awareness, {
-            undoManager: new Y.UndoManager(room.ytext),
-          }),
-          keymap.of(yUndoManagerKeymap),
-          normalizePastedEndings,
-        ]
-      : []),
-    saveKeymap,
-    // What the format bar's context segment watches. Outside the preview
-    // compartment: a table is a table in Raw mode too.
-    tableContextListener(options.onTableContext),
-    // The same watch for the image menu. Outside the preview compartment
-    // beside it: the menu edits the target's text, which is as much text in
-    // Raw mode as it is under the previews.
-    imageContextListener(options.onImageContext),
-    // A pasted screenshot and a dropped deck are attachments in Raw mode too,
-    // so these sit outside the compartment beside it.
-    options.uploads,
-    // The toolbar's own shortcuts. Beside `saveKeymap` rather than inside the
-    // preview compartment: Mod-b and Mod-i are typing help like the
-    // completions below, and raw mode is still markdown being written. Its
-    // `Prec.high` wrapper - not its position here - is what beats
-    // defaultKeymap's own Mod-i; see `formattingKeymap`.
-    formattingKeymap,
-    // Typing help rather than preview, so it stays on in raw mode: outside
-    // the compartment the Raw toggle empties.
-    autocompletion({
-      override: [
-        wikilinkCompletions(options.domain, options.client),
-        crystallineCompletions(options.vocab),
+    ...surfaceExtensions({
+      adapter: options.adapter,
+      dark: options.dark,
+      // The room's own undo stack replaces CodeMirror's: see `baseExtensions`.
+      history: room === null,
+      screen: [
+        ...(room !== null
+          ? [
+              yCollab(room.ytext, room.awareness, {
+                undoManager: new Y.UndoManager(room.ytext),
+              }),
+              keymap.of(yUndoManagerKeymap),
+              normalizePastedEndings,
+              cursorFlags,
+            ]
+          : []),
+        saveKeymap,
+        options.resolverBox.of(wikilinkResolverFacet.of(options.resolver)),
       ],
+      preview: options.preview,
+      raw: options.raw,
+      images: imagePreviews(options.domain),
+      uploads: options.uploads,
+      onTableContext: options.onTableContext,
+      onImageContext: options.onImageContext,
+      onElementContext: options.onElementContext,
     }),
-    options.resolverBox.of(wikilinkResolverFacet.of(options.resolver)),
-    // Every later flip goes through the compartment rather than through this
-    // array, which is read once per state.
-    options.preview.of(
-      previewConfig(options.raw, options.dark, options.domain),
-    ),
   ];
 }
 
@@ -385,7 +302,7 @@ export default function EngramEditor() {
     );
   }
   if (!detail.data) {
-    return <Skeleton label="Loading the editor" rows={8} />;
+    return <Loading label="Loading the editor" subject={permalink} />;
   }
   // Keyed by address: a different engram is a different editing session.
   return <EditorSurface key={`${domain}/${permalink}`} engram={detail.data} />;
@@ -408,6 +325,9 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
   // or graph under it. The tree, listing and switcher rows still fire, which
   // a rename receipt wants anyway.
   useIgnoredEngram(engram.domain, engram.permalink);
+  // The screen an upload belongs to: this editor, whatever room or buffer
+  // it shows (see `useAttachmentUploads`).
+  const uploadScreen = useUploadScreen();
   const { user } = useAuth();
   // Anonymous can never reach this screen (`canWrite` gates it above); the
   // fallback only satisfies the types.
@@ -454,58 +374,17 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
     collab.mode === "connecting" ||
     (collab.mode === "collab" && collab.ytext === null)
   ) {
-    return <Skeleton label="Connecting the session" rows={8} />;
+    return <Loading label="Connecting the session" subject={engram.title} />;
   }
   return (
-    <Surface
-      key={`${collab.mode}:${collab.epoch ?? ""}`}
-      engram={engram}
-      collab={collab}
-      account={account}
-    />
-  );
-}
-
-/**
- * What the room says about saving, which in a session is the server's job
- * rather than this tab's: the control channel's verdict, in its own words
- * when it refused.
- */
-function SessionStatus({ collab }: { collab: CollabSession }) {
-  return (
-    <>
-      {collab.status === "reconnecting" && (
-        // The one thing an author needs to know while the socket is down:
-        // typing is not being thrown away. The buffer stays live and the
-        // session resyncs on the same epoch when it comes back - a drop
-        // never forks the room into a second history.
-        <p role="status" className="text-sm text-amber-700 dark:text-amber-300">
-          Reconnecting - edits are kept locally
-        </p>
-      )}
-      {collab.mergeNotice && (
-        <p role="status" className="text-sm text-slate-500 dark:text-slate-400">
-          A change from outside was folded into this session.
-        </p>
-      )}
-      {collab.saveState === "failed" && collab.saveDetail !== null && (
-        <p
-          role="alert"
-          className="rounded bg-red-50 px-2 py-1 text-sm text-red-800 dark:bg-red-950 dark:text-red-200"
-        >
-          {collab.saveDetail}
-        </p>
-      )}
-      {collab.saveState === "pending" && (
-        <p className="text-sm text-slate-500 dark:text-slate-400">Saving...</p>
-      )}
-      {collab.saveState === "ok" && (
-        <p className="inline-flex items-center gap-1 text-sm text-slate-500 dark:text-slate-400">
-          <Check aria-hidden="true" size={14} strokeWidth={2} />
-          Saved
-        </p>
-      )}
-    </>
+    <UploadScreenContext.Provider value={uploadScreen}>
+      <Surface
+        key={`${collab.mode}:${collab.epoch ?? ""}`}
+        engram={engram}
+        collab={collab}
+        account={account}
+      />
+    </UploadScreenContext.Provider>
   );
 }
 
@@ -521,7 +400,6 @@ function Surface({
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const { resolved } = useTheme();
-  const { fullWidth } = useFullWidth();
   const { ytext, awareness } = collab;
   /**
    * The session this buffer belongs to, or null on the solo surface. Fixed
@@ -580,6 +458,8 @@ function Surface({
   const [tableActive, setTableActive] = useState(false);
   /** The same, for the caret sitting on an attachment image. */
   const [imageActive, setImageActive] = useState(false);
+  /** The callout or status label the caret is in, for their segments. */
+  const [element, setElement] = useState<ElementFace>(null);
   /**
    * WHICH conflict this tab has the resolution view open on, rather than a
    * bare open flag. The conflict itself is the server's - it stands until
@@ -590,6 +470,7 @@ function Surface({
    * conflict raised later never pops a dialog nobody asked for.
    */
   const [resolving, setResolving] = useState<CollabConflict | null>(null);
+  const [resolveProblem, setResolveProblem] = useState<string | null>(null);
   /**
    * Why the last attachment did not land, in the words of whoever refused it -
    * this tab for a file type or a size the server would bounce, the server for
@@ -618,6 +499,7 @@ function Surface({
   const uploadView = useRef<EditorView | null>(null);
   const uploads = useAttachmentUploads({
     domain: engram.domain,
+    subject: engram.title,
     view: () => uploadView.current,
     onError: setAttachError,
   });
@@ -667,6 +549,26 @@ function Surface({
     vocabRef.current = vocabulary.data ?? null;
   }, [vocabulary.data]);
   const readVocab = useCallback(() => vocabRef.current, []);
+  /**
+   * What an engram adds to the shared surface: its chips, lines, fold and
+   * completions. One object for the screen's life, so the Raw toggle hands
+   * the compartment back the same layers it took away.
+   */
+  const adapter = useMemo(
+    () =>
+      // `readVocab` only ever hands `vocabRef` to `crystallineCompletions`,
+      // which stores it in a `CompletionSource` closure CodeMirror calls later
+      // from typing, not here: nothing on this call stack reads `.current`
+      // during this render, but the checker cannot see through the
+      // `crystallineCompletions` call to confirm that.
+      // eslint-disable-next-line react-hooks/refs
+      engramAdapter({
+        domain: engram.domain,
+        client: queryClient,
+        vocab: readVocab,
+      }),
+    [engram.domain, queryClient, readVocab],
+  );
 
   /**
    * The extensions a buffer swapped in mid-session is rebuilt with: this
@@ -674,20 +576,20 @@ function Surface({
    * line separator.
    */
   const extensionsFor = (content: string) =>
-    surfaceExtensions({
+    engramSurface({
       content,
-      client: queryClient,
+      adapter,
       dark: resolved === "dark",
       domain: engram.domain,
       preview,
       raw,
       resolverBox,
       resolver,
-      vocab: readVocab,
       room,
       uploads: uploads.extension,
       onTableContext: setTableActive,
       onImageContext: setImageActive,
+      onElementContext: setElement,
     });
 
   /**
@@ -773,7 +675,7 @@ function Surface({
         queryKey: domainTreeKey(saved.domain),
       });
       /*
-       * Whether this save is the one Save and close asked for.
+       * Whether this save is the one Save and leave asked for.
        *
        * What is compared is the SENT content rather than the returned content,
        * read back through `docText` at the moment the answer lands: a server
@@ -805,6 +707,7 @@ function Surface({
     // `requestSave`, which the collab transport routes here. A forgotten
     // `flush` would be a Save button that silently does nothing.
     flush: collab.flush,
+    live: collab.live,
     draftContent,
   });
 
@@ -853,6 +756,16 @@ function Surface({
   const closed = inRoom && collab.closed;
   /** The room's standing conflict, if this surface is in a room at all. */
   const conflict = inRoom ? collab.conflict : null;
+  /*
+   * Whose document this editor is, as the room decides it: in a domain
+   * that reviews changes it is the reader's own draft unless it is
+   * somebody else's granted one. Unknown until the listing answers.
+   */
+  const reviewing =
+    domains.data === undefined
+      ? null
+      : (domains.data.domains.find((entry) => entry.name === engram.domain)
+          ?.review ?? null) !== null;
   const walkedOut = useRef(false);
   useEffect(() => {
     if (!closed || walkedOut.current) {
@@ -863,17 +776,30 @@ function Surface({
     walkedOut.current = true;
     session.snapshotDraft();
   }, [closed, session]);
+  /**
+   * The room closed because the engram moved: nothing is gone, so the author
+   * is not walked away. The banner offers the new address instead, and the
+   * draft the snapshot above wrote goes along. An editor that was still
+   * joining when the move came (its join is refused while the move runs, and
+   * the provider tries again) is told the same on its next try, with no room
+   * ever opened, so this is read on the solo surface too.
+   */
+  const movedTo = collab.movedTo;
+  // Moved somewhere this person cannot open: the notice says so and stays.
+  const movedAway = inRoom && collab.closedReason === "moved";
   useEffect(() => {
-    if (!closed) {
+    if (!closed || movedTo !== null || movedAway) {
       return;
     }
     const timer = setTimeout(() => {
-      void navigate(domainRoute(engram.domain), { replace: true });
+      // The engram view, not the domain's address, which may open on the
+      // Reflection: the reader was working on engrams.
+      void navigate(engramsRoute(engram.domain), { replace: true });
     }, CLOSED_NOTICE_MS);
     return () => {
       clearTimeout(timer);
     };
-  }, [closed, engram.domain, navigate]);
+  }, [closed, movedTo, movedAway, engram.domain, navigate]);
 
   /**
    * The unload prompt in a room, keyed on the SESSION's verdict.
@@ -936,15 +862,9 @@ function Surface({
 
   const extensions = useMemo(
     () =>
-      // `readVocab` only ever hands `vocabRef` to `crystallineCompletions`,
-      // which stores it in a `CompletionSource` closure CodeMirror calls later
-      // from typing, not here: nothing on this call stack reads `.current`
-      // during this render, but the checker cannot see through the
-      // `autocompletion` and `crystallineCompletions` calls to confirm that.
-      // eslint-disable-next-line react-hooks/refs
-      surfaceExtensions({
+      engramSurface({
         content: mountText,
-        client: queryClient,
+        adapter,
         dark: resolved === "dark",
         domain: engram.domain,
         preview,
@@ -953,11 +873,11 @@ function Surface({
         // The graph has not landed at mount; the compartment above carries
         // the real resolver in as soon as it does.
         resolver: NO_RESOLUTION,
-        vocab: readVocab,
         room,
         uploads: uploads.extension,
         onTableContext: setTableActive,
         onImageContext: setImageActive,
+        onElementContext: setElement,
       }),
     // Read once: `CmEditor` snapshots the extensions at mount, so a later
     // theme change reaches the buffer through a remount rather than through
@@ -965,11 +885,10 @@ function Surface({
     [
       mountText,
       engram.domain,
-      queryClient,
+      adapter,
       resolved,
       preview,
       resolverBox,
-      readVocab,
       room,
       uploads.extension,
     ],
@@ -993,369 +912,444 @@ function Surface({
     />
   );
 
+  /*
+   * The one save state the header shows. In a room the server saves and its
+   * control channel is the only truth about whether that worked; on the solo
+   * surface it is this tab's own mutation. A refused save is not a state but
+   * the server's sentence, shown as an alert under the header.
+   */
+  const saveState: SaveStateKind | null = inRoom
+    ? collab.status === "reconnecting"
+      ? "offline"
+      : collab.saveState === "pending"
+        ? "saving"
+        : collab.saveState === "ok"
+          ? "saved"
+          : null
+    : session.saving
+      ? "saving"
+      : session.dirty
+        ? // Unsaved text outranks the last receipt: a "Saved" beside a
+          // buffer that has moved on would claim what is not on disk.
+          "unsaved"
+        : session.notice?.kind === "done"
+          ? "saved"
+          : null;
+  /*
+   * Save goes away once the buffer is clean, which is the moment a press of
+   * it succeeds. Focus that stood on it would fall to the page, so it goes
+   * back into the text the author was writing.
+   */
+  // Save stands only while a solo buffer holds work the file does not have:
+  // in a room the server saves on its own, and Mod-S still flushes it.
+  const showSave = !inRoom && session.dirty;
+  /*
+   * Done in a room waits a moment for a save the room still owes, and keeps
+   * the text as a draft if it cannot land (see `useRoomExit`).
+   */
+  const roomExit = useRoomExit(
+    collab,
+    () => {
+      session.snapshotDraft();
+    },
+    () => {
+      void navigate(engramRoute(engram.domain, engram.permalink));
+    },
+    closed,
+  );
+  const saveFocused = useRef(false);
+  useEffect(() => {
+    if (!showSave && saveFocused.current) {
+      saveFocused.current = false;
+      view?.focus();
+    }
+  });
+  const soloProblem =
+    !inRoom && session.notice?.kind === "problem" ? session.notice.text : null;
+
   return (
     <div className="flex flex-col gap-4">
-      <header className="flex flex-col gap-2">
+      {/*
+        The page's name for assistive tech and for the frame's focus move after
+        a route change. On screen the breadcrumb and the Editing chip say it.
+      */}
+      <h1 className="sr-only">Editing {engram.title}</h1>
+      {/*
+        The reading page's two columns, so the metadata sits where a reader
+        already expects it: the text at the reading measure, the Details rail
+        beside it. The form is a view over the buffer rather than a second
+        place a value lives: it reads `buffer` and writes back through
+        ordinary transactions on the view. It stays at full width too (the
+        text column just widens), because the block it edits is hidden from
+        the text and the rail is where it is reached outside Raw.
+      */}
+      <div className="grid gap-y-3 lg:grid-cols-[minmax(0,1fr)_18.75rem] lg:grid-rows-[auto_1fr] lg:gap-x-14">
         {/*
-          Where this engram lives, above its name - the same trail the read
-          page carries, so moving between reading and editing does not move
-          the address to a different place on the screen.
-
-          The controls sit at the right end of that same trail row, which is
-          where the reading page carries its own. They used to stand one row
-          lower, beside the title, so every toggle between reading and editing
-          shunted the row of controls up or down the screen under the pointer
-          that had just pressed one of them.
+          Three blocks: the header and its notices, the rail, the text. On a
+          phone they stack in that order, so the Details disclosure sits under
+          the header; from the large breakpoint the rail spans both rows
+          beside the other two, its top level with the header's.
         */}
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <Breadcrumbs
-            crumbs={crumbsOf(engram.domain, engram.permalink, engram.title)}
-          />
-          <div className="flex flex-wrap items-center gap-2">
-            {/*
-              Who reports on saving depends on who does it. In a room the
-              server saves and its control channel is the only truth about
-              whether that worked; on the solo surface it is this tab's own
-              mutation.
-            */}
-            {inRoom ? (
-              <SessionStatus collab={collab} />
-            ) : (
-              <>
-                {session.notice && (
-                  <p
-                    role={
-                      session.notice.kind === "problem" ? "alert" : "status"
-                    }
-                    className={
-                      session.notice.kind === "problem"
-                        ? "rounded bg-red-50 px-2 py-1 text-sm text-red-800 dark:bg-red-950 dark:text-red-200"
-                        : "inline-flex items-center gap-1 text-sm text-slate-500 dark:text-slate-400"
-                    }
-                  >
-                    {/*
-                      The done notice is the solo surface's save receipt -
-                      the same "Saved" the room reports, so it wears the same
-                      tick. A problem notice is the server's words and gets
-                      no mark.
-                    */}
-                    {session.notice.kind === "done" && (
-                      <Check aria-hidden="true" size={14} strokeWidth={2} />
-                    )}
-                    {session.notice.text}
-                  </p>
-                )}
-                {session.dirty && !session.notice && (
-                  <p className="text-sm text-slate-500 dark:text-slate-400">
-                    Unsaved changes
-                  </p>
-                )}
-              </>
-            )}
-            {/*
-              A toggle, so the label names the thing being switched and
-              `aria-pressed` carries the state. A button whose text flipped to
-              "Preview" while announcing itself as pressed would be telling a
-              screen reader the opposite of what it shows.
-
-              A glyph rather than the word, because this row's two verbs - Save
-              and Close - are what should read as words on it, and a mode switch
-              standing between them in the same letters competes with both. The
-              name survives where a name is what a control is known by: the
-              accessible name and the tooltip both still say Raw, and the
-              document glyph says which of the two faces the buffer is wearing.
-            */}
-            {/*
-              Sharing the draft, and only ever a draft: a link hands over work
-              the team has not seen, and there is nothing to hand over about a
-              page they all read already.
-
-              In this header row rather than in the right-hand column beside
-              it, because that column is not rendered at all at full width -
-              see the `<aside>` below. A control only half the app's readers
-              can reach is not a control.
-            */}
-            {engram.draftOwner && (
-              <span className="rounded bg-amber-100 px-2 py-1 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-100">
-                {engram.draftOwner}&apos;s draft
+        <div className="edit-column order-1 flex min-w-0 flex-col gap-3 lg:col-start-1 lg:row-start-1">
+          <header className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+            <div className="flex min-w-0 flex-wrap items-center gap-2">
+              <Breadcrumbs
+                crumbs={crumbsOf(engram.domain, engram.permalink, engram.title)}
+              />
+              <span className="rounded-full bg-accent-tint px-2 py-0.5 text-caption font-medium text-accent-800 dark:text-accent-200">
+                Editing
               </span>
+              {engram.draftOwner && (
+                <span className="rounded-full bg-amber-100 px-2 py-0.5 text-caption text-amber-900 dark:bg-amber-950 dark:text-amber-100">
+                  {engram.draftOwner}&apos;s draft
+                </span>
+              )}
+            </div>
+            <div className="flex flex-wrap items-center gap-3">
+              {inRoom && (
+                <PresenceChips
+                  participants={collab.participants}
+                  offline={collab.status !== "connected"}
+                />
+              )}
+              <SaveState state={saveState} room={inRoom} />
+              {/*
+                Sharing the draft, and only ever a draft: a link hands over
+                work the team has not seen, and there is nothing to hand over
+                about a page they all read already.
+              */}
+              {engram.draft && !engram.draftOwner && engram.path && (
+                <Tooltip label="Share this draft with one person">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSharing(true);
+                    }}
+                    className={BUTTON.secondary}
+                  >
+                    Share draft
+                  </button>
+                </Tooltip>
+              )}
+              {showSave && (
+                <Tooltip label="Save and keep editing">
+                  <button
+                    type="button"
+                    onClick={session.requestSave}
+                    onFocus={() => {
+                      saveFocused.current = true;
+                    }}
+                    onBlur={() => {
+                      saveFocused.current = false;
+                    }}
+                    disabled={session.saving || session.hardErrors > 0}
+                    className={BUTTON.secondary}
+                  >
+                    Save
+                  </button>
+                </Tooltip>
+              )}
+              {/*
+                Done is the way out, and the one primary on this screen. It
+                does not save on the way - one press with two meanings hid the
+                one that could fail - so on the solo surface it is a button
+                that asks what should become of unsaved text before it goes
+                anywhere. In a room the server owns the write and is already
+                making it; there is nothing for this control to do but leave,
+                so it is a link.
+              */}
+              {inRoom ? (
+                <Tooltip label="Leave the editor. The room keeps your work.">
+                  {/*
+                    Warmed like every other link to the reading screen: that
+                    screen is lazy, and an author who deep-linked into the
+                    editor has never loaded its chunk.
+                  */}
+                  <Link
+                    to={engramRoute(engram.domain, engram.permalink)}
+                    {...ENGRAM_PREFETCH}
+                    onClick={roomExit.onDone}
+                    aria-disabled={roomExit.phase !== "idle" || undefined}
+                    className={BUTTON.primary}
+                  >
+                    Done
+                  </Link>
+                </Tooltip>
+              ) : (
+                <Tooltip label="Leave the editor">
+                  <button
+                    type="button"
+                    onClick={closing.close}
+                    className={BUTTON.primary}
+                  >
+                    Done
+                  </button>
+                </Tooltip>
+              )}
+            </div>
+          </header>
+          {roomExit.phase === "waiting" && (
+            <p
+              role="status"
+              className="text-sm text-slate-500 dark:text-slate-400"
+            >
+              Saving before you leave.
+            </p>
+          )}
+          {roomExit.phase === "kept" && (
+            <p role="alert" className={AMBER_BANNER}>
+              Not saved yet. Your text is kept as a draft on this device.
+            </p>
+          )}
+          {soloProblem !== null && (
+            <p role="alert" className={ALERT}>
+              {soloProblem}
+            </p>
+          )}
+          {inRoom &&
+            collab.saveState === "failed" &&
+            collab.saveDetail !== null && (
+              <p role="alert" className={ALERT}>
+                {collab.saveDetail}
+              </p>
             )}
-            {engram.draft && !engram.draftOwner && engram.path && (
-              <Tooltip label="Share this draft with one person">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setSharing(true);
-                  }}
-                  className={BUTTON.secondary}
-                >
-                  Share draft
-                </button>
-              </Tooltip>
-            )}
-            <Tooltip label="Raw">
-              <button
-                type="button"
-                aria-pressed={raw}
-                aria-label="Raw"
-                onClick={() => {
-                  const next = !raw;
-                  setRaw(next);
-                  session.viewRef.current?.dispatch({
-                    effects: preview.reconfigure(
-                      previewConfig(next, resolved === "dark", engram.domain),
-                    ),
-                  });
-                }}
-                // Quiet until it is on, then an accent wash. The two faces are
-                // whole strings rather than a base plus overrides: see `TOGGLE`
-                // for why layering accent utilities onto the ghost tier renders
-                // nothing at all.
-                className={raw ? ICON_TOGGLE.on : ICON_TOGGLE.off}
-              >
-                <FileCode aria-hidden="true" size={16} strokeWidth={1.75} />
-              </button>
-            </Tooltip>
-            {/*
-              What each of the two verbs promises, in one line, where the
-              pointer already is. The buttons say what they do; these say what
-              happens next - through the app's own tooltip, because Raw next to
-              them wears that surface and a native `title` here was a second
-              one, drawn a beat later in a font the page does not choose.
-            */}
-            <Tooltip label="Save and keep editing">
-              <button
-                type="button"
-                onClick={session.requestSave}
-                // In a room the client's verdict never gates a save: the
-                // server owns the write, it debounce-saves whatever the shared
-                // text holds regardless of this tab, and its own parse refusal
-                // is the authoritative gate - it comes back as a save-failed
-                // control in the server's words. A button disabled here while
-                // Mod-S flushed and the server saved anyway would be a control
-                // lying about what is happening.
-                disabled={session.saving || (!inRoom && session.hardErrors > 0)}
-                className={BUTTON.secondary}
-              >
-                Save
-              </button>
-            </Tooltip>
-            {/*
-              The primary verb of this screen: Save keeps the work, Close is
-              the way out. It does not save on the way - one press with two
-              meanings hid the one that could fail - so on the solo surface it
-              is a button that asks what should become of unsaved text before
-              it goes anywhere. In a room the server owns the write and is
-              already making it; there is nothing for this control to do but
-              leave, so it stays the link it has always been.
-            */}
-            {inRoom ? (
-              <Tooltip label="Close; the server keeps the room's work">
-                {/*
-                  Warmed like every other link to the reading screen: that
-                  screen is lazy now, and an author who deep-linked into the
-                  editor has never loaded its chunk, which makes this the one
-                  link to it most likely to be cold when it is pressed.
-                */}
-                <Link
-                  to={engramRoute(engram.domain, engram.permalink)}
-                  {...ENGRAM_PREFETCH}
-                  className={BUTTON.primary}
-                >
-                  Close
-                </Link>
-              </Tooltip>
-            ) : (
-              <Tooltip label="Close the editor">
-                <button
-                  type="button"
-                  onClick={closing.close}
-                  className={BUTTON.primary}
-                >
-                  Close
-                </button>
-              </Tooltip>
-            )}
-          </div>
-        </div>
-        <div className="flex flex-wrap items-baseline gap-3">
-          <h1 className="text-title">Editing {engram.title}</h1>
+          {inRoom && collab.mergeNotice && (
+            <p
+              role="status"
+              className="text-sm text-slate-500 dark:text-slate-400"
+            >
+              A change from outside was folded into this session.
+            </p>
+          )}
           {/*
-            The permalink stays beside the title rather than folding into the
-            trail above, which carries folders and the title but never the
-            slug. This screen has no details panel to hold the address, and a
-            save that renamed the engram through its frontmatter answers at a
-            new one: this line is where an author sees that happen.
+            The save receipt's own advisory, as a panel of its own: a
+            guidance sentence and a list of links need their own line. Guarded
+            to the solo surface for the same reason `advisory` is only ever
+            set there: a room's autosave never reaches the REST save route.
           */}
-          <span className="font-mono text-caption text-slate-500 dark:text-slate-400">
-            {engram.permalink}
-          </span>
-          {/*
-            And the address itself, one press away: it is what a person hands
-            an agent to join the document they are in, and the editor is
-            where they are when they want to. The reading page carries the
-            same control; the editor has no details panel to hold it, so it
-            stands beside the permalink at both widths.
-          */}
-          <CopyAddress address={engram.url} />
-          {inRoom && (
-            <PresenceChips
-              participants={collab.participants}
-              offline={collab.status !== "connected"}
+          {!inRoom && advisory && (
+            <SimilarEngramsPanel
+              similar={advisory.similar}
+              guidance={advisory.guidance}
+              onDismiss={() => {
+                setAdvisory(null);
+                // The Dismiss control held focus and leaves with the panel;
+                // without this the next Tab restarts at the top of the page.
+                view?.focus();
+              }}
             />
           )}
-        </div>
-      </header>
-      {/*
-        The save receipt's own advisory, drawn as a full-width panel like the
-        other post-header notices below rather than squeezed into the button
-        row the "Saved" tick stands in - that row is a line of small
-        controls, and a panel with a guidance sentence and a list of links
-        needs its own line. Guarded to the solo surface for the same reason
-        `advisory` is only ever set there: a room's autosave never reaches
-        the REST save route (3.2), so this can never fire while `inRoom`, but
-        the guard keeps that true by construction rather than by accident.
-      */}
-      {!inRoom && advisory && (
-        <SimilarEngramsPanel
-          similar={advisory.similar}
-          guidance={advisory.guidance}
-          onDismiss={() => {
-            setAdvisory(null);
-            // The Dismiss control is what held focus, and it leaves the
-            // document with the panel; without this the browser drops
-            // focus to `document.body` and the next Tab restarts at the
-            // top of the page instead of continuing from the buffer a
-            // keyboard reader was just in.
-            view?.focus();
-          }}
-        />
-      )}
-      {session.hardErrors > 0 && (
-        <p role="alert" className="text-sm text-red-800 dark:text-red-200">
-          {String(session.hardErrors)} hard{" "}
-          {session.hardErrors === 1 ? "error" : "errors"}{" "}
+          {session.hardErrors > 0 && (
+            <p role="alert" className="text-sm text-red-800 dark:text-red-200">
+              {String(session.hardErrors)} hard{" "}
+              {session.hardErrors === 1 ? "error" : "errors"}{" "}
+              {/*
+                On the solo surface the findings hold the save back; in a room
+                they cannot - the server saves the shared text on its own
+                schedule and refuses what it cannot parse in its own words.
+              */}
+              {inRoom
+                ? "in this engram; see Findings."
+                : "block saving; see Findings."}
+            </p>
+          )}
+          {attachError !== null && (
+            // The same face a refused save wears: the server, or this tab on
+            // the server's rules, would not take what was just handed to it.
+            <p role="alert" className={ALERT}>
+              {attachError}
+            </p>
+          )}
           {/*
-            Two different truths about the same findings: on the solo
-            surface they hold the save back, in a room they cannot - the
-            server saves the shared text on its own schedule and refuses
-            what it cannot parse in its own words.
+            No room to join, and the attempt is over rather than still running:
+            one quiet line, because editing solo is the ordinary older behavior
+            and not a failure the author has to act on.
           */}
-          {inRoom
-            ? "in this engram; see Findings."
-            : "block saving; see Findings."}
-        </p>
-      )}
-      {attachError !== null && (
-        // The same face a refused save wears on this screen, because it is the
-        // same kind of news: the server, or this tab on the server's rules,
-        // would not take what was just handed to it. Nothing was inserted, so
-        // the buffer still says what it said.
-        <p
-          role="alert"
-          className="rounded bg-red-50 px-2 py-1 text-sm text-red-800 dark:bg-red-950 dark:text-red-200"
-        >
-          {attachError}
-        </p>
-      )}
-      {/*
-        No room to join, and the attempt is over rather than still running:
-        one quiet line, because editing solo is the ordinary older behavior
-        and not a failure the author has to act on.
-      */}
-      {!inRoom && collab.status === "failed" && (
-        <p role="status" className="text-sm text-slate-500 dark:text-slate-400">
-          Editing solo - live collaboration is not available here
-        </p>
-      )}
-      {closed && (
-        <p
-          role="status"
-          className="rounded border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-100"
-        >
-          This engram was deleted; your text is kept as a draft
-        </p>
-      )}
-      {/*
-        Saving is suspended until the room resolves, so the banner stays put
-        rather than fading: it is the state of the session, not an event.
-      */}
-      {conflict && (
-        <aside
-          role="alert"
-          className="flex flex-wrap items-baseline gap-3 rounded border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-900 dark:border-red-700 dark:bg-red-950 dark:text-red-100"
-        >
-          <span>
-            Saving is paused: this engram changed outside the session.
-          </span>
-          <button
-            type="button"
-            className="rounded underline underline-offset-2 hover:no-underline focus-visible:ring-2 focus-visible:ring-red-500 focus-visible:outline-none"
-            onClick={() => {
-              setResolving(conflict);
+          {!inRoom && collab.status === "failed" && (
+            <p
+              role="status"
+              className="text-sm text-slate-500 dark:text-slate-400"
+            >
+              Editing solo - live collaboration is not available here
+            </p>
+          )}
+          {movedTo !== null && (
+            <p role="status" className={AMBER_BANNER}>
+              <span>
+                {`This engram was moved to ${
+                  movedTo.domain === engram.domain
+                    ? movedTo.path
+                    : `${movedTo.domain} / ${movedTo.path}`
+                }.`}
+              </span>
+              <button
+                type="button"
+                className="underline underline-offset-2 hover:no-underline"
+                onClick={() => {
+                  const permalink = movedTo.permalink ?? engram.permalink;
+                  // The snapshot taken when the room closed goes to the new
+                  // address, where the editor offers it when it differs.
+                  moveDraft(
+                    account,
+                    { domain: engram.domain, slot: engram.permalink },
+                    { domain: movedTo.domain, slot: permalink },
+                  );
+                  void navigate(editRoute(movedTo.domain, permalink));
+                }}
+              >
+                Open it there
+              </button>
+            </p>
+          )}
+          {closed && movedTo === null && (
+            <p role="status" className={AMBER_BANNER}>
+              {collab.closedReason === "deleted"
+                ? "This engram was deleted; your text is kept as a draft"
+                : collab.closedReason === "moved"
+                  ? "This engram was moved to a place you cannot open. Your text is kept as a draft."
+                  : "The session ended; your text is kept as a draft"}
+            </p>
+          )}
+          {/*
+            Saving is suspended until the room resolves, so the banner stays
+            put rather than fading: it is the state of the session, not an
+            event.
+          */}
+          {conflict && (
+            <aside
+              role="alert"
+              className="flex flex-wrap items-baseline gap-3 rounded border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-900 dark:border-red-700 dark:bg-red-950 dark:text-red-100"
+            >
+              <span>
+                Saving is paused: this engram changed outside the session.
+              </span>
+              <button
+                type="button"
+                className="rounded underline underline-offset-2 hover:no-underline focus-visible:ring-2 focus-visible:ring-red-500 focus-visible:outline-none"
+                onClick={() => {
+                  setResolving(conflict);
+                }}
+              >
+                Resolve
+              </button>
+            </aside>
+          )}
+          {session.offeredDraft && (
+            <aside role="note" className={AMBER_BANNER}>
+              <span>
+                An unsaved draft of this engram from{" "}
+                {session.offeredDraft.savedAt || "an earlier session"} is on
+                this browser.
+              </span>
+              <button
+                type="button"
+                className="underline underline-offset-2 hover:no-underline"
+                onClick={session.restoreDraft}
+              >
+                Restore draft
+              </button>
+              <button
+                type="button"
+                className="underline underline-offset-2 hover:no-underline"
+                onClick={session.discardDraft}
+              >
+                Discard draft
+              </button>
+            </aside>
+          )}
+          {/*
+            A text the server kept for this engram when a room could not
+            save it. Somebody else's draft has none of the reader's own.
+          */}
+          <KeptTextNotice
+            domain={engram.domain}
+            kind="engram"
+            path={engram.draftOwner ? null : engram.path}
+            draft={reviewing}
+            ready={inRoom ? collab.live && !closed : view !== null}
+            {...(inRoom
+              ? {}
+              : {
+                  soloSaves: {
+                    started: session.savesStarted,
+                    landedAfter: (count: number) => session.landedSave > count,
+                  },
+                })}
+            onReplace={(text) => {
+              // One ordinary change on the buffer, so Undo takes it back: in
+              // the mounted line endings, which in a room are LF. A
+              // dispatch, never a rebuild, so even a one-line text in a CRLF
+              // buffer keeps the history and the file's endings.
+              const current = session.viewRef.current;
+              if (current === null) {
+                return false;
+              }
+              const separator =
+                current.state.facet(EditorState.lineSeparator) ?? "\n";
+              const lf = text.replace(/\r\n/g, "\n");
+              const target =
+                separator === "\n" ? lf : lf.replace(/\n/g, separator);
+              current.dispatch({
+                changes: {
+                  from: 0,
+                  to: current.state.doc.length,
+                  insert: target,
+                },
+              });
+              current.focus();
+              return docText(current.state) === target;
             }}
-          >
-            Resolve
-          </button>
-        </aside>
-      )}
-      {session.offeredDraft && (
-        <aside
-          role="note"
-          className="flex flex-wrap items-baseline gap-3 rounded border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-100"
-        >
-          <span>
-            An unsaved draft of this engram from{" "}
-            {session.offeredDraft.savedAt || "an earlier session"} is on this
-            browser.
-          </span>
-          <button
-            type="button"
-            className="underline underline-offset-2 hover:no-underline"
-            onClick={session.restoreDraft}
-          >
-            Restore draft
-          </button>
-          <button
-            type="button"
-            className="underline underline-offset-2 hover:no-underline"
-            onClick={session.discardDraft}
-          >
-            Discard draft
-          </button>
-        </aside>
-      )}
-      {/*
-        The same two-column shape the read page has, so the metadata sits
-        where a reader already expects it. The form is a view over the buffer
-        rather than a second place a value lives: it reads `buffer` and writes
-        back through ordinary transactions on the view.
-
-        That is also what makes the column safe to drop at full width: every
-        field the form writes is a line of the frontmatter block in the text
-        right there, and a hand edit to it lands on the form a render later.
-        The findings are a different matter and stay - the notice above names
-        them, and jumping to the line a finding is about is offered nowhere
-        else - so at full width they run under the buffer instead of beside
-        it.
-      */}
-      <div
-        className={`grid gap-8 ${
-          fullWidth ? "" : "lg:grid-cols-[minmax(0,1fr)_18rem]"
-        }`}
-      >
-        <div className="rounded border border-slate-200 dark:border-slate-800">
+            onDropped={() => {
+              session.viewRef.current?.focus();
+            }}
+          />
+        </div>
+        <div className="edit-column order-3 min-w-0 lg:col-start-1 lg:row-start-2">
           {/*
-            The format bar sits inside the card, above the text it edits, and
-            takes the live view rather than the session: what it does are
-            transactions on the buffer, which in a room is the shared document
-            and everywhere is the file.
-          */}
+              The format bar is a sticky row on the column, above the text it
+              edits, and takes the live view rather than the session: what it
+              does are transactions on the buffer, which in a room is the
+              shared document and everywhere is the file.
+
+              Raw sits at its right end: a toggle, so the label names the
+              thing being switched and `aria-pressed` carries the state. It is
+              also the way to the frontmatter as text, which the preview
+              hides because the Details rail edits it.
+            */}
           <EditorToolbar
+            bare
             view={view}
             tableActive={tableActive}
             imageActive={imageActive}
+            calloutActive={element?.kind === "callout" ? element : null}
+            statusActive={element?.kind === "status" ? element.colour : null}
             onAttach={uploads.attach}
+            adapter={adapter}
+            trailing={
+              <Tooltip label="Show the file as Markdown, frontmatter included">
+                <button
+                  type="button"
+                  aria-pressed={raw}
+                  onClick={() => {
+                    const next = !raw;
+                    setRaw(next);
+                    session.viewRef.current?.dispatch({
+                      effects: preview.reconfigure(
+                        previewConfig(
+                          next,
+                          resolved === "dark",
+                          imagePreviews(engram.domain),
+                          adapter,
+                        ),
+                      ),
+                    });
+                  }}
+                  className={raw ? TOGGLE.on : TOGGLE.off}
+                >
+                  Raw
+                </button>
+              </Tooltip>
+            }
           />
           <CmEditor
             initialDoc={mountText}
@@ -1369,18 +1363,31 @@ function Surface({
             onDocChanged={session.setBuffer}
           />
         </div>
-        {fullWidth ? (
-          findings
-        ) : (
-          <aside className="flex flex-col gap-4">
-            <FrontmatterForm
-              doc={session.buffer}
-              view={view}
-              vocabulary={vocabulary.data ?? null}
-            />
-            {findings}
-          </aside>
-        )}
+        <EditorDetails hasHardErrors={session.hardErrors > 0}>
+          <FrontmatterForm
+            doc={session.buffer}
+            view={view}
+            vocabulary={vocabulary.data ?? null}
+          />
+          <div className="border-t border-hair pt-4">{findings}</div>
+          {/*
+            The address, one press away: it is what a person hands an agent
+            to join the document they are in. The permalink is here too, so
+            a save that renamed the engram through its frontmatter shows the
+            new one.
+          */}
+          <div className="flex flex-col gap-1 border-t border-hair pt-4">
+            <span className="text-caption font-medium text-slate-600 dark:text-slate-300">
+              Address
+            </span>
+            <div className="flex min-w-0 items-center gap-2">
+              <span className="truncate font-mono text-caption text-slate-500 dark:text-slate-400">
+                {engram.permalink}
+              </span>
+              <CopyAddress address={engram.url} />
+            </div>
+          </div>
+        </EditorDetails>
       </div>
       {conflict !== null && resolving === conflict && (
         <CollabConflictDialog
@@ -1388,6 +1395,7 @@ function Surface({
           // The live buffer, in the room's own LF space: what the panes show
           // side by side is what each side would end up with.
           mine={session.buffer}
+          problem={resolveProblem}
           onResolve={(choice) => {
             if (choice === "theirs") {
               // Their version is about to become the room's text (or, on a
@@ -1396,10 +1404,17 @@ function Surface({
               // this author had is recoverable afterwards.
               session.snapshotDraft();
             }
-            collab.resolve(choice);
+            // Refused while the connection is not live: the dialog stays,
+            // and the choice is the person's to make again.
+            if (!collab.resolve(choice)) {
+              setResolveProblem(NOT_LIVE);
+              return;
+            }
+            setResolveProblem(null);
             setResolving(null);
           }}
           onClose={() => {
+            setResolveProblem(null);
             setResolving(null);
           }}
         />

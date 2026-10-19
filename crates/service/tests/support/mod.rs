@@ -33,6 +33,52 @@ use flate2::write::GzEncoder;
 use sha2::{Digest, Sha256};
 use tar::Header;
 
+/// The Postgres URL the parity legs run against, or `None` with a note when
+/// `CRYSTALLINE_TEST_POSTGRES_URL` is unset.
+#[cfg(feature = "postgres")]
+pub fn pg_url() -> Option<String> {
+    use std::sync::Once;
+    static NOTE: Once = Once::new();
+    match std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") {
+        Ok(u) if !u.is_empty() => Some(u),
+        _ => {
+            NOTE.call_once(|| {
+                eprintln!(
+                    "note: skipping the postgres legs (CRYSTALLINE_TEST_POSTGRES_URL is unset); turso only"
+                )
+            });
+            None
+        }
+    }
+}
+
+/// A scratch schema named from `prefix`, dropped when it goes out of scope
+/// even if the test fails, or `None` without a URL. Declare it before any
+/// store opened in it, so it drops last.
+#[cfg(feature = "postgres")]
+pub fn scratch_schema(prefix: &str) -> Option<crystalline_index::ScratchSchema> {
+    pg_url().map(|url| crystalline_index::ScratchSchema::new(&url, prefix))
+}
+
+/// The instance id every engine of one test takes on a shared database,
+/// as one machine's daemon and its commands share theirs. An engine with no
+/// instance id walks no file domain there (`REFUSED_ANONYMOUS_WALK`), so a
+/// test that runs one engine as "the daemon" on Postgres gives it this id.
+pub const THIS_MACHINE: &str = "this-machine";
+
+/// `engine` with [`THIS_MACHINE`] as its instance id when `store` is shared
+/// by several instances (Postgres), else unchanged.
+pub async fn as_this_machine(
+    engine: crystalline_service::Engine,
+    store: &Arc<tokio::sync::Mutex<dyn crystalline_index::Store>>,
+) -> crystalline_service::Engine {
+    if store.lock().await.shares_database() {
+        engine.with_instance_id(THIS_MACHINE.to_string())
+    } else {
+        engine
+    }
+}
+
 /// Every operation the `/api/v1` router mounts, as `METHOD path`, spelled the
 /// way the OpenAPI document spells it (the engram wildcard becomes an ordinary
 /// `{permalink}` template, which is the only notation OpenAPI has for it).
@@ -82,6 +128,9 @@ pub const MOUNTED_OPERATIONS: &[&str] = &[
     "PUT /api/v1/domains/{domain}/members/{principal}",
     "DELETE /api/v1/domains/{domain}/members/{principal}",
     "PUT /api/v1/domains/{domain}/owner",
+    "GET /api/v1/domains/{domain}/kept",
+    "GET /api/v1/domains/{domain}/kept/{id}",
+    "DELETE /api/v1/domains/{domain}/kept/{id}",
     "GET /api/v1/domains/{domain}/sync",
     "POST /api/v1/domains/{domain}/sync",
     "GET /api/v1/domains/{domain}/sync/changes",
@@ -115,6 +164,7 @@ pub const MOUNTED_OPERATIONS: &[&str] = &[
     "GET /api/v1/sync",
     "GET /api/v1/events",
     "GET /api/v1/collab/{domain}/{permalink}",
+    "GET /api/v1/collab-reflection/{domain}/{path}",
     "GET /api/v1/search",
     "GET /api/v1/vocabulary",
     "GET /api/v1/context",
@@ -123,6 +173,25 @@ pub const MOUNTED_OPERATIONS: &[&str] = &[
     "GET /api/v1/evolve",
     "POST /api/v1/domains/{domain}/evolve/ack",
     "DELETE /api/v1/domains/{domain}/evolve/ack",
+    "GET /api/v1/reflection/domains",
+    "GET /api/v1/domains/{domain}/reflection",
+    "GET /api/v1/domains/{domain}/reflection/tree",
+    "POST /api/v1/domains/{domain}/reflection/move",
+    "GET /api/v1/domains/{domain}/reflection/threads",
+    "POST /api/v1/domains/{domain}/reflection/threads",
+    "POST /api/v1/domains/{domain}/reflection/threads/{id}/{action}",
+    "GET /api/v1/domains/{domain}/reflection/queue",
+    "GET /api/v1/domains/{domain}/reflection/review",
+    "GET /api/v1/domains/{domain}/reflection/summary",
+    "GET /api/v1/domains/{domain}/reflection/search",
+    "GET /api/v1/domains/{domain}/reflection/assets",
+    "GET /api/v1/domains/{domain}/reflection/assets/{path}",
+    "PUT /api/v1/domains/{domain}/reflection/assets/{path}",
+    "DELETE /api/v1/domains/{domain}/reflection/assets/{path}",
+    "POST /api/v1/domains/{domain}/reflection/move-asset",
+    "GET /api/v1/domains/{domain}/reflections/{path}",
+    "PUT /api/v1/domains/{domain}/reflections/{path}",
+    "DELETE /api/v1/domains/{domain}/reflections/{path}",
     "GET /api/v1/users",
     "POST /api/v1/users",
     "PATCH /api/v1/users/{name}",
@@ -216,6 +285,17 @@ struct Inner {
     /// snapshot into a new [`Commit`].
     trees: HashMap<String, BTreeMap<String, Vec<u8>>>,
     tree_counter: u64,
+    /// Whether every branch write (`create_branch`, `update_branch`) fails
+    /// with `RemoteError::Offline`. Set through
+    /// `MockProvider::set_offline_writes`.
+    offline_writes: bool,
+    /// Whether `create_tree` refuses a delete (`sha: null`) of a path its
+    /// base does not hold, with a 422, instead of ignoring it. Set through
+    /// `MockProvider::refuse_deletes_of_nothing`.
+    refuse_missing_deletes: bool,
+    /// When set, `branch_ref` answers `RemoteError::RateLimited` with this
+    /// reset. Set through `MockProvider::rate_limit_branch_ref`.
+    branch_ref_rate_limited: Option<chrono::DateTime<chrono::Utc>>,
     proposal_counter: u64,
     /// How many times `branch_head` has been called, for the daemon poller
     /// tests: it is always the first call any `origin_update`/`origin_status`
@@ -598,6 +678,36 @@ impl MockProvider {
             .and_then(|c| c.files.get(path).cloned())
     }
 
+    /// Makes every branch write (creating or moving a branch) answer as
+    /// though the forge could not be reached, until turned off again. Blobs,
+    /// trees and commits still land.
+    pub fn set_offline_writes(&self, offline: bool) {
+        self.inner.lock().unwrap().offline_writes = offline;
+    }
+
+    /// Makes `create_tree` answer a delete of a path its base does not hold
+    /// with a 422, so a test proves no such delete is ever sent.
+    pub fn refuse_deletes_of_nothing(&self) {
+        self.inner.lock().unwrap().refuse_missing_deletes = true;
+    }
+
+    /// Makes `branch_ref` answer a rate limit that resets at `reset`, or
+    /// answer normally again with `None`.
+    pub fn rate_limit_branch_ref(&self, reset: Option<chrono::DateTime<chrono::Utc>>) {
+        self.inner.lock().unwrap().branch_ref_rate_limited = reset;
+    }
+
+    /// Every path a commit's tree holds, sorted.
+    pub fn commit_paths(&self, commit: &str) -> Vec<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .commits
+            .get(commit)
+            .map(|c| c.files.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
     /// The provider calls made so far, in order, for asserting the exact
     /// sequence a share-update or withdraw drives.
     pub fn calls(&self) -> Vec<String> {
@@ -923,7 +1033,12 @@ impl Provider for MockProvider {
                     files.insert(write.path.clone(), content);
                 }
                 None => {
-                    files.remove(&write.path);
+                    if files.remove(&write.path).is_none() && inner.refuse_missing_deletes {
+                        return Err(RemoteError::Api {
+                            status: 422,
+                            message: format!("cannot delete {}: not in the tree", write.path),
+                        });
+                    }
                 }
             }
         }
@@ -931,6 +1046,33 @@ impl Provider for MockProvider {
         let id = format!("tree{}", inner.tree_counter);
         inner.trees.insert(id.clone(), files);
         inner.calls.push(format!("create_tree:{id}"));
+        Ok(id)
+    }
+
+    async fn create_root_tree(
+        &self,
+        _origin: &OriginSpec,
+        writes: &[TreeWrite],
+    ) -> Result<String, RemoteError> {
+        let mut inner = self.inner.lock().unwrap();
+        let mut files = BTreeMap::new();
+        for write in writes {
+            if let Some(sha) = &write.blob_sha {
+                let content = inner
+                    .blobs
+                    .get(sha)
+                    .cloned()
+                    .ok_or_else(|| RemoteError::Api {
+                        status: 404,
+                        message: format!("no blob {sha}"),
+                    })?;
+                files.insert(write.path.clone(), content);
+            }
+        }
+        inner.tree_counter += 1;
+        let id = format!("tree{}", inner.tree_counter);
+        inner.trees.insert(id.clone(), files);
+        inner.calls.push(format!("create_root_tree:{id}"));
         Ok(id)
     }
 
@@ -970,6 +1112,9 @@ impl Provider for MockProvider {
         commit: &str,
     ) -> Result<(), RemoteError> {
         let mut inner = self.inner.lock().unwrap();
+        if inner.offline_writes {
+            return Err(RemoteError::Offline);
+        }
         inner.etag_counter += 1;
         let etag = format!("etag{}", inner.etag_counter);
         inner.branches.insert(name.to_string(), commit.to_string());
@@ -993,6 +1138,9 @@ impl Provider for MockProvider {
     ) -> Result<Option<String>, RemoteError> {
         let mut inner = self.inner.lock().unwrap();
         inner.calls.push(format!("branch_ref:{name}"));
+        if let Some(reset) = inner.branch_ref_rate_limited {
+            return Err(RemoteError::RateLimited { reset: Some(reset) });
+        }
         Ok(inner.branches.get(name).cloned())
     }
 
@@ -1004,6 +1152,9 @@ impl Provider for MockProvider {
         force: bool,
     ) -> Result<(), RemoteError> {
         let mut inner = self.inner.lock().unwrap();
+        if inner.offline_writes {
+            return Err(RemoteError::Offline);
+        }
         // Extends the old `update_branch:{name}:{commit}` with the force flag
         // rather than rewording it, so `starts_with` assertions keep matching.
         // Recorded before either refusal below, so a refused update shows in
