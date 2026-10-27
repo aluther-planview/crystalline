@@ -52,17 +52,18 @@ pub use hosting::{
     give_back, instance_label, stale_secs,
 };
 pub use store::{
-    AssetTable, AttachmentRow, BrowseLevel, ChunkJob, ChunkModelCount, ChunkTable, CitedEngram,
-    ContentMention, ContradictionRow, CoverageGroup, DEFAULT_RETIRED_WEIGHT,
-    DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind, DomainLookup, DomainStats, EdgeKind,
-    EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId, EngramRecord, EngramSummary,
-    FileStamp, FilterOp, FtsMode, GraphEdge, GraphNode, GraphSlice, HitKind, HostClaim, HostMove,
-    InboundHit, InboundPage, InboundQuery, InboundRef, LEXICAL_CANDIDATE_CAP, LINKS_TO, LeadVector,
-    MetadataFilter, NamedCount, NewChunk, NewReflectionChunk, OBSERVATION_VECTOR_CHUNK,
-    ObservationVector, OnlyElsewhere, OutboundRef, Page, RETIRED_STATUSES, RebuildKind,
-    RecentFilter, ReflectionRow, ReflectionStamp, ScoredPair, SearchHit, SearchMode, SearchOrder,
-    SearchQuery, SectionVector, Store, StoreInfo, StoredEngram, TagAlias, TagCount, Vocabulary,
-    WorkClaim, is_current_status, is_retired_status, lookup_in_domain, merge_vocabularies,
+    AssetTable, AttachmentRow, AutomationLease, AutomationRun, BrowseLevel, ChunkJob,
+    ChunkModelCount, ChunkTable, CitedEngram, ContentMention, ContradictionRow, CoverageGroup,
+    DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind,
+    DomainLookup, DomainStats, DueKey, EdgeKind, EmbeddingCoverage, EmbeddingRow, EngramDescriptor,
+    EngramId, EngramRecord, EngramSummary, FileStamp, FilterOp, FtsMode, GraphEdge, GraphNode,
+    GraphSlice, HitKind, HostClaim, HostMove, InboundHit, InboundPage, InboundQuery, InboundRef,
+    LEXICAL_CANDIDATE_CAP, LINKS_TO, LeadVector, LeaseClaim, LeaseHolder, MetadataFilter,
+    NamedCount, NewChunk, NewReflectionChunk, OBSERVATION_VECTOR_CHUNK, ObservationVector,
+    OnlyElsewhere, OutboundRef, Page, PathChecksum, RETIRED_STATUSES, RebuildKind, RecentFilter,
+    ReflectionRow, ReflectionStamp, ScoredPair, SearchHit, SearchMode, SearchOrder, SearchQuery,
+    SectionVector, Store, StoreInfo, StoredEngram, TagAlias, TagCount, Vocabulary, WorkClaim,
+    is_current_status, is_retired_status, lookup_in_domain, merge_vocabularies,
     parse_metadata_filters, retired_factor, salience_prior,
 };
 /// The shared statement builders, reachable from `tests/it/plans.rs` and from
@@ -104,6 +105,36 @@ pub use vocab::{TagCluster, tag_clusters, tag_clusters_with_aliases};
 
 #[cfg(feature = "postgres")]
 pub use postgres::{PostgresStore, ScratchSchema};
+
+/// The environment variable the Xet client (hf-xet, under hf-hub's model
+/// download) reads to decide whether it reports transfer telemetry, and the
+/// value that turns the reports off.
+///
+/// hf-xet 1.7.0 sends, by default, a summary of every upload and download to
+/// the Xet storage server, with the access token. hf-hub builds its Xet session
+/// from `XetConfig::new()`, which reads this variable each time a session is
+/// built, and offers no way to hand it a configuration of its own, so the
+/// environment is the only switch there is.
+pub const XET_TELEMETRY_ENV: (&str, &str) = ("HF_XET_TELEMETRY_ENABLED", "false");
+
+/// Turns the Xet client's download telemetry off for this process and every
+/// process it starts, whatever the variable held before.
+///
+/// Set unconditionally: an explicit `HF_XET_TELEMETRY_ENABLED=true` in the
+/// user's environment is overwritten, because Crystalline never sends these
+/// reports. The binary calls it first thing in `main`.
+///
+/// # Safety
+///
+/// It writes the process environment, so no other thread may read or write the
+/// environment at the same time: call it while the process is still
+/// single-threaded, before any runtime or thread starts.
+pub unsafe fn keep_xet_telemetry_off() {
+    let (name, value) = XET_TELEMETRY_ENV;
+    // SAFETY: the caller guarantees that no other thread touches the
+    // environment while this runs (the contract above).
+    unsafe { std::env::set_var(name, value) };
+}
 
 /// Encode bytes as lowercase hexadecimal into a pre-sized string. The shared
 /// SHA-256 formatter for the whole crate: chunk fingerprints, file checksums and
